@@ -11,7 +11,6 @@
 [Side-Effect Policy]
   Inputs, artifacts and caller files stay inside pytest temporary directories.
 """
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 
 import copy
 import hashlib
@@ -26,6 +25,7 @@ from unittest.mock import patch
 
 import pytest
 
+pytest.importorskip("mindie_profiler")
 from mindie_profiler.events import ProfilerUsageError
 from mindie_sim import diff_trace as diff
 

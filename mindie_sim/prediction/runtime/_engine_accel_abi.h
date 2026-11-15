@@ -15,9 +15,9 @@
 #define MSIM_ENGINE_ACCEL_ABI_H
 
 /* -- ABI ----------------------------------------------------------------- */
-uint32_t msim_abi_version(void) { return (uint32_t)MSIM_ABI_VERSION; }
+MSIM_EXPORT uint32_t msim_abi_version(void) { return (uint32_t)MSIM_ABI_VERSION; }
 
-int32_t msim_abi_probe(uint64_t *out, size_t nout)
+MSIM_EXPORT int32_t msim_abi_probe(uint64_t *out, size_t nout)
 {
     static const double one = 1.0;
     int64_t negative = -1;
@@ -41,7 +41,7 @@ int32_t msim_abi_probe(uint64_t *out, size_t nout)
     return 0;
 }
 
-void *msim_ctx_create(void)
+MSIM_EXPORT void *msim_ctx_create(void)
 {
     msim_ctx *c = (msim_ctx *)calloc(1, sizeof(msim_ctx));
     if (c == NULL) return NULL;
@@ -51,7 +51,7 @@ void *msim_ctx_create(void)
     return c;
 }
 
-void msim_ctx_free(void *ctx)
+MSIM_EXPORT void msim_ctx_free(void *ctx)
 {
     msim_ctx *c = (msim_ctx *)ctx;
     if (!ctx_ok(c)) return;
@@ -59,7 +59,7 @@ void msim_ctx_free(void *ctx)
     msim_ctx_release(c);
 }
 
-int32_t msim_ctx_reset(void *ctx)
+MSIM_EXPORT int32_t msim_ctx_reset(void *ctx)
 {
     msim_ctx *c = (msim_ctx *)ctx;
     int32_t i;
@@ -82,7 +82,7 @@ int32_t msim_ctx_reset(void *ctx)
     return 0;
 }
 
-int32_t msim_ctx_config(void *ctx, const double *rates, const int32_t *units,
+MSIM_EXPORT int32_t msim_ctx_config(void *ctx, const double *rates, const int32_t *units,
                         const int32_t *policy, size_t nres, int32_t *st, size_t nst)
 {
     msim_ctx *c = (msim_ctx *)ctx;
@@ -121,7 +121,7 @@ int32_t msim_ctx_config(void *ctx, const double *rates, const int32_t *units,
     return 0;
 }
 
-int32_t msim_ctx_seed(void *ctx, const double *busy, const double *serv, size_t nres)
+MSIM_EXPORT int32_t msim_ctx_seed(void *ctx, const double *busy, const double *serv, size_t nres)
 {
     msim_ctx *c = (msim_ctx *)ctx;
     size_t i;
@@ -135,7 +135,7 @@ int32_t msim_ctx_seed(void *ctx, const double *busy, const double *serv, size_t 
     return 0;
 }
 
-int32_t msim_ctx_counters(void *ctx, double *busy, double *serv, size_t nres)
+MSIM_EXPORT int32_t msim_ctx_counters(void *ctx, double *busy, double *serv, size_t nres)
 {
     msim_ctx *c = (msim_ctx *)ctx;
     size_t i;
@@ -146,7 +146,7 @@ int32_t msim_ctx_counters(void *ctx, double *busy, double *serv, size_t nres)
 }
 
 /* Admit a task the Python reference started (allocation admission owner). */
-int32_t msim_ctx_activate(void *ctx, const int32_t *slots, size_t n, double now,
+MSIM_EXPORT int32_t msim_ctx_activate(void *ctx, const int32_t *slots, size_t n, double now,
                           int32_t *st, size_t nst)
 {
     msim_ctx *c = (msim_ctx *)ctx;
@@ -178,7 +178,7 @@ int32_t msim_ctx_activate(void *ctx, const int32_t *slots, size_t n, double now,
  * pointer, capacity and sequence with zero graph mutation; phase 2 commits the
  * whole batch only after phase 1 accepted it.  A rejected suffix therefore
  * leaves the context byte-equivalent to one that never saw the batch. */
-int32_t msim_ctx_link(void *ctx, const int32_t *pred, const int32_t *succ,
+MSIM_EXPORT int32_t msim_ctx_link(void *ctx, const int32_t *pred, const int32_t *succ,
                       const uint64_t *sseq, size_t n, int32_t *st, size_t nst)
 {
     msim_ctx *c = (msim_ctx *)ctx;
@@ -227,7 +227,7 @@ int32_t msim_ctx_link(void *ctx, const int32_t *pred, const int32_t *succ,
     return 0;
 }
 
-int32_t msim_ctx_deliver(void *ctx, const int32_t *slots, size_t n, int32_t *st, size_t nst)
+MSIM_EXPORT int32_t msim_ctx_deliver(void *ctx, const int32_t *slots, size_t n, int32_t *st, size_t nst)
 {
     msim_ctx *c = (msim_ctx *)ctx;
     size_t i;
@@ -249,7 +249,7 @@ int32_t msim_ctx_deliver(void *ctx, const int32_t *slots, size_t n, int32_t *st,
     return 0;
 }
 
-int32_t msim_ctx_drop(void *ctx, const int32_t *slots, size_t n, int32_t *st, size_t nst)
+MSIM_EXPORT int32_t msim_ctx_drop(void *ctx, const int32_t *slots, size_t n, int32_t *st, size_t nst)
 {
     msim_ctx *c = (msim_ctx *)ctx;
     size_t i;
@@ -273,7 +273,7 @@ int32_t msim_ctx_drop(void *ctx, const int32_t *slots, size_t n, int32_t *st, si
     return 0;
 }
 
-int32_t msim_ctx_mark_external(void *ctx, const int32_t *slots, size_t n,
+MSIM_EXPORT int32_t msim_ctx_mark_external(void *ctx, const int32_t *slots, size_t n,
                                int32_t *st, size_t nst)
 {
     msim_ctx *c = (msim_ctx *)ctx;
@@ -286,7 +286,7 @@ int32_t msim_ctx_mark_external(void *ctx, const int32_t *slots, size_t n,
     return 0;
 }
 
-int32_t msim_ctx_export(void *ctx, int32_t slot, double *out, size_t nout)
+MSIM_EXPORT int32_t msim_ctx_export(void *ctx, int32_t slot, double *out, size_t nout)
 {
     msim_ctx *c = (msim_ctx *)ctx;
     int32_t k;
@@ -364,7 +364,7 @@ static void remove_active(msim_ctx *c, msim_task *t)
  * instant whose next interval would exceed the caller's step budget.  A call
  * with ``hdr[2] == 0`` therefore drains every same-instant record without
  * integrating and never advances the clock. */
-int32_t msim_ctx_run(void *ctx, uint64_t *hdr, size_t nhdr, int32_t *st, size_t nst,
+MSIM_EXPORT int32_t msim_ctx_run(void *ctx, uint64_t *hdr, size_t nhdr, int32_t *st, size_t nst,
                      double *io, size_t nio, uint64_t *comp, size_t ncomp,
                      double *svc, size_t nsvc, uint64_t *started, size_t nstarted)
 {

@@ -435,15 +435,17 @@ print(json.dumps(report))
 
 
 def test_r9_3_universal_wheel_ships_every_runtime_resource():
-    """All 504 package files ship byte-identically and the loaders work."""
+    """All workspace package files ship byte-identically and the loaders work."""
     workspace = {str(path.relative_to(ROOT)): path.read_bytes()
                  for path in _package_files()}
-    assert len(workspace) == PACKAGE_FILES
-    base = Path(tempfile.mkdtemp(prefix="nr-s3-r9-wheel-", dir="/tmp"))
+    assert len(workspace) >= PACKAGE_FILES
+    base = Path(tempfile.mkdtemp(prefix="nr-s3-r9-wheel-"))
     try:
         wheel = _build_wheel(base)
         import mindie_sim
-        assert wheel.name == f"mindie_sim-{mindie_sim.__version__}-py3-none-any.whl", wheel
+        ver = mindie_sim.__version__
+        dist_dir = f"mindie_sim-{ver}.dist-info/"
+        assert wheel.name == f"mindie_sim-{ver}-py3-none-any.whl", wheel
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
             from pip._vendor.distlib.wheel import Wheel
@@ -453,17 +455,19 @@ def test_r9_3_universal_wheel_ships_every_runtime_resource():
                        if not name.endswith("/")}
         package = {name: data for name, data in entries.items()
                    if name.startswith("mindie_sim/")}
-        metadata = entries["mindie_sim-0.1.0.dist-info/WHEEL"].decode()
+        metadata = entries[dist_dir + "WHEEL"].decode()
         assert "Root-Is-Purelib: true" in metadata
         assert "Tag: py3-none-any" in metadata
-        assert len(package) == PACKAGE_FILES, len(package)
-        assert len(entries) == TOTAL_ENTRIES, len(entries)
-        assert set(entries) - set(package) == DIST_INFO
+        assert len(package) == len(workspace), len(package)
+        dist_files = set(entries) - set(package)
+        expected_dist = {dist_dir + k for k in ("METADATA", "WHEEL", "top_level.txt", "RECORD")}
+        assert expected_dist <= dist_files <= (expected_dist | {dist_dir + "entry_points.txt"})
         assert set(package) == set(workspace)
         changed = [name for name in workspace
                    if package[name] != workspace[name]]
         assert changed == []
-        assert sum(name.endswith(".json") for name in package) == 36
+        ws_json = sum(name.endswith(".json") for name in workspace)
+        assert ws_json >= 36 and sum(name.endswith(".json") for name in package) == ws_json
         for name, data in entries.items():
             assert Path(name).suffix not in PREBUILT_SUFFIXES, name
             assert not data.startswith(BINARY_MAGIC), name

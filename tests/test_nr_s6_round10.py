@@ -28,7 +28,6 @@
 """
 
 from __future__ import annotations
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 
 import builtins
 import hashlib
@@ -36,6 +35,7 @@ import io
 import stat
 import threading
 from unittest.mock import patch
+__import__("pytest").importorskip("mindie_profiler")
 from mindie_profiler import repro_storage as storage
 from test_nr_s6_round8 import _r16_fds, _r16_no_leaks, _r16_probe_namespace
 import json

@@ -1,5 +1,4 @@
 """Historical native rows compared to an independently selected source wrapper."""
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 from dataclasses import replace
 import json
 from pathlib import Path

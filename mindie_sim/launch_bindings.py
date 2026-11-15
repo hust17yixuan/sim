@@ -239,6 +239,8 @@ def parse_launch(text_or_argv, *, format="shell", command_index=None,
                 else:
                     merged["ep"] = (merged.get("dp", 1) * merged.get("tp", 1)
                                     * merged.get("pcp", 1))
+                    if int(merged.get("pcp", 1)) > 1 and not merged.get("rank_table"):
+                        merged["rank_table"] = [list(range(int(merged["ep"])))]
             else:
                 merged["ep"] = 1
         elif "ep" not in merged:

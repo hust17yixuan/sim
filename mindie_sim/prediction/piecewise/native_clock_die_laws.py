@@ -6,7 +6,7 @@
   time is a declared byte/op quantity divided by the selected die's sustained
   rate, plus a declared per-class launch floor.
 [Invariants]
-  * No shape list, cohort/case selector, piecewise knot table, ``fixed_us`` or
+  * No shape list, cohort/case selector, piecewise knot table, ``constant_us_intercept`` or
     observed duration is stored or read; the laws are continuous in the
     declared geometry.
   * Every constant is a declared hardware parameter (die rate, capacity,

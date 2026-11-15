@@ -14,7 +14,6 @@ from .guards import (
     PipeDemand, PipeDominanceGuard, PipeEnvelope, ServiceMode, SplitKGuard,
     SplitKPolicy, StepGuard, StructuralPartition,
 )
-from .primitive_eval import evaluate_primitive_spec
 from .compiler import (
     AnalysisDomain, CompiledOperator, CompiledSubgraph, ImplementationPolicy,
     NativeProgram, NativeSchedule, NativeTask, OperatorCost,
@@ -37,6 +36,7 @@ from .composition import (
     run_engine, run_engine_work,
 )
 from .diagnostics import DiagnosticReport, boundary_distance, coverage_summary, explain
+from .primitive_eval import evaluate_primitive_spec
 
 __all__ = [
     "Add", "AnalysisDomain", "CeilDiv", "CompiledOperator", "CompiledSubgraph",
@@ -54,7 +54,8 @@ __all__ = [
     "WorkloadGeometry", "as_fraction", "attribute_rope", "boundary_distance",
     "chunked_prefill_mean_ttft_ms",
     "clamp_graph_bucket", "compose_sequence", "coverage_summary", "ep_batch",
-    "evaluate", "explain", "local_batch", "lower_fusion", "evaluate_primitive_spec",
+    "evaluate", "explain", "local_batch", "lower_fusion",
+    "evaluate_primitive_spec",
     "lower_layer_predictions", "operator_segment", "contention_envelope",
     "pipeline_makespan", "quant_ledger", "run_engine", "run_engine_work",
     "service_ttft_overhead_ms", "simplify", "substitute", "ttft_wave_scale",

@@ -112,7 +112,7 @@ static int32_t submit_deps_check(msim_ctx *c, const int32_t *dep_task,
 
 /* Incremental submission: every row/link/placement cell is validated before the
  * first table mutation.  On success ``out_slots`` receives each assigned slot. */
-int32_t msim_ctx_submit(void *ctx, const uint64_t *rows, size_t nrows,
+MSIM_EXPORT int32_t msim_ctx_submit(void *ctx, const uint64_t *rows, size_t nrows,
                         size_t row_stride, const uint64_t *links, size_t nlinks,
                         size_t link_stride, const uint32_t *place, size_t nplace,
                         const int32_t *dep_task, const int32_t *dep_pred,

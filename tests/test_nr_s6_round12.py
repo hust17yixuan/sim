@@ -26,13 +26,13 @@
 """
 
 from __future__ import annotations
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 
 import json
 import contextlib
 import errno
 import os
 from pathlib import Path
+__import__("pytest").importorskip("mindie_profiler")
 from mindie_profiler import repro_atomic_io as checked_io
 from mindie_profiler import repro_storage as storage
 from unittest.mock import patch

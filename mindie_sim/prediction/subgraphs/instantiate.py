@@ -1418,11 +1418,13 @@ def _layer_slots(model: ModelSpec, layer: LayerPlan,
                        and not layer.owns_long_kv)
     kv_slot = LayerSlot("kv_cache", "read" if shared_consumer else "store", "kv")
 
-    def compression_slots() -> None:
+    def kv_compress_slots() -> None:
         if layer.compress_ratio or window_compressed:
             slots.append(LayerSlot("kv_compressor",
                                    str(layer.compressor_kind or "weighted_pool"),
                                    "compress"))
+
+    def indexer_slots() -> None:
         if layer.indexer:
             slots.append(LayerSlot("indexer_prolog",
                                    str(layer.indexer_type or "full"),
@@ -1437,10 +1439,12 @@ def _layer_slots(model: ModelSpec, layer: LayerPlan,
         slots.append(LayerSlot(attention_kind, "window_compressed",
                                "attention_prolog"))
         slots.append(LayerSlot("kv_cache", "layout", "kv"))
-        compression_slots()
+        kv_compress_slots()
+        indexer_slots()
         slots.append(LayerSlot(attention_kind, "", "attention"))
     elif latent_attention:
-        compression_slots()
+        kv_compress_slots()
+        indexer_slots()
         slots.append(LayerSlot(attention_kind,
                                "latent_mqa" if layer.mla_variant == "latent_mqa"
                                else "latent_mla", "attention"))
@@ -1448,13 +1452,15 @@ def _layer_slots(model: ModelSpec, layer: LayerPlan,
             slots.append(kv_slot)
     elif attention_kind in {"gdn_linear_attn", "kda_linear_attn"}:
         slots.append(LayerSlot(attention_kind, "", "attention"))
-        compression_slots()
+        kv_compress_slots()
+        indexer_slots()
     else:
         variant = ("shared_consumer" if shared_consumer
                    else STANDARD_VARIANTS[attention_kind])
+        indexer_slots()
         slots.append(LayerSlot(attention_kind, variant, "attention"))
         slots.append(kv_slot)
-        compression_slots()
+        kv_compress_slots()
     boundary("attn_post")
     # The post-attention residual is folded into the pre-FFN AddRmsNorm;
     # there is no third standalone residual N0 per layer.

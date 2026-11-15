@@ -2732,6 +2732,13 @@ def coalesce_execution_program(program):
         children = tuple(coalesce_execution_program(child)
                          for child in program.programs)
         merged = coalesce_programs(children, widen_pipelines=True)
+        if len(merged) > 1 and len(merged) < len(children) and any(
+            isinstance(m, KernelProgram)
+            and any(not s.coupled and (set(s.work) - set(s.placement))
+                    for s in m.stages)
+            for m in merged
+        ):
+            merged = children
         if (len(merged) == 1 and isinstance(merged[0], KernelProgram)
                 and not any(s.acquire or s.free for s in merged[0].stages)):
             return merged[0]

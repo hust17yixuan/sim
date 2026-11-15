@@ -1,5 +1,4 @@
 """Independent matrix declarations checked against retained native captures."""
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 from copy import deepcopy
 from dataclasses import replace
 import json

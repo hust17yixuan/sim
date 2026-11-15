@@ -98,7 +98,8 @@ def test_complete_typed_invocation_and_negative_controls():
 def test_two_replicas_share_one_call_and_one_owner():
     op = _lowered()
     structure = export_op_structure(
-        {0: (op,), 1: (op,)}, model={}, execution={"phase": "decode"})
+        {0: (op,), 1: (op,)}, model={}, execution={"phase": "decode"},
+        native_evidence=True)
     records = structure["native_calls"]
     assert len(records) == 2
     assert len({record["call_id"] for record in records}) == 1

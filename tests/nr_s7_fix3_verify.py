@@ -546,8 +546,8 @@ def _dspark():
 
 
 def _mcp():
-    encodings = [tiktoken.get_encoding(name)
-                 for name in ("cl100k_base", "o200k_base")]
+    encodings = ([tiktoken.get_encoding(name) for name in ("cl100k_base", "o200k_base")]
+                 if tiktoken is not None else ())
     rows = []
     for label, codes in (("100_codes", [f"e{i}" for i in range(100)]),
                          ("70_diagnostics",
@@ -582,8 +582,8 @@ def _public():
                is_kv_consumer=True, kv_connector="MooncakeConnectorV2")),
         ("ds41", _case("deepseek-v4.1-flash", max_model_len=8192), _ds41()),
     ]
-    encodings = [tiktoken.get_encoding(name)
-                 for name in ("cl100k_base", "o200k_base")]
+    encodings = ([tiktoken.get_encoding(name) for name in ("cl100k_base", "o200k_base")]
+                 if tiktoken is not None else ())
     rows = []
     for label, case, options in cases:
         report = E(case, options)

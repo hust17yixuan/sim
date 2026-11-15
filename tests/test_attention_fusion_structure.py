@@ -1,5 +1,4 @@
 """Source-derived QKV preprocessing boundaries and real capture limitations."""
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 from dataclasses import replace
 from itertools import product
 import json

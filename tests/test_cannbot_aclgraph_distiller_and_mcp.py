@@ -14,12 +14,11 @@ Read-only except tmp_path JSONL output.
 """
 
 from __future__ import annotations
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 
 from collections import Counter
 from pathlib import Path
 
-import pytest
+import pytest; pytest.importorskip("mindie_knowledge")
 
 from mindie_knowledge.cannbot_aclgraph_distiller import (
     NORMALIZATION_RULES,
@@ -35,6 +34,7 @@ from mindie_knowledge.cannbot_aclgraph_distiller import (
 from mindie_knowledge.knowledge_unit import validate_units
 from mindie_sim.opflow.opflow_mcp import TOOL_SPECS as OPFLOW_SPECS, call_tool as opflow_call
 from mindie_sim.opflow.token_budget import envelope_size
+pytest.importorskip("mindie_profiler")
 from mindie_profiler.aclgraph_mcp import TOOL_SPECS as ACL_SPECS, call_tool as acl_call
 
 REF_ROOT = Path("/Users/maoxx241/code/refs")

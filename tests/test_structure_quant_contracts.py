@@ -1,5 +1,4 @@
 """Declared precision boundaries compared with original native capture rows."""
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 from pathlib import Path
 
 import pytest

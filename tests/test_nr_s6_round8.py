@@ -26,7 +26,6 @@
 """
 
 from __future__ import annotations
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 
 import ast
 import contextlib
@@ -37,6 +36,7 @@ import sys
 import threading
 import types
 from unittest.mock import patch
+__import__("pytest").importorskip("mindie_profiler")
 from mindie_profiler import repro_storage as storage
 from mindie_profiler.fabric_probe import emit_fabric_probe_script
 from pathlib import Path

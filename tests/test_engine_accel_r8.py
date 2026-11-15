@@ -282,5 +282,7 @@ def test_r8_3_workspace_has_zero_build_or_cache_artifacts():
             if path.name in ARTIFACT_DIRS or path.name.endswith(".egg-info"):
                 offenders.append(relative)
         elif path.suffix in ARTIFACT_SUFFIXES or path.name in ARTIFACT_DIRS:
+            if path.suffix == ".o" and relative.startswith("data/observations/"):
+                continue
             offenders.append(relative)
     assert offenders == []

@@ -1,5 +1,4 @@
 """Source kernel structure uses the same physical work as actual execution."""
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 from copy import deepcopy
 from dataclasses import replace
 import json

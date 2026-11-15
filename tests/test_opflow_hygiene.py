@@ -50,7 +50,9 @@ def _python_files() -> list[Path]:
 def test_python_line_limit_and_lf() -> None:
     for path in ROOT.rglob("*"):
         if path.is_file() and ".git" not in path.parts:
-            assert b"\r" not in path.read_bytes(), f"CR byte in {path}"
+            raw_p = path.read_bytes()
+            if b"\x00" not in raw_p[:8192] and path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".gz", ".whl", ".so", ".sqlite", ".db", ".o"}:
+                assert b"\r" not in raw_p, f"CR byte in {path}"
     for path in _python_files():
         raw = path.read_bytes()
         assert b"\r" not in raw, f"CR byte in {path}"

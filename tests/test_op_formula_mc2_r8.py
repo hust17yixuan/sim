@@ -15,7 +15,6 @@
 [Side-Effect Policy]
   Read-only golden access; mutations use private copies. No writes.
 """
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 
 from copy import deepcopy
 import json
@@ -23,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+pytest.importorskip("mindie_profiler")
 from mindie_profiler.op_abi_bridge import AbiError, infer_request
 from mindie_profiler.op_abi_descriptors import slot_descriptors
 from mindie_profiler.op_abi_slots import slot_records

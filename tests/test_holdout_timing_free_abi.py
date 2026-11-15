@@ -15,7 +15,6 @@
 [Side-Effect Policy] Read-only except for the explicitly requested executions.
 """
 from __future__ import annotations
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 
 import json
 import os
@@ -58,6 +57,7 @@ def inputs():
 
 @pytest.fixture(scope="module")
 def predictions(inputs):
+    pytest.importorskip("mindie_profiler")
     from mindie_profiler.sim_bridge import predict_native_requests
     return predict_native_requests(
         inputs, hardware=SKU, execute=True, blocking=True)

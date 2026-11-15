@@ -1,5 +1,4 @@
 """Independent Kimi MX declarations checked against retained native interfaces."""
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 from copy import deepcopy
 from dataclasses import replace
 from functools import lru_cache

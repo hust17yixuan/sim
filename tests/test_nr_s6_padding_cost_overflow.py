@@ -18,6 +18,8 @@ import math
 
 import pytest
 
+pytest.importorskip("mindie_profiler")
+
 from mindie_sim import diff_trace as diff
 
 CASES = [

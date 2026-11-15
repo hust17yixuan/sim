@@ -16,6 +16,11 @@
  */
 #ifndef MSIM_ENGINE_ACCEL_CORE_H
 #define MSIM_ENGINE_ACCEL_CORE_H
+#ifdef _WIN32
+#define MSIM_EXPORT __declspec(dllexport)
+#else
+#define MSIM_EXPORT
+#endif
 
 #include <stdbool.h>
 #include <stddef.h>

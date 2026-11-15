@@ -28,7 +28,6 @@
 """
 
 from __future__ import annotations
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 
 import copy
 import hashlib
@@ -39,6 +38,7 @@ import types
 
 import pytest
 
+pytest.importorskip("mindie_profiler")
 from mindie_profiler.fabric_probe import build_fabric_probe_plan
 from mindie_profiler.fabric_probe_fit import fit_calibrated_fabric_profile
 from mindie_profiler.op_api_registry import (

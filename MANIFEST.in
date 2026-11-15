@@ -16,4 +16,3 @@ recursive-include data/verification *.json
 recursive-include tools *.py *.ptx *.cpp *.sh
 recursive-include benchmarks *.py *.json
 global-exclude *.py[cod]
-recursive-include mindie_sim *.json *.c *.h

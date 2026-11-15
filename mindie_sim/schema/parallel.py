@@ -515,7 +515,10 @@ class ParallelSpec:
             raise ModelingError("ep_requires_moe_model")
 
     def to_dict(self) -> dict[str, Any]:
-        return {key: getattr(self, key) for key in (
+        out = {key: getattr(self, key) for key in (
             "dp", "tp", "ep", "pp", "cp", "pcp", "cp_plan",
             "prefill_cp_plan", "decode_cp_plan", "enable_dsa_cp",
             "expert_tp", "expert_dp", "pcp_lane_policy")}
+        if self.rank_table is not None:
+            out["rank_table"] = [list(group) for group in self.rank_table]
+        return out

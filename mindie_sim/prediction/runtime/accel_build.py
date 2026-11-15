@@ -25,8 +25,6 @@ from pathlib import Path
 import platform
 import shutil
 import subprocess
-
-_WIN_NO_WINDOW = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if os.name == "nt" else {}
 import sys
 import tempfile
 import threading
@@ -55,6 +53,7 @@ _BASE_FLAGS = (
 _STATUS_MEMO: dict[tuple, dict] = {}
 _IDENTITY_MEMO: dict[tuple, str] = {}
 _MEMO_LOCK = threading.Lock()
+_SUBPROCESS_KWARGS = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
 
 
 def source_dir() -> Path:
@@ -93,7 +92,7 @@ def library_extension() -> str:
 
 def compiler_flags() -> list[str]:
     """Exact deterministic flags; never ``-march=native`` or fast-math."""
-    flags = list(_BASE_FLAGS)
+    flags = [f for f in _BASE_FLAGS if not (os.name == "nt" and f == "-fPIC")]
     if sys.platform == "darwin":
         flags.extend(("-dynamiclib", "-lm"))
     elif os.name == "nt":
@@ -126,7 +125,8 @@ def discover_compiler() -> tuple[str | None, str | None]:
         if found is None:
             return None, "compiler_unavailable:configured_override_missing"
         return found, None
-    for candidate in ("cc", "clang", "gcc"):
+    candidates = ("gcc", "clang", "cc") if os.name == "nt" else ("cc", "clang", "gcc")
+    for candidate in candidates:
         found = shutil.which(candidate)
         if found is not None:
             return found, None
@@ -177,7 +177,7 @@ def _compiler_identity(compiler: str, *, persist: bool = False) -> str:
     try:
         completed = subprocess.run(
             [compiler, "--version"], capture_output=True, text=True,
-            timeout=PROBE_TIMEOUT_SECONDS, check=False)
+            timeout=PROBE_TIMEOUT_SECONDS, check=False, **_SUBPROCESS_KWARGS)
         lines = (completed.stdout or completed.stderr or "").splitlines()
         if lines:
             version = lines[0].strip()[:160]
@@ -260,7 +260,7 @@ def _validate(path: Path) -> tuple[bool, str]:
         completed = subprocess.run(
             [sys.executable, "-c", _VALIDATE_BODY, str(path)],
             capture_output=True, text=True,
-            timeout=VALIDATE_TIMEOUT_SECONDS, check=False)
+            timeout=VALIDATE_TIMEOUT_SECONDS, check=False, **_SUBPROCESS_KWARGS)
     except subprocess.TimeoutExpired:
         return False, "abi_probe_timeout"
     except TimeoutError:
@@ -336,7 +336,7 @@ def _publish(compiler: str, flags: list[str], destination_dir: Path,
         try:
             completed = subprocess.run(
                 command, capture_output=True, text=True,
-                timeout=COMPILE_TIMEOUT_SECONDS, check=False)
+                timeout=COMPILE_TIMEOUT_SECONDS, check=False, **_SUBPROCESS_KWARGS)
         except subprocess.TimeoutExpired:
             return False, "accel_compile_timeout", None
         except TimeoutError:

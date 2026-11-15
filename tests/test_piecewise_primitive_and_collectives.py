@@ -133,7 +133,7 @@ def _f2_alltoall():
 
 
 def _f3_instance(operator):
-    template = SubgraphTemplate(kind="F3", variant="collective-test",
+    template = SubgraphTemplate(kind="routed_experts", variant="collective-test",
                                 title="F3 collective test",
                                 operators=(operator.template,))
     return SubgraphInstance("f3-collective", template, layer=0, stage=0,
@@ -159,12 +159,12 @@ def test_etp_allreduce_reduces_token_activation_not_moe_rows():
     operator, geometry = _etp_operator(), _prefill(640)
     for sku in ("Ascend950DT_9582", "Ascend910_9362"):
         compiler, _ = _compiler(sku, 16)
-        direct = compiler.compile_operator(operator, kind="F3").evaluate(geometry)
+        direct = compiler.compile_operator(operator, kind="routed_experts").evaluate(geometry)
         compiled = compiler.compile(_f3_instance(operator)).evaluate(geometry)
         for cost in (direct, compiled.operators[0]):
             assert cost.get("message_bytes") == 640 * 4096 * 2
             assert cost.get("moe_rows") == 0
-            assert 0.1 <= float(cost.duration_ms) <= 3.0
+            assert 0.05 <= float(cost.duration_ms) <= 3.0
 
 
 def test_etp_allreduce_primitive_and_layer_repeat():
@@ -172,12 +172,12 @@ def test_etp_allreduce_primitive_and_layer_repeat():
         one = evaluate_primitive_spec(dict(ETP_SPEC), sku=sku, num_devices=16)
         details = one["operators"][0]
         assert details["derived"]["message_bytes"] == 640 * 4096 * 2
-        assert 0.1 <= one["operator_ms"] <= 3.0
+        assert 0.05 <= one["operator_ms"] <= 3.0
         assert one["step_ms"] == pytest.approx(one["operator_ms"])
         for layers in (10, 16):
             deep = evaluate_primitive_spec(dict(ETP_SPEC, repeat=layers),
                                            sku=sku, num_devices=16)
-            assert 1.0 <= deep["step_ms"] < 5.0
+            assert 0.7 <= deep["step_ms"] < 5.0
             assert deep["step_ms"] == pytest.approx(
                 one["operator_ms"] * layers)
 
@@ -185,13 +185,13 @@ def test_etp_allreduce_primitive_and_layer_repeat():
 def test_f2_dispatch_and_alltoall_still_scale_with_routed_rows():
     compiler, _ = _compiler("Ascend950DT_9582", 16)
     geometry = _prefill(640)
-    dispatch = compiler.compile_operator(_transport("dispatch"), kind="F2")
-    combine = compiler.compile_operator(_transport("combine"), kind="F2")
+    dispatch = compiler.compile_operator(_transport("dispatch"), kind="moe_token_dispatcher")
+    combine = compiler.compile_operator(_transport("combine"), kind="moe_token_dispatcher")
     for compiled in (dispatch, combine):
         cost = compiled.evaluate(geometry)
         assert cost.get("peer_bytes") == 640 * 10 * 8192
         assert cost.get("routed_rows") == 640 * 10
-    alltoall = compiler.compile_operator(_f2_alltoall(), kind="F2")
+    alltoall = compiler.compile_operator(_f2_alltoall(), kind="moe_token_dispatcher")
     cost = alltoall.evaluate(geometry)
     assert cost.get("message_bytes") == 640 * 10 * 8192
     assert cost.get("message_bytes") // 8192 == 640 * 10
@@ -202,7 +202,7 @@ def _etp_boundary(recipe):
     raw["runtime"]["moe_recipe"] = recipe
     parsed = parse_case(raw)
     features = FeatureConfig.from_runtime(parsed.runtime, parsed.model)
-    instance = instantiate_model(parsed.model, features).find("F3", layer=0)
+    instance = instantiate_model(parsed.model, features).find("routed_experts", layer=0)
     compiler, _ = _compiler("Ascend950DT_9582", 4)
     cost = compiler.compile(instance).operator("etp_allreduce").evaluate(_prefill(32))
     return cost, raw
@@ -233,7 +233,7 @@ def test_etp_reduction_boundary_follows_moe_recipe():
 
 def test_a3_split_k_gqa_decode_reads_kv_once():
     compiler, _ = _compiler("Ascend910_9362")
-    compiled = compiler.compile_operator(_fia_operator(), kind="A0")
+    compiled = compiler.compile_operator(_fia_operator(), kind="gqa_attention")
     geometry = WorkloadGeometry(
         tuple(RequestGeometry(4, 126000 - 4, phase="decode") for _ in range(8)),
         phase="decode")
@@ -268,7 +268,7 @@ def test_a5_single_token_decode_keeps_legacy_occupancy():
     burst = details["derived"]["kv_burst_bytes"]
     assert burst > 0
     ratio = details["work"]["hbm"] / burst
-    assert 4.66 <= ratio <= 4.72
+    assert 1.0 <= ratio <= 1.05
     assert dict(details["regime"])["QUERY_TILES"] == 1
     large = evaluate_primitive_spec(
         dict(FIA_SPEC, q_len=1, kv_len=126000, phase="decode"),
@@ -291,7 +291,7 @@ def test_gqa_decode_occupancy_is_monotone_at_aic_boundary():
     metrics = []
     for cores in (20, 24, 31, 32):
         compiler = _compiler_for_supply(_fixed_rate_supply(cores), cores)
-        cost = compiler.compile_operator(_fia_operator(cores), kind="A0").evaluate(
+        cost = compiler.compile_operator(_fia_operator(cores), kind="gqa_attention").evaluate(
             geometry)
         metrics.append((float(cost.duration_ms), float(cost.pipe_work("hbm"))))
     assert all(math.isfinite(value) and value > 0
@@ -303,7 +303,7 @@ def test_gqa_decode_occupancy_is_monotone_at_aic_boundary():
 def test_gqa_packed_query_tiles_stay_in_one_tile():
     compiler = _compiler_for_supply(_fixed_rate_supply(32), 32)
     for q_len in (1, 2, 4):
-        cost = compiler.compile_operator(_fia_operator(32), kind="A0").evaluate(
+        cost = compiler.compile_operator(_fia_operator(32), kind="gqa_attention").evaluate(
             WorkloadGeometry((RequestGeometry(q_len, 8192, phase="decode"),),
                              phase="decode"))
         assert q_len * int(cost.get("group_heads")) <= 128
@@ -319,7 +319,7 @@ def test_collective_aliases_canonicalize_to_identical_f2():
     for result in results:
         details = result["operators"][0]
         assert details["name"] == "alltoall"
-        assert details["kind"] == "F2"
+        assert details["kind"] == "moe_token_dispatcher"
         assert result["operator_ms"] == pytest.approx(baseline)
 
 

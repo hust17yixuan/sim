@@ -1,5 +1,4 @@
 """Declared model graphs compared with retained A3/A5 native descriptors."""
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 from dataclasses import replace
 import json
 from pathlib import Path

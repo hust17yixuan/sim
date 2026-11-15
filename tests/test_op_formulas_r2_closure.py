@@ -26,7 +26,6 @@
 """
 
 from __future__ import annotations
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 
 import json
 import random
@@ -35,6 +34,7 @@ from pathlib import Path
 
 import pytest
 
+pytest.importorskip("mindie_profiler")
 from mindie_profiler.op_abi_bridge import AbiError, infer_request
 from mindie_profiler.op_formula_annotator import (
     annotate_profile_formulas, call_mcp_tool,

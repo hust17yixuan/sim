@@ -292,6 +292,8 @@ def _indexer_source_declaration(ctx: _Ctx) -> tuple[tuple[str, Any], ...] | None
 
 
 def _gemma_k_eq_v(ctx: _Ctx) -> bool:
+    if ctx.layer.k_eq_v:
+        return True
     facts = _gemma_facts(ctx)
     layers = facts.get("gemma4_k_eq_v_layers")
     if layers is None:
@@ -500,6 +502,18 @@ def _build_standard_attention(ctx: _Ctx) -> _Built:
                ("k_bytes", rope_bytes), ("output_dtype", post_dtype),
                ("partition", "q_k")))
     specs.append(("attention", "attention", "attention"))
+    plans, idx_raw, sel_raw = ctx.model.layer_plans, int(ctx.layer.index_k_owner_layer_id), int(ctx.layer.topk_owner_layer_id)
+    if ctx.layer.indexer:
+        idx_owner = sel_owner = ctx.layer.index
+    else:
+        idx_owner = idx_raw if (0 <= idx_raw < ctx.layer.index and idx_raw < len(plans) and plans[idx_raw].indexer) else -1
+        sel_owner = sel_raw if (0 <= sel_raw < ctx.layer.index and sel_raw < len(plans) and (plans[sel_raw].indexer or plans[sel_raw].owns_topk)) else idx_owner
+    has_indexer = bool(ctx.layer.indexer or ctx.layer.owns_topk or idx_owner >= 0 or sel_owner >= 0)
+    gqa_topk = int(ctx.layer.index_topk) if has_indexer else 0
+    gqa_kpool = max(1, int(ctx.layer.index_kpool or 1))
+    idx_reqs = ((("index_topk", gqa_topk), ("kpool", gqa_kpool),
+                 ("require_index", idx_owner), ("require_selection", sel_owner))
+                if gqa_topk > 0 and idx_owner >= 0 else ())
     block = int(dict(ctx.features.metadata).get("kv_block_size", 0) or 0)
     signatures["attention"] = _attention_sig( "attention", ctx, local_heads=ctx.local_heads,
         local_kv_heads=ctx.local_kv_heads, group_heads=ctx.group_heads, width=ctx.width, value_width=ctx.width,
@@ -509,6 +523,7 @@ def _build_standard_attention(ctx: _Ctx) -> _Built:
                ("k_eq_v", int(k_eq_v)), ("local_window", int(ctx.layer.window)),
                ("page_attention", 1 if block > 0 else 0),
                ("page", block if block > 0 else 0))
+        + idx_reqs
         + ((("require_kv", int(ctx.layer.kv_owner_layer_id)),) if shared else ()))
     _dcp_merge(ctx, specs, signatures, local_heads=ctx.local_heads, d_v=ctx.width)
     _pcp_kv_gather(ctx, specs, signatures)
@@ -701,7 +716,7 @@ def _build_standard_attention(ctx: _Ctx) -> _Built:
         contract_items.append(
             ("qkv_kv_view", ("kv", "aggregate", "key", "value")))
     contract = tuple(contract_items)
-    a0_state_in = [_HIDDEN_IN, _KV_IN]
+    a0_state_in = [_HIDDEN_IN, _KV_IN] + ([_in("index_selection", "selection")] if gqa_topk > 0 else [])
     if shared and ctx.stage != _owner_stage(ctx):
         a0_state_in.append(_in(
             "cross_stage_ready", "readiness", scope="stage",
@@ -1969,7 +1984,8 @@ def gemma4_model_spec(config: Mapping[str, Any], *, name: str = "gemma4") -> Mod
         global_head_dim = int(c.get("global_head_dim") or 512)
         kv_heads = int(c.get("num_key_value_heads", heads) or heads)
         global_kv_heads = int(c.get("num_global_key_value_heads") or kv_heads)
-        intermediate = int(c.get("intermediate_size") or c.get("ffn_dim") or 1)
+        intermediate = int(c.get("intermediate_size") or c.get("shared_expert_intermediate_size")
+                           or c.get("ffn_dim") or c.get("moe_intermediate_size") or 1)
     except (KeyError, TypeError, ValueError) as exc:
         raise ModelingError("gemma4_config_incomplete") from exc
     if min(hidden, layers, heads, head_dim, global_head_dim) < 1:
@@ -2039,7 +2055,8 @@ def gemma4_model_spec(config: Mapping[str, Any], *, name: str = "gemma4") -> Mod
             shared_intermediate_size=int(c.get("shared_expert_intermediate_size", 0) or 0),
             qk_norm=bool(c.get("use_qk_norm", c.get("qk_norm", True))),
             ffn_activation=activation, kv_owner_layer_id=owners[index],
-            owns_long_kv=owners[index] == index, native_layer_id=index))
+            owns_long_kv=owners[index] == index, k_eq_v=(index in set(k_layers)),
+            native_layer_id=index))
     facts = tuple(sorted({ "gemma4": 1, "gemma4_ple": int(ple),
         "gemma4_ple_layers": ple_layers, "gemma4_ple_width": ple_width,
         "gemma4_ple_tables": int(c.get("ple_tables", 1) or 1), "gemma4_ple_gated": bool(c.get("ple_gated", True)),

@@ -14,7 +14,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 from collections.abc import Mapping
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -87,6 +87,26 @@ def _json_value(value):
     return _intern_tree(json.loads(json.dumps(value, allow_nan=False)))
 
 
+_NATIVE_EVIDENCE_KEYS = frozenset(("native_call", "native_call_binding", "observed_aliases"))
+
+
+def _without_native_call_evidence(op):
+    """Structural view: derived native-call provenance is not identity."""
+    meta = dict(op.metadata)
+    semantic = meta.get("semantic_metadata")
+    nested = (isinstance(semantic, Mapping)
+              and bool(_NATIVE_EVIDENCE_KEYS.intersection(semantic)))
+    if not _NATIVE_EVIDENCE_KEYS.intersection(meta) and not nested:
+        return op
+    for key in _NATIVE_EVIDENCE_KEYS:
+        meta.pop(key, None)
+    if nested:
+        meta["semantic_metadata"] = {
+            key: value for key, value in semantic.items()
+            if key not in _NATIVE_EVIDENCE_KEYS}
+    return replace(op, metadata=tuple(meta.items()))
+
+
 def _node_id(replica, op_id):
     return f"rank:{replica}/{op_id}"
 
@@ -129,7 +149,9 @@ def _node(op, replica, *, source_call=None, block=None, role=None, structure=Non
         # start its program, consult timings, or resolve captured ABI identity.
         op, plan = book.prepare(op, geometry)
     node_id = _node_id(replica, op.op_id)
-    operator = op.to_dict(include_work=False)
+    full_operator = op.to_dict(include_work=False)
+    structural_op = _without_native_call_evidence(op)
+    operator = structural_op.to_dict(include_work=False)
     contract = predicted_contract(operator)
     outputs_by_id = {} if outputs_by_id is None else outputs_by_id
     metadata_by_id = {} if metadata_by_id is None else metadata_by_id
@@ -142,7 +164,7 @@ def _node(op, replica, *, source_call=None, block=None, role=None, structure=Non
         # extraction path and must not hide a malformed T11 layout.
         produced = ()
     structure_record = operator_structure(
-        operator, contract, semantic_refs=semantic_refs, owner_id=node_id,
+        full_operator, contract, semantic_refs=semantic_refs, owner_id=node_id,
         context={"op": op, "outputs_by_id": outputs_by_id,
                  "metadata_by_id": metadata_by_id, "produced": produced})
     outputs_by_id[op.op_id] = tuple(structure_record["values"]["outputs"])
@@ -156,6 +178,7 @@ def _node(op, replica, *, source_call=None, block=None, role=None, structure=Non
     else:
         binding = bind_native_call(op, contract=contract, plan=plan,
                                    prepared=op if plan is not None else None)
+
     payload = {
         "node_id": node_id,
         "op_id": op.op_id,
@@ -177,7 +200,7 @@ def _node(op, replica, *, source_call=None, block=None, role=None, structure=Non
         "native_execution": structure_record["native_execution"],
         "representation_gaps": structure_record["gaps"],
         "implementation": native_implementation(operator, contract) or {},
-        **node_physical(op, recipe_bindings=kernels),
+        **node_physical(structural_op, recipe_bindings=kernels),
         "physical_work_basis": ("prepared_source_plan" if geometry is not None else
                                 "source_declaration_without_resource_geometry")
                                if op.source_boundary == "kernel" else "operator_declaration",
@@ -197,7 +220,8 @@ def _node(op, replica, *, source_call=None, block=None, role=None, structure=Non
 
 
 def export_op_structure(ops, *, model, execution, kernels=None, source=None,
-                        expand_calls=True, resource_graphs=None, resource_geometries=None):
+                        expand_calls=True, resource_graphs=None, resource_geometries=None,
+                        native_evidence=False):
     """Export a declared OpSpec DAG without a hardware Case or timing execution.
 
     A sequence selects replica 0; a mapping supplies explicit replica -> DAG.
@@ -210,6 +234,10 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
     ``resource_geometries`` optionally maps (replica, stage) to declared Geometry
     for source-kernel planning. It contains ownership/capacity, not resource rates.
     Caller ``source`` is provenance excluded from the content hash.
+    ``native_evidence=True`` attaches derived ``native_calls`` and
+    ``native_call_coverage`` beside the identity. It is opt-in because released
+    consumers (profiler <= 0.5.11) verify ``graph_id`` over every top-level key
+    except ``graph_id``/``source``; the default report stays verifiable by them.
     """
     graphs = ops if isinstance(ops, Mapping) else {0: ops}
     graphs = {replica: tuple(operators) for replica, operators in graphs.items()}
@@ -251,7 +279,7 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
             if is_expanded:
                 source_calls.append(_json_value({
                     "node_id": parent,
-                    "operator": op.to_dict(include_work=False),
+                    "operator": _without_native_call_evidence(op).to_dict(include_work=False),
                     "children": [
                         _node_id(replica, child.op_id)
                         for child in expanded if child.op_id != op.op_id
@@ -397,21 +425,23 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
     encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"), allow_nan=False)
     for chunk in encoder.iterencode(payload):
         digest.update(chunk.encode("utf-8"))
-    return {
+    report = {
         **payload,
         "graph_id": "sha256:" + digest.hexdigest(),
         "source": _json_value(source),
+    }
+    if native_evidence:
         # Derived actual-invocation evidence: carried beside the structural
         # identity, excluded from its hash exactly like caller source.
-        "native_calls": _json_value(native_calls),
-        "native_call_coverage": _json_value(
-            coverage_from_records(native_calls, emitted=len(nodes))),
-    }
+        report["native_calls"] = _json_value(native_calls)
+        report["native_call_coverage"] = _json_value(
+            coverage_from_records(native_calls, emitted=len(nodes)))
+    return report
 
 
 def export_structure(case, *, phase, tokens, context=0, sequences=1,
                      scope="model", source=None, expand_calls=True, apply_body_defaults=True,
-                     replicas=None):
+                     replicas=None, native_evidence=False):
     """Export the first independent DP cohort, without evaluating its timing.
 
     ``case`` is the same complete declared case accepted by ``target_graphs``.
@@ -424,7 +454,7 @@ def export_structure(case, *, phase, tokens, context=0, sequences=1,
         case, phase=phase, tokens=tokens, context=context, sequences=sequences,
         scope=scope, source=source, expand_calls=expand_calls,
         apply_body_defaults=apply_body_defaults, replicas=replicas)
-    return export_op_structure(graphs, **options)
+    return export_op_structure(graphs, native_evidence=native_evidence, **options)
 
 
 def _structure_inputs(case, *, phase, tokens, context=0, sequences=1,

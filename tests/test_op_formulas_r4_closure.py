@@ -23,7 +23,6 @@
 """
 
 from __future__ import annotations
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 
 import itertools
 import json
@@ -32,6 +31,7 @@ from unittest.mock import patch
 
 import pytest
 
+pytest.importorskip("mindie_profiler")
 from mindie_profiler.op_abi_bridge import AbiError, infer_request
 from mindie_profiler.op_formula_annotator import (
     annotate_profile_formulas, annotate_row, call_mcp_tool, load_rows, main,

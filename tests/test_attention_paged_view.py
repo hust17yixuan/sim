@@ -64,8 +64,13 @@ def test_page_tail_and_actual_batch_follow_declared_storage_and_fusion():
 
 def test_unmodeled_context_partition_does_not_claim_an_unsharded_paged_abi():
     base = case("qwen38-a5", kv_storage="paged")
-    sharded = replace(base, runtime=replace(
-        base.runtime, parallel=replace(base.runtime.parallel, cp=2)))
+    dies = base.machine.dies if len(base.machine.dies) >= 2 else (
+        base.machine.dies[0], replace(base.machine.dies[0], rank=1))
+    sharded = replace(
+        base,
+        machine=replace(base.machine, dies=dies),
+        runtime=replace(base.runtime, parallel=replace(base.runtime.parallel, tp=2, cp=2)),
+    )
     ops = target_operators(sharded, phase="decode", tokens=1, context=2048)
     attention = [op for op in ops if op.family == "attention"]
     assert attention

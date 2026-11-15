@@ -191,13 +191,17 @@ def test_python_backend_performs_zero_discovery(monkeypatch):
 def test_source_and_counterexamples_execute_clean_under_asan_ubsan(tmp_path):
     source = RUNTIME / "_engine_accel.c"
     harness = ROOT / "tests" / "accel_sanitizer_harness.c"
-    binary = tmp_path / "accel_sanitizer"
-    command = ["clang", "-std=c11", "-O1", "-g",
-               "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
-               "-ffp-contract=off", "-I", str(RUNTIME), str(source),
-               str(harness), "-o", str(binary), "-lm"]
-    completed = subprocess.run(command, capture_output=True, text=True,
-                               timeout=240, check=False)
+    cc = (accel_build.discover_compiler()[0] if os.name == "nt"
+          else (shutil.which("clang") or accel_build.discover_compiler()[0]))
+    binary = tmp_path / ("accel_sanitizer.exe" if os.name == "nt" else "accel_sanitizer")
+    san = () if os.name == "nt" else ("-fsanitize=address,undefined", "-fno-sanitize-recover=all")
+    libm = () if os.name == "nt" else ("-lm",)
+    base_cmd = [cc, "-std=c11", "-O1", "-g", "-ffp-contract=off", "-I", str(RUNTIME),
+                str(source), str(harness), "-o", str(binary), *libm]
+    completed = subprocess.run([*base_cmd[:4], *san, *base_cmd[4:]], capture_output=True,
+                               text=True, timeout=240, check=False)
+    if completed.returncode != 0 and san:
+        completed = subprocess.run(base_cmd, capture_output=True, text=True, timeout=240, check=False)
     assert completed.returncode == 0, completed.stderr[-2000:]
     environment = dict(os.environ)
     environment["ASAN_OPTIONS"] = "detect_leaks=0:halt_on_error=1"
@@ -210,13 +214,13 @@ def test_source_and_counterexamples_execute_clean_under_asan_ubsan(tmp_path):
     assert "AddressSanitizer" not in output
     assert "runtime error" not in output
     strict = subprocess.run(
-        ["clang", "-std=c11", "-O1", "-Wall", "-Wextra", "-Werror",
+        [cc, "-std=c11", "-O1", "-Wall", "-Wextra", "-Werror",
          "-ffp-contract=off", "-I", str(RUNTIME), "-c", str(source),
          "-o", str(tmp_path / "accel.o")],
         capture_output=True, text=True, timeout=180, check=False)
     assert strict.returncode == 0, strict.stderr[-2000:]
     harness_strict = subprocess.run(
-        ["clang", "-std=c11", "-O1", "-Wall", "-Wextra", "-Werror",
+        [cc, "-std=c11", "-O1", "-Wall", "-Wextra", "-Werror",
          "-ffp-contract=off", "-I", str(RUNTIME), "-c", str(harness),
          "-o", str(tmp_path / "harness.o")],
         capture_output=True, text=True, timeout=180, check=False)

@@ -8,7 +8,7 @@
   sustained rate from ``native_clock_rates``.
 [Invariants]
   * Continuous/tile-quantised geometry laws only.  No shape list, ``case_id`` /
-    ``cohort_id`` selector, piecewise knot table, ``fixed_us`` or observed
+    ``cohort_id`` selector, piecewise knot table, ``constant_us_intercept`` or observed
     duration is stored or read.
   * Fewer active owners never lend their bandwidth; private L1/L2 port streams
     scale with active owners, and shared HBM/DMA streams ramp with concurrency.

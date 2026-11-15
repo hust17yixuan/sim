@@ -24,13 +24,13 @@
 """
 
 from __future__ import annotations
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 
 import contextlib
 import io
 import json
 import os
 from pathlib import Path
+__import__("pytest").importorskip("mindie_profiler")
 from mindie_profiler import repro_atomic_io as checked_io
 import sys
 import types

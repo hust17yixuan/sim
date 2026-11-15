@@ -11,7 +11,6 @@ Small deterministic cases only; no waits, locks, network or subprocesses.
 [Side-Effect Policy]
 Read-only tests; pytest artifacts are placed in caller-selected scratch space.
 """
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 
 import inspect
 import random
@@ -34,6 +33,7 @@ from mindie_sim.opflow.transfer_accounting import (
 )
 from mindie_sim.opflow.triton_lowering import analyze_triton_lowering
 from mindie_sim.opflow.v4_math import evaluate_math
+pytest.importorskip("mindie_profiler")
 from mindie_profiler.aclgraph_multistream import ParallelRegion, StreamInterval, diagnose_region
 from mindie_profiler.aclgraph_mcp import aclgraph_diagnose
 from mindie_profiler.memory_evidence import region_memory_service

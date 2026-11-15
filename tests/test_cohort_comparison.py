@@ -1,5 +1,4 @@
 """Retained native rows flow through the real profiler cohort producer into sim."""
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 from copy import deepcopy
 from dataclasses import replace
 from itertools import islice

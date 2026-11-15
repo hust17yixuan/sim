@@ -24,7 +24,6 @@
 """
 
 from __future__ import annotations
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 
 import csv
 import importlib.util
@@ -34,6 +33,7 @@ from pathlib import Path
 
 import pytest
 
+pytest.importorskip("mindie_profiler")
 from mindie_profiler.op_formula_annotator import annotate_row
 from mindie_sim.op_formulas import evaluate_operator
 

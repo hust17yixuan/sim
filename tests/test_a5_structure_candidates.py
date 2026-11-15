@@ -301,7 +301,7 @@ def test_source_call_expansion_keeps_one_call_identity_across_kernels():
 
     raw = mla_case()
     report = export_structure(raw, phase="decode", tokens=1, context=16,
-                              sequences=2)
+                              sequences=2, native_evidence=True)
     call = next(row for row in report["source_calls"])
     assert call["operator"]["source_boundary"] == "call"
     assert call["children"]

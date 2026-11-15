@@ -508,6 +508,10 @@ def _merge_requests(requests: Any, overrides: Mapping[str, Any], runtime: dict[s
         o_tok = int(overrides["output_tokens"]) if overrides.get("output_tokens") is not None else int(req.get("output_tokens", 128))
         pref = int(overrides["prefix_tokens"]) if overrides.get("prefix_tokens") is not None else int(req.get("prefix_tokens", 0))
         req.update(prompt_tokens=p_tok, output_tokens=o_tok, prefix_tokens=min(pref, p_tok))
+        if "text_prompt_tokens" in req or "text_tokens" in req:
+            media_tok = int(req.get("media_tokens", 0) or 0)
+            req["text_prompt_tokens"] = max(0, p_tok - media_tok)
+            req.pop("text_tokens", None)
         out_reqs.append(req)
     runtime["max_model_len"] = max(int(runtime.get("max_model_len", 32768)), max((r["prompt_tokens"] + r["output_tokens"] for r in out_reqs), default=4096))
     runtime["max_num_seqs"] = max(int(runtime.get("max_num_seqs", 256)), count)

@@ -1,5 +1,4 @@
 """Source-defined routing work and independent retained selection contracts."""
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 from dataclasses import replace
 import json
 from pathlib import Path

@@ -637,7 +637,13 @@ def compose_case(
         runtime_meta["enable_shared_expert_dp"] = True
 
     runtime_dict: dict[str, Any] = {
-        "parallel": {"dp": dp, "tp": tp, "pp": pp, "ep": ep, "cp": dcp, "dcp": dcp, "pcp": pcp},
+        "parallel": {
+            "dp": dp, "tp": tp, "pp": pp, "ep": ep, "cp": dcp, "dcp": dcp, "pcp": pcp,
+            **({"rank_table": [list(range(g * int(ep), (g + 1) * int(ep)))
+                               for g in range((int(dp) * int(tp) * int(pcp)) // int(ep))]}
+               if int(pcp) > 1 and int(ep) > int(dp) * int(tp)
+               and (int(dp) * int(tp) * int(pcp)) % int(ep) == 0 else {}),
+        },
         "max_num_seqs": resolved_max_seqs,
         "max_num_batched_tokens": resolved_max_batched,
         "max_model_len": resolved_max_model_len,

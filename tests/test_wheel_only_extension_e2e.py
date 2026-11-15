@@ -86,7 +86,6 @@ the installed package: the loader imports this file through its snapshot
 finder.
 """
 from __future__ import annotations
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 
 import csv
 from dataclasses import replace

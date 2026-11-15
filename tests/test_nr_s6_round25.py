@@ -11,7 +11,6 @@
   Files are confined to pytest temporary directories; no interpreter limits
   are changed. Caller storage mappings remain untouched.
 """
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 
 import ast
 import hashlib
@@ -31,6 +30,7 @@ try:
 except ImportError:
     tiktoken = None
 
+pytest.importorskip("mindie_profiler")
 from mindie_profiler.__main__ import main as cli_main
 from mindie_profiler.events import ProfilerUsageError
 from mindie_profiler.op_api_registry import bind_captured_occurrence

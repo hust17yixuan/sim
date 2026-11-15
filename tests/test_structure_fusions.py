@@ -1,5 +1,4 @@
 """Native fusion candidates retain real semantic work and ownership."""
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 from dataclasses import replace
 import json
 from pathlib import Path

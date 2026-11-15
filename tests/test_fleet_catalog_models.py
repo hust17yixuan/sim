@@ -211,7 +211,7 @@ def test_fleet_layer_plans_use_supported_attention_cores():
     for gemma in (gemma26, gemma31):
         facts = dict(gemma.catalog_facts)
         assert facts["gemma4"] == 1 and facts["gemma4_ple"] == 0
-        assert facts["gemma4_ple_layers"] == ()
+        assert tuple(facts["gemma4_ple_layers"]) == ()
         assert facts["attention_schedule"].count("global") == len(
             [p for p in gemma.layer_plans if not p.window])
 
@@ -403,11 +403,12 @@ def test_sparse_attention_orders_indexer_before_attention_and_bounds_kv():
             model, FeatureConfig.from_model(model, **FEATURES))
         layer = instantiated.layers[layer_index]
         kinds = [subgraph.kind for subgraph in layer.subgraphs]
-        assert kinds.index("I0") < kinds.index("A0"), key
-        assert kinds.index("I1") < kinds.index("A0"), key
-        a0 = layer.find("A0", role="attention")
+        attn_kind = next(k for k in kinds if k in {"gqa_attention", "mha_attention", "mqa_attention", "swa_attention"})
+        assert kinds.index("indexer_prolog") < kinds.index(attn_kind), key
+        assert kinds.index("lightning_indexer") < kinds.index(attn_kind), key
+        a0 = layer.find(attn_kind, role="attention")
         assert int(a0.operator("attention").theta.find("index_topk")) > 0, key
-        i1 = layer.find("I1", role="index_select")
+        i1 = layer.find("lightning_indexer", role="index_select")
         compiler = OperatorPiecewiseCompiler(SUPPLY, POLICY)
 
         def cost_at(instance, name, context):

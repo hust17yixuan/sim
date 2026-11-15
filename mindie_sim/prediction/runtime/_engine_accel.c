@@ -20,7 +20,7 @@
  */
 #include "_engine_accel_core.h"
 
-int32_t msim_ctx_reset(void *ctx);
+MSIM_EXPORT int32_t msim_ctx_reset(void *ctx);
 static void remove_active(msim_ctx *c, msim_task *t);
 
 /* -- validated accessors ------------------------------------------------ */

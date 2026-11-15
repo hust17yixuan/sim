@@ -23,10 +23,10 @@
 """
 
 from __future__ import annotations
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 
 import pytest
 
+pytest.importorskip("mindie_profiler")
 from mindie_profiler.op_abi_bridge import AbiError, infer_request
 from mindie_profiler.op_formula_annotator import annotate_row
 from mindie_sim.op_formulas import FormulaValidationError, evaluate_operator

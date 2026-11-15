@@ -23,7 +23,6 @@
 """
 
 from __future__ import annotations
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 
 import contextlib
 import errno
@@ -37,6 +36,7 @@ from unittest.mock import patch
 
 import pytest
 
+pytest.importorskip("mindie_profiler")
 from mindie_profiler import op_api_registry as registry
 from mindie_profiler import repro_atomic_io as atomic_io
 from mindie_profiler import repro_storage as storage

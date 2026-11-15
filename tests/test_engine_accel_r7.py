@@ -54,9 +54,14 @@ static void *r7_realloc(void *ptr, size_t bytes)
 }
 #define realloc r7_realloc
 #include "_engine_accel.c"
+#ifdef _WIN32
+#define R7_EXP __declspec(dllexport)
+#else
+#define R7_EXP
+#endif
 #undef realloc
 
-void r7_arm(void *ctx, int kind)
+R7_EXP void r7_arm(void *ctx, int kind)
 {
     msim_ctx *c = (msim_ctx *)ctx;
     r7_target = kind == 1 ? (void *)c->cheap
@@ -64,21 +69,22 @@ void r7_arm(void *ctx, int kind)
     r7_armed = 1;
 }
 
-int r7_failures(void) { return r7_hits; }
+R7_EXP int r7_failures(void) { return r7_hits; }
 """
 
 
 @pytest.fixture(scope="module")
 def fault_library():
     """Compile the unchanged kernel with a one-shot failing ``realloc``."""
-    compiler = shutil.which("cc") or shutil.which("clang")
+    compiler, _ = accel_build.discover_compiler()
     assert compiler, "a C compiler is required for the R7 fault probes"
     directory = tempfile.mkdtemp(prefix="nr-s3-r7-fault-")
     source = Path(directory) / "fault_wrapper.c"
     source.write_text(WRAPPER, encoding="ascii")
-    output = Path(directory) / "fault_wrapper.dylib"
+    output = Path(directory) / f"fault_wrapper{accel_build.library_extension()}"
+    pic = () if __import__("os").name == "nt" else ("-fPIC",)
     command = [compiler, "-std=c11", "-O1", "-Wall", "-Wextra", "-Werror",
-               "-ffp-contract=off", "-fPIC", "-shared", "-I", str(RUNTIME),
+               "-ffp-contract=off", *pic, "-shared", "-I", str(RUNTIME),
                str(source), "-o", str(output)]
     done = subprocess.run(command, capture_output=True, text=True, timeout=180)
     assert done.returncode == 0, done.stderr

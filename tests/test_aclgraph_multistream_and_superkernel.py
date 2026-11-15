@@ -13,10 +13,10 @@ Read-only; no files or graph captures are created.
 """
 
 from __future__ import annotations
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 
 import pytest
 
+pytest.importorskip("mindie_profiler")
 from mindie_profiler.aclgraph_mcp import call_tool
 from mindie_profiler.aclgraph_multistream import (
     ACLGraphModelError,

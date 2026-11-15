@@ -1,5 +1,4 @@
 """Independent paged declarations against original mixed-step A3/A5 tensors."""
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 from copy import deepcopy
 from dataclasses import replace
 import json

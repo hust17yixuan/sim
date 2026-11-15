@@ -12,7 +12,6 @@ Bounded local reads and deterministic arithmetic; no waits or locks.
 [Side-Effect Policy]
 Read fixtures and live provenance only; no writes.
 """
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 
 import json
 from collections import Counter
@@ -20,8 +19,11 @@ from pathlib import Path
 
 import pytest
 
+pytest.importorskip("mindie_knowledge")
+
 from mindie_knowledge.distiller_sources import scan_live, static_ingestion
 from mindie_knowledge.cannbot_aclgraph_distiller import distill_units
+pytest.importorskip("mindie_profiler")
 from mindie_profiler.aclgraph_multistream import ParallelRegion, StreamInterval, diagnose_region
 from mindie_sim.opflow import build_flow, catalog_info, evaluate_operator, get_profile
 from mindie_sim.opflow.exact_math import MathDomainError, floor_sum, integer, memory_seconds, semantic_vector_costs

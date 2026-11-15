@@ -91,10 +91,8 @@ _WEIGHT_WIDTHS = {
 }
 _NON_QUANT = frozenset({"bf16", "bfloat16", "fp16", "float16", "fp32",
                         "float32", ""})
-
 def _int(value: Any, default: int) -> int:
     return default if value is None else int(value)
-
 def _frac(value: Any, default: Any = 0) -> Any:
     return as_fraction(default) if value is None else as_fraction(value)
 
@@ -903,16 +901,16 @@ def _compile_router(ctx: CompiledOperator, operator: BoundOperator) -> FamilyTem
 
 def _collective_kind(name: str, theta: Any) -> str:
     text = (str(theta.find("collective", "") or name)).lower().replace("-", "_")
-    if "allreduce" in text or "all_reduce" in text:
+    compact = text.replace("_", "")
+    if "allreduce" in compact:
         return "allreduce"
-    if "reduce_scatter" in text or "reducescatter" in text:
+    if "reducescatter" in compact:
         return "reduce_scatter"
-    if "all_gather" in text or "allgather" in text:
+    if "allgather" in compact:
         return "all_gather"
     if text in {"gather", "gather_to_sampler"} or "gather_to_sampler" in text:
         return "gather"
-    if "alltoall" in text or "all_to_all" in text or "dispatch" in text \
-            or "combine" in text:
+    if "alltoall" in compact or "alltoall" in text or "all_to_all" in text or "dispatch" in text or "combine" in text:
         return "alltoallv"
     return "allreduce"
 
@@ -1351,8 +1349,15 @@ def _compile_collective(ctx: CompiledOperator,
     wire = _frac(theta.find("wire_bytes", theta.find("bytes_per_token", 0.0)), 0.0)
     mtu = max(1, _int(theta.find("mtu_bytes"), DEFAULT_MTU))
     chunks = max(1, _int(theta.find("chunks"), 1))
-    etp = name == "etp_allreduce" or ctx.kind == "routed_experts"
-    route = _moe_route_shape(ctx, theta) if etp else None
+    boundary = str(theta.find("reduction_boundary", "") or "").strip().lower()
+    if not boundary:
+        rec = str(theta.find("moe_recipe", theta.find("recipe", "")) or "").strip().lower()
+        boundary = "token_rows" if rec in {"tp_join_reduce", "local_expert_reduce"} else ("expert_rows" if rec in {"alltoall", "mc2"} else "")
+    is_etp = name == "etp_allreduce" or ctx.kind in {"F3", "routed_experts"}
+    if is_etp:
+        routed = boundary != "token_rows"
+    else:
+        routed = False
     sp_rows = str(theta.find("sp_rows", "") or "")
     phase_scope = str(theta.find("phase_scope", "") or "")
     if phase_scope not in {"", "prefill", "decode"}:
@@ -1364,9 +1369,10 @@ def _compile_collective(ctx: CompiledOperator,
         raise ModelingError(f"collective_row_binding_invalid:{row_binding}")
     if row_binding and sp_rows:
         raise ModelingError("collective_row_binding_excludes_sp_rows")
-    if row_binding and etp:
+    if row_binding and routed:
         raise ModelingError("collective_row_binding_excludes_etp")
-    if etp:
+    route = _moe_route_shape(ctx, theta) if routed else None
+    if routed:
         message = Mul((Var("MOE_ROWS"), Const(wire)))
     elif row_binding == "real_q":
         message = Mul((Var("T_VALID"), Const(wire)))

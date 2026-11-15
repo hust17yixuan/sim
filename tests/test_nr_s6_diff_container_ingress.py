@@ -10,7 +10,6 @@
 [Side-Effect Policy]
   Artifacts and input files are confined to pytest temporary directories.
 """
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 
 import copy
 import json
@@ -24,6 +23,7 @@ from unittest.mock import patch
 
 import pytest
 
+pytest.importorskip("mindie_profiler")
 from mindie_profiler.events import ProfilerUsageError
 from mindie_sim import diff_trace as diff
 from mindie_sim import diff_trace_replay as engine

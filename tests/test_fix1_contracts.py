@@ -14,7 +14,6 @@ Read-only except an optional tmp_path JSONL write.
 """
 
 from __future__ import annotations
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 
 import re
 from dataclasses import replace
@@ -22,8 +21,11 @@ from pathlib import Path
 
 import pytest
 
+pytest.importorskip("mindie_knowledge")
+
 from mindie_knowledge import cannbot_aclgraph_distiller as dist
 from mindie_knowledge.knowledge_unit import KnowledgeUnit, KnowledgeUnitError
+pytest.importorskip("mindie_profiler")
 from mindie_profiler.aclgraph_mcp import call_tool as acl_call
 from mindie_profiler.aclgraph_multistream import (
     ACLGraphModelError, ACLGraphWrapperModel, ParallelRegion, StreamInterval,

@@ -153,6 +153,10 @@ def component_rates(resources, tasks, active, *, coupled_solver=None,
                 return {name: {reverse[proxy]: value
                                for proxy, value in components.items()}
                         for name, components in rates.items()}
+        elif n_active > 8 and any(
+                tasks[key].coupled and len(tasks[key].remaining) > 1
+                for key in active):
+            return _tiered_coupled(resources, tasks, active, coupled_solver)
         else:
             for key in active:
                 task = tasks[key]

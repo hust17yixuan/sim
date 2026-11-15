@@ -10,7 +10,6 @@
 [Side-Effect Policy]
   All artifacts and subprocess working directories belong to pytest tmp_path.
 """
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 
 import copy
 import json
@@ -22,6 +21,7 @@ import sys
 
 import pytest
 
+pytest.importorskip("mindie_profiler")
 from mindie_profiler.events import ProfilerUsageError
 from mindie_sim import __main__ as cli
 from mindie_sim import diff_trace as diff

@@ -476,6 +476,7 @@ def test_sku_ordering_and_resolution():
 
 
 def test_cli_evaluates_and_rejects_bad_params(tmp_path):
+    pytest.importorskip("mindie_profiler")
     root = Path(__file__).resolve().parents[1]
     command = [sys.executable, "-m", "mindie_profiler", "op-formula",
                "--operator", "matmul", "--params",

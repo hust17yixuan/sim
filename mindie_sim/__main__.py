@@ -25,7 +25,7 @@ def read_json(path, *, bounded=False):
         raise ValueError("metadata_input_exceeds_50_MiB:use_streaming_observation_import")
     if bounded:
         return load_cli_json(path)
-    with path.open() as stream:
+    with path.open(encoding="utf-8") as stream:
         return json.load(stream)
 
 
@@ -35,7 +35,10 @@ def emit(value, output):
     if output:
         Path(output).write_bytes(data)
     else:
-        print(text, end="")
+        try:
+            print(text, end="")
+        except UnicodeEncodeError:
+            print(json.dumps(value, ensure_ascii=True, indent=2, allow_nan=False))
 
 
 def _add_supply_arguments(command):

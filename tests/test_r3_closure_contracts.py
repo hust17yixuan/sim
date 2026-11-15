@@ -11,12 +11,14 @@ Small deterministic loops; no waits, locks, network or subprocesses.
 [Side-Effect Policy]
 Read-only tests; test artifacts belong in caller-selected external scratch.
 """
-import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 
 from dataclasses import fields
 from fractions import Fraction
 import pytest
+
+pytest.importorskip("mindie_knowledge")
 from mindie_knowledge.distiller_text import normalize_text
+pytest.importorskip("mindie_profiler")
 from mindie_profiler.aclgraph_mcp import aclgraph_diagnose, aclgraph_launch_floor
 from mindie_profiler.aclgraph_multistream import diagnose_region
 from mindie_sim.opflow import build_flow, evaluate_flow, get_profile
