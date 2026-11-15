@@ -16,7 +16,8 @@ jobs:
       MINDIE_RELEASE_DEPLOY_KEY: ${{ secrets.MINDIE_RELEASE_DEPLOY_KEY }}
     with:
       release-notes-path: docs/releases/sim-0.9.14.md
+      python: /tmp/sim-rel-venv/bin/python
       setup-command: |
-        UV_PROJECT_ENVIRONMENT=/tmp/sim-rel-venv uv venv --seed --python 3.13 /tmp/sim-rel-venv && UV_PROJECT_ENVIRONMENT=/tmp/sim-rel-venv uv pip install ".[test]" && rm -rf build dist *.egg-info .venv
+        uv venv --seed --python 3.13 /tmp/sim-rel-venv && uv pip install --python /tmp/sim-rel-venv/bin/python ".[test]" && rm -rf build dist *.egg-info .venv
       test-command: |
         PYTHONDONTWRITEBYTECODE=1 /tmp/sim-rel-venv/bin/python -B -m pytest -q -n auto -p no:cacheprovider -m "not live_npu"
