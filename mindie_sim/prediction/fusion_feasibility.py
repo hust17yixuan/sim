@@ -20,8 +20,8 @@ from typing import Any, Iterable, Mapping
 
 from .fusion_graph import (
     CUBE_KINDS, Constraint, FeasibilityError, OpNode, PARAM_ROLES,
-    REDUCTION_KINDS, TensorValue, TypedGraph, _align, _is_public, external_readers,
-    is_connected, is_convex, region_causal_order, state_ports,
+    REDUCTION_KINDS, TensorValue, TypedGraph, _align, _graph_index, _is_public,
+    external_readers, is_connected, is_convex, region_causal_order, state_ports,
 )
 
 from .fusion_contract import (
@@ -276,25 +276,29 @@ class TrafficLedger:
                 f"traffic_ledger_baseline_mismatch:{selected_baseline}:{base}")
 
 
+_ZERO_BYTES = 0; _UNIT_COUNT = 1
+
+
 def traffic_ledger(graph: TypedGraph, members: Iterable[str], *, tile_rows: int,
-                   channel_width: int | None = None, spill_bytes: int = 0,
-                   rows: int | None = None, tensor_parallel: int = 1,
+                   channel_width: int | None = None, spill_bytes: int = _ZERO_BYTES,
+                   rows: int | None = None, tensor_parallel: int = _UNIT_COUNT,
                    reduction_merge: ReductionMerge | None = None) -> TrafficLedger:
     chosen = tuple(dict.fromkeys(members))
     total_rows = int(rows or graph.rows)
-    tile_rows = max(1, min(int(tile_rows), total_rows))
+    tile_rows = max(_UNIT_COUNT, min(int(tile_rows), total_rows))
     external = external_readers(graph, chosen)
-    readers = {value_id: 0 for value_id in graph.values}
+    readers: dict[str, int] = {}
     for op_id in chosen:
         for value_id in graph.ops[op_id].inputs:
-            readers[value_id] += 1
+            readers[value_id] = readers.get(value_id, _ZERO_BYTES) + _UNIT_COUNT
     produced = {v for op_id in chosen for v in graph.ops[op_id].outputs}
+    value_rank = _graph_index(graph)["value_rank"]
+    touched = sorted(produced | readers.keys(), key=value_rank.__getitem__)
     records: list[TrafficValue] = []
     spill_assigned = False
     padding = 0
-    for value_id, value in graph.values.items():
-        if value_id not in produced and not readers.get(value_id):
-            continue
+    for value_id in touched:
+        value = graph.values[value_id]
         per_invocation = value.role in {"weight", "state", "parameter", "scale"}
         local = local_nbytes(value, tensor_parallel)
         # Tiles partition the physical storage exactly, so every sum over

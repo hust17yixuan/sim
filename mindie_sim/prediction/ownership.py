@@ -31,29 +31,61 @@ def unit_group(index, owners, units):
     raise ValueError(f"resource_ownership_geometry_incompatible:{owners}:{units}")
 
 
+@lru_cache(maxsize=None)
+def _full_units(count):
+    return tuple(range(count))
+
+
+_ZERO_MASK = 0; _ONE_BIT = 1
+
+
+@lru_cache(maxsize=None)
+def _unit_mask(units):
+    mask = _ZERO_MASK
+    for unit in units:
+        mask |= _ONE_BIT << unit
+    return mask
+
+
 def _partition_rates(rate, count, caps, placements):
     """Disjoint owner partitions are independent equal-weight resource pools."""
-    groups, occupied = {}, set()
+    groups = {}
+    occupied = _ZERO_MASK
+    full_u = None
+    full_m = _ZERO_MASK
     for key in caps:
-        units = placements.get(key) or tuple(range(count))
+        units = placements.get(key)
+        if not units:
+            if full_u is None:
+                full_u = _full_units(count)
+                full_m = (_ONE_BIT << count) - _ONE_BIT
+            units = full_u
+            u_mask = full_m
+        else:
+            u_mask = _unit_mask(units)
         group = groups.get(units)
         if group is not None:
             group.append(key)
         else:
-            if any(unit in occupied for unit in units):
+            if occupied & u_mask:
                 return None
-            occupied.update(units)
+            occupied |= u_mask
             groups[units] = [key]
     result = {}
+    unit_rate = rate / count
     for units, keys in groups.items():
-        capacity = rate / count * len(units)
-        if len(keys) == 1:
+        capacity = unit_rate * len(units)
+        if len(keys) == _ONE_BIT:
             key = keys[0]
-            result[key] = min(capacity, caps[key])
+            cap = caps[key]
+            result[key] = capacity if capacity < cap else cap
             continue
         ordered = sorted(keys, key=caps.__getitem__)
+        n_ord = len(ordered)
         for index, key in enumerate(ordered):
-            assigned = min(caps[key], capacity / (len(ordered) - index))
+            cap = caps[key]
+            share = capacity / (n_ord - index)
+            assigned = cap if cap < share else share
             result[key] = assigned
             capacity -= assigned
     return result
@@ -86,7 +118,7 @@ def _cached_partition_rates(rate, count, caps, placements):
 
 def unit_rates(rate, count, caps, placements):
     """Max-min task rates subject to per-unit capacities and task supply caps."""
-    partitioned = _cached_partition_rates(rate, count, caps, placements)
+    partitioned = _partition_rates(rate, count, caps, placements)
     if partitioned is not None:
         return partitioned
     weights = {}

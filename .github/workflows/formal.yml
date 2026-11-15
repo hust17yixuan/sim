@@ -1,0 +1,46 @@
+name: formal-lean4
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "formal/**"
+      - "scripts/check_lean_no_sorry.py"
+      - ".github/workflows/formal.yml"
+  pull_request:
+    paths:
+      - "formal/**"
+      - "scripts/check_lean_no_sorry.py"
+      - ".github/workflows/formal.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lean4-kernel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Audit Lean sources for forbidden sorry, admit, or custom axiom tokens
+        run: python3 -B scripts/check_lean_no_sorry.py
+
+      - name: Install pinned Lean 4 toolchain via elan
+        env:
+          ELAN_HOME: ${{ runner.temp }}/elan
+        run: |
+          TOOLCHAIN="$(tr -d '[:space:]' < formal/lean-toolchain)"
+          curl -fsSL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o "${RUNNER_TEMP}/elan-init.sh"
+          sh "${RUNNER_TEMP}/elan-init.sh" -y --no-modify-path --default-toolchain "${TOOLCHAIN}"
+          echo "${ELAN_HOME}/bin" >> "${GITHUB_PATH}"
+
+      - name: Machine-check MindIESimSpec and AxiomCheck
+        working-directory: formal
+        env:
+          ELAN_HOME: ${{ runner.temp }}/elan
+        run: |
+          lean --version
+          lake --version
+          lake build

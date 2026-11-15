@@ -58,25 +58,25 @@ from mindie_sim.xpyd_transfer import (_fraction, _int, _nic_bw_gbps, _positive,
                                       kv_transfer_contention,
                                       logical_transfer_bytes)
 
-DEFAULT_RHO = 0.9
+DEFAULT_RHO = 0.9; _ZERO_I = 0; _ONE_I = 1; _MAX_INSTANCES = 16; _ZERO_F = 0.0; _ONE_F = 1.0; _TRANSFER_LAT_MS = 0.1
 
 def  solve_xpyd_pools(
     case: CaseSpec | Mapping[str, Any], *, total_npus: int,
-    isl: int, osl: int, prefix_hit_rate: float = 0.0,
+    isl: int, osl: int, prefix_hit_rate: float = _ZERO_F,
     ttft_slo_ms: float, tpot_slo_ms: float,
     prefill_configs: Sequence[ParallelSpec | Mapping[str, Any]] | None = None,
     decode_configs: Sequence[ParallelSpec | Mapping[str, Any]] | None = None,
     nic_bw_gbps: float | None = None,
     hccl_buffsize_mb: float | None = None,
-    routing_skew: float = 1.0,
-    eplb_redundant_experts: int = 0,
-    max_pool_instances: int = 16,
+    routing_skew: float = _ONE_F,
+    eplb_redundant_experts: int = _ZERO_I,
+    max_pool_instances: int = _MAX_INSTANCES,
     utilization_cap: float = DEFAULT_RHO,
     roce_bw_gbps: float | None = None,
-    roce_oversubscription: float = 1.0,
+    roce_oversubscription: float = _ONE_F,
     staging_bytes: float | None = None,
-    transfer_latency_ms: float = 0.1,
-    destination_cached_tokens: int = 0,
+    transfer_latency_ms: float = _TRANSFER_LAT_MS,
+    destination_cached_tokens: int = _ZERO_I,
     eplb_redundant_slots_per_rank: Sequence[int] | None = None,
     allow_unqualified: bool = False,
     require_prefix_identity: bool = False,
@@ -92,7 +92,7 @@ def  solve_xpyd_pools(
     comm_arena_qualified: bool = False,
     comm_arena_domains: Mapping[str, float] | None = None,
     strict_memory_qualification: bool = False,
-    eplb_rebalance_peak_bytes: float = 0.0,
+    eplb_rebalance_peak_bytes: float = _ZERO_F,
 ) -> dict[str, Any]:
     """Enumerate pools and maximize SLO-qualified completed-request goodput."""
     geometry_reason = raw_shared_geometry_reason(case)
@@ -344,7 +344,11 @@ def  solve_xpyd_pools(
                 continue
             remap_bridge = bridge.to_dict()
             edge_cache = {}
-            lifetime_key = lifetime
+            life_dict = lifetime.to_dict()
+            life_scalars = tuple((k, float(life_dict[k])) for k in ("source_retention_bytes", "destination_retention_bytes", "handoff_staging_bytes", "eplb_rebalance_peak_bytes") if life_dict.get(k) is not None)
+            owners_key = tuple(int(r) for r in getattr(lifetime, "page_owner_ranks", ()) or ())
+            p_key = ("prefill", float(lifetime.phase_peak_bytes("prefill")), tuple(lifetime.phase_rank_peak_bytes("prefill")), life_scalars, owners_key)
+            d_key = ("decode", float(lifetime.phase_peak_bytes("decode")), tuple(lifetime.phase_rank_peak_bytes("decode")), life_scalars, owners_key)
             if replica_lanes:
                 remap = bridge_remap_bytes(bridge)
                 remap_ms = (float(remap["total_bytes"]) / (nic * 1e9) * 1000.0
@@ -352,16 +356,12 @@ def  solve_xpyd_pools(
             else:
                 remap = {"total_bytes": 0.0, "destination_lanes": 0.0}
                 remap_ms = 0.0
-            for n_p in range(1, min(cap, total // wp) + 1):
+            for n_p in range(_ONE_I, min(cap, total // wp) + _ONE_I):
                 p_ids = tuple(index * wp for index in range(n_p))
-                for n_d in range(1, min(cap, (total - n_p * wp) // wd) + 1):
+                for n_d in range(_ONE_I, min(cap, (total - n_p * wp) // wd) + _ONE_I):
                     d_ids = tuple(n_p * wp + index * wd for index in range(n_d))
-                    p_inst = [_instance_row(p_row["parallel"], "prefill", start,
-                                            wp, lifetime, lifetime_key)
-                              for start in p_ids]
-                    d_inst = [_instance_row(d_row["parallel"], "decode", start,
-                                            wd, lifetime, lifetime_key)
-                              for start in d_ids]
+                    p_inst = [_instance_row(p_row["parallel"], "prefill", start, wp, lifetime, p_key) for start in p_ids]
+                    d_inst = [_instance_row(d_row["parallel"], "decode", start, wd, lifetime, d_key) for start in d_ids]
                     bad = next((item for item in p_inst + d_inst
                                 if not item.get("feasible")
                                 or (not allow_unqualified
