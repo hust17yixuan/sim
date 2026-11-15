@@ -37,12 +37,28 @@ import math
 from typing import Callable, Mapping
 
 from mindie_sim.prediction.engine import Allocation
-from mindie_sim.prediction.mechanism import Geometry, OperatorPlan, Work
+from mindie_sim.prediction.mechanism import (
+    Geometry, OperatorPlan, PlannedRecipe, Work,
+)
 from mindie_sim.prediction.ownership import read_role, unit_group
-from mindie_sim.prediction.program import KernelProgram, PipelineProgram, RecipeContext, Stage
+from .attention_kv_access import KVCacheAccess, kv_access, paged_fia_plan
+from mindie_sim.prediction.program import (
+    KernelProgram, PipelinePhase, PipelineProgram, PipelineTemplate,
+    PipelineTemplateProgram, RecipeContext, Stage,
+)
 from mindie_sim.prediction.refill_steady import compact_periodic_pipeline
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.operators import OpSpec
+
+from .attention_decode_helpers import (
+    _DTYPE_ALIASES, _FP32_BYTES, _AttentionPipelineTemplate, _Contribution,
+    _MergeStream, _Output, _Spec, _allocation, _allocations,
+    _attention_pipeline_template, _ceil_div, _dtype, _fold_interior_phase,
+    _merge_program, _nonnegative_int, _operand_role, _output_pairs,
+    _output_row_tiles, _partial_row_bytes, _placement, _positive_int,
+    _read_role, _rows_per_token, _spec, _split_ranges, _tile_counts,
+    _total_work, _write_role, causal_pairs,
+)
 
 IMPLEMENTATION = "staged_gqa_decode"
 RECIPE_ID = IMPLEMENTATION
@@ -55,46 +71,6 @@ SOURCE_REFERENCES = (
     "/Users/maoxx241/code/refs/ops-transformer/attention/"
     "fused_infer_attention_score/op_kernel/arch35/fia_block_cube_noquant_gqa.h",
 )
-
-_DTYPE_ALIASES = {
-    "bf16": "bf16", "bfloat16": "bf16",
-    "fp16": "fp16", "float16": "fp16",
-    "fp32": "fp32", "float32": "fp32",
-}
-_FP32_BYTES = 4
-def _partial_row_bytes(dim: int) -> int:
-    """Per output row: FP32 partial accumulator plus max and sum scalars."""
-    return dim * _FP32_BYTES + 2 * _FP32_BYTES
-
-
-def _positive_int(value, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ModelingError(f"attention_decode_{name}_must_be_positive_int")
-    return value
-
-
-def _nonnegative_int(value, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ModelingError(f"attention_decode_{name}_must_be_nonnegative_int")
-    return value
-
-
-def _dtype(value, name: str) -> str:
-    if not isinstance(value, str):
-        raise ModelingError(f"attention_decode_{name}_must_be_dtype")
-    try:
-        return _DTYPE_ALIASES[value.strip().lower()]
-    except KeyError:
-        raise ModelingError(f"attention_decode_unsupported_{name}:{value}") from None
-
-
-def _ceil_div(value: int, divisor: int) -> int:
-    return -(-value // divisor)
-
-
-def causal_pairs(query: int, context: int) -> int:
-    """Causal key/query pairs for one query head of a speculative decode block."""
-    return query * (context + 1) + query * (query - 1) // 2
 
 
 @dataclass(frozen=True)
@@ -137,17 +113,119 @@ class StagedGQADecode:
     def spec(self, op: OpSpec) -> "_Spec":
         return _spec(op, self)
 
-    def work(self, op: OpSpec, *, include_mte1: bool = False) -> Work:
-        """Physical work of the lowered mechanism, independent of service rates."""
-        return _total_work(self.spec(op), include_mte1=include_mte1)
+    def work(self, op: OpSpec, *, include_mte1: bool = False,
+             read: str = "mte2", vread: str | None = None,
+             write: str | None = "mte3", operand: str | None = "mte1") -> Work:
+        """Physical work of the lowered mechanism, independent of service rates.
+
+        ``read``/``vread`` are the actual producer and vector read pipes.  The
+        default generic pair keeps the historical verification ledger; a
+        bound geometry supplies the split AIC/AIV pipe names.
+        """
+        return _total_work(self.spec(op), include_mte1=include_mte1,
+                           read=read, vread=vread, write=write, operand=operand)
+
+    def kv_access(self, op: OpSpec) -> KVCacheAccess:
+        """Declared KV storage/page/scale access for this operator geometry."""
+        return self.spec(op).kv_cache
+
+    def native_plan(self, op: OpSpec) -> dict | None:
+        """Typed ordinary paged-FIA ports and geometry for the actual op."""
+        spec = self.spec(op)
+        cache = spec.kv_cache
+        if not cache.paged or cache.key_format is None or cache.value_format is None:
+            return None
+        plan = paged_fia_plan(
+            requests=spec.requests,
+            query_lengths=tuple(query for query, _ in spec.requests),
+            kv_lengths=tuple(context + query
+                             for query, context in spec.requests),
+            page_size=cache.page_size,
+            query_heads=spec.query_heads,
+            kv_heads=spec.kv_heads,
+            head_dim=spec.head_dim,
+            query_dtype=spec.query_dtype,
+            output_dtype=spec.query_dtype,
+            key_format=cache.key_format,
+            value_format=cache.value_format,
+            phase=getattr(op, "phase", "decode"),
+            mask="causal",
+            return_lse=False,
+            output_prepare=None,
+        )
+        outputs = []
+        full_tiles = tail_tiles = 0
+        for output in spec.outputs:
+            for contribution in output.contributions:
+                last_start = (contribution.tile_start
+                              + contribution.tile_count - 1) * spec.key_tile
+                last_valid = min(spec.key_tile,
+                                 output.horizon - last_start)
+                for tile in range(contribution.tile_count):
+                    start = (contribution.tile_start + tile) * spec.key_tile
+                    valid = min(spec.key_tile, output.horizon - start)
+                    if valid < spec.key_tile:
+                        tail_tiles += 1
+                    else:
+                        full_tiles += 1
+                outputs.append({
+                    "request": output.request, "kv_head": output.kv_head,
+                    "tiles": contribution.tile_count,
+                    "tile_start": contribution.tile_start,
+                    "last_valid": last_valid,
+                    "tail": last_valid < spec.key_tile,
+                })
+        plan["strategy"] = {
+            "key_tile": spec.key_tile,
+            "query_tile": spec.query_tile,
+            "kv_splits": spec.kv_splits,
+            "slots": spec.slots,
+            "key_tiles": full_tiles + tail_tiles,
+            "full_tiles": full_tiles,
+            "tail_tiles": tail_tiles,
+            "outputs": outputs,
+            "transactions": {
+                "page_reads": plan["work"]["pages"],
+                "key_page_reads": plan["work"]["key_page_reads"],
+                "value_page_reads": plan["work"]["value_page_reads"],
+                "static_kv_read": True,
+                "state_writes": 0,
+            },
+            "compute": {"qk": "fia", "softmax": "online",
+                        "pv": "fia", "causal": True},
+        }
+        plan["cache_access"] = cache.report()
+        plan["operator"] = {"op_id": op.op_id, "stage": op.stage,
+                            "layer": op.layer, "phase": op.phase}
+        return plan
 
     def build(self, op: OpSpec, geometry: Geometry | None = None) -> OperatorPlan:
         """Verification binding using this recipe's options and work ledger."""
         spec = self.spec(op)
-        mte1 = geometry is not None and "mte1" in geometry.resource_units
+        if geometry is None:
+            read, vread, write, operand = "mte2", "mte2", "mte3", "mte1"
+            mte1 = False
+        else:
+            read = read_role(geometry.resource_units)
+            vread = read_role(geometry.resource_units, aiv=0)
+            write = "mte3" if "mte3" in geometry.resource_units else None
+            operand = "mte1" if "mte1" in geometry.resource_units else None
+            mte1 = operand is not None
+            if spec.kv_cache.needs_conversion and operand is None:
+                raise ModelingError(
+                    "attention_decode_conversion_requires_mte1_operand_copy")
+            if spec.kv_cache.needs_conversion and write is None:
+                raise ModelingError(
+                    "attention_decode_conversion_requires_mte3_result_copy")
+        metadata = {"kv_cache_access": spec.kv_cache.report()}
+        native = self.native_plan(op)
+        if native is not None:
+            metadata["native_paged_fia"] = native
         return OperatorPlan(
-            self.work(op, include_mte1=mte1),
+            self.work(op, include_mte1=mte1, read=read, vread=vread,
+                      write=write, operand=operand),
             lambda context: _GQADecodeProgram(context, self, spec),
+            metadata=metadata,
         )
 
     def lower(self, context: RecipeContext) -> KernelProgram:
@@ -163,277 +241,9 @@ class StagedGQADecode:
         )
 
 
-@dataclass(frozen=True)
-class _Contribution:
-    split: int
-    tile_start: int
-    tile_count: int
-    owner: int | None = None
-
-
-@dataclass(frozen=True)
-class _Output:
-    request: int
-    kv_head: int
-    query_tile: int
-    row_start: int
-    row_end: int
-    token_first: int
-    token_last: int
-    horizon: int
-    contributions: tuple[_Contribution, ...]
-
-    @property
-    def rows(self) -> int:
-        return self.row_end - self.row_start
-
-
-@dataclass(frozen=True)
-class _Spec:
-    requests: tuple[tuple[int, int], ...]
-    query_heads: int
-    kv_heads: int
-    head_dim: int
-    query_dtype: str
-    kv_dtype: str
-    key_tile: int
-    query_tile: int
-    kv_splits: int
-    slots: int
-    outputs: tuple[_Output, ...]
-
-    @property
-    def group(self) -> int:
-        return self.query_heads // self.kv_heads
-
-    @property
-    def query_bytes(self) -> int:
-        return int(dtype_bytes(self.query_dtype))
-
-    @property
-    def kv_bytes(self) -> int:
-        return int(dtype_bytes(self.kv_dtype))
-
-
-def _split_ranges(tiles: int, requested: int) -> tuple[tuple[int, int], ...]:
-    """Contiguous, nonempty tile ranges, at most ``requested`` partitions."""
-    if tiles <= 0:
-        return ()
-    count = min(requested, tiles)
-    base, extra = divmod(tiles, count)
-    ranges, start = [], 0
-    for index in range(count):
-        size = base + (1 if index < extra else 0)
-        ranges.append((start, start + size))
-        start += size
-    return tuple(ranges)
-
-
-def _spec(op: OpSpec, recipe: StagedGQADecode) -> _Spec:
-    if getattr(op, "phase", "decode") not in {"decode", "draft"}:
-        raise ModelingError("attention_decode_only_supports_decode_phase")
-    metadata = dict(getattr(op, "metadata", ()))
-    raw = metadata.get("gqa_decode")
-    if not isinstance(raw, Mapping):
-        raise ModelingError("attention_decode_gqa_decode_metadata_required")
-
-    requests_raw = raw.get("requests")
-    if not isinstance(requests_raw, (list, tuple)):
-        raise ModelingError("attention_decode_requests_must_be_sequence")
-    requests = []
-    for item in requests_raw:
-        if not isinstance(item, (list, tuple)) or len(item) != 2:
-            raise ModelingError("attention_decode_request_must_be_query_context_pair")
-        query = _nonnegative_int(item[0], "query_len")
-        context = _nonnegative_int(item[1], "context")
-        requests.append((query, context))
-    requests = tuple(requests)
-
-    heads = _positive_int(raw.get("query_heads"), "query_heads")
-    kv_heads = _positive_int(raw.get("kv_heads"), "kv_heads")
-    dim = _positive_int(raw.get("head_dim"), "head_dim")
-    if heads % kv_heads:
-        raise ModelingError("attention_decode_query_heads_not_divisible_by_kv_heads")
-    query_dtype = _dtype(raw.get("query_dtype"), "query_dtype")
-    kv_dtype = _dtype(raw.get("kv_dtype"), "kv_dtype")
-    if raw.get("causal") is not True:
-        raise ModelingError("attention_decode_causal_true_required")
-    if raw.get("window", 0) != 0:
-        raise ModelingError("attention_decode_windowed_decode_not_selected")
-    if raw.get("cp", 1) != 1:
-        raise ModelingError("attention_decode_context_parallel_not_selected")
-
-    group = heads // kv_heads
-    # A fixed split count is a mapping declaration, not a source selector.
-    # The optional occupancy mapping shares cores between independent query
-    # tiles first, then partitions their KV loops. Short contexts still cap the
-    # split count at real key tiles; partial writes/merges are never removed.
-    query_tasks = kv_heads * sum(_ceil_div(query * group, recipe.query_tile)
-                                for query, _ in requests if query)
-    splits = (max(recipe.kv_splits, _ceil_div(recipe.target_cores, query_tasks))
-              if recipe.target_cores and query_tasks else recipe.kv_splits)
-    outputs = []
-    for request_index, (query, context) in enumerate(requests):
-        if query == 0:
-            continue
-        rows = query * group
-        length = context + query
-        tile_count = _ceil_div(length, recipe.key_tile)
-        partitions = _split_ranges(tile_count, splits)
-        for kv_head in range(kv_heads):
-            for query_tile, row_start in enumerate(
-                    range(0, rows, recipe.query_tile)):
-                row_end = min(rows, row_start + recipe.query_tile)
-                token_first = row_start // group
-                token_last = (row_end - 1) // group
-                horizon = context + token_last + 1
-                cutoff = _ceil_div(horizon, recipe.key_tile)
-                contributions = tuple(
-                    _Contribution(index, begin, min(end, cutoff) - begin)
-                    for index, (begin, end) in enumerate(partitions)
-                    if min(end, cutoff) > begin
-                )
-                if not contributions:
-                    continue
-                outputs.append(_Output(
-                    request_index, kv_head, query_tile, row_start, row_end,
-                    token_first, token_last, horizon, contributions,
-                ))
-    if recipe.kv_mapping in {"fai_flash_decode", "fai_host"}:
-        from .fai_decode_mapping import partitions, host_partitions
-        mapper = host_partitions if recipe.kv_mapping == "fai_host" else partitions
-        mapping = mapper(requests, heads, kv_heads, recipe.target_cores,
-                             key_tile=recipe.key_tile, query_tile=recipe.query_tile)
-        outputs = [replace(output, contributions=tuple(
-            _Contribution(index, start, end - start, owner)
-            for index, (owner, start, end) in enumerate(
-                mapping[output.request, output.kv_head]))) for output in outputs]
-        splits = max(len(output.contributions) for output in outputs)
-    return _Spec(
-        requests, heads, kv_heads, dim, query_dtype, kv_dtype,
-        recipe.key_tile, recipe.query_tile, splits, recipe.slots,
-        tuple(outputs),
-    )
-
-
-def _rows_per_token(output: _Output, group: int, token: int) -> int:
-    return max(0, min(output.row_end, (token + 1) * group)
-               - max(output.row_start, token * group))
-
-
-def _output_pairs(output: _Output, context: int, group: int) -> int:
-    """Valid causal pairs, independently of key tiling."""
-    return sum(_rows_per_token(output, group, token) * (context + token + 1)
-               for token in range(output.token_first, output.token_last + 1))
-
-
-def _output_row_tiles(output: _Output, context: int, group: int,
-                      key_tile: int) -> int:
-    """Sum of active query rows over key tiles (online-softmax work)."""
-    return sum(_rows_per_token(output, group, token)
-               * _ceil_div(context + token + 1, key_tile)
-               for token in range(output.token_first, output.token_last + 1))
-
-
-def _total_work(spec: _Spec, *, include_mte1: bool) -> Work:
-    reads = writes = vector = mte1 = 0
-    flops = 0
-    for output in spec.outputs:
-        _query, context = spec.requests[output.request]
-        pairs = _output_pairs(output, context, spec.group)
-        row_tiles = _output_row_tiles(output, context, spec.group, spec.key_tile)
-        contributions = len(output.contributions)
-        q_bytes = contributions * output.rows * spec.head_dim * spec.query_bytes
-        kv_bytes = (output.horizon * 2 * spec.head_dim * spec.kv_bytes)
-        output_bytes = output.rows * spec.head_dim * spec.query_bytes
-        partial = contributions * output.rows * _partial_row_bytes(spec.head_dim)
-        reads += q_bytes + kv_bytes
-        writes += output_bytes
-        if include_mte1:
-            mte1 += q_bytes + kv_bytes
-        flops += 4 * pairs * spec.head_dim
-        vector += 7 * pairs + (3 * spec.head_dim + 10) * row_tiles
-        if include_mte1:
-            # Each probability tile becomes the left operand of PV. It never
-            # leaves the on-chip hierarchy or becomes an HBM read.
-            mte1 += pairs * spec.query_bytes
-        if contributions == 1:
-            vector += output.rows * (spec.head_dim + 1)
-        else:
-            reads += partial
-            writes += partial
-            vector += (contributions * output.rows * (3 * spec.head_dim + 9)
-                       + output.rows * (spec.head_dim + 1))
-    resources = {
-        "hbm": reads + writes,
-        "mte2": reads,
-        "mte3": writes,
-        "vector": vector,
-    }
-    if include_mte1:
-        resources["mte1"] = mte1
-    return Work(matrix={spec.query_dtype: flops}, resources=resources)
-
-
 def build(op: OpSpec, geometry: Geometry | None = None) -> OperatorPlan:
     """Independent verification binding for the default recipe options."""
     return StagedGQADecode().build(op, geometry)
-
-
-# ---------------------------------------------------------------------------
-# Placement, buffer and tile helpers.
-# ---------------------------------------------------------------------------
-
-
-def _placement(context: RecipeContext, core: int, *roles: str) -> dict:
-    present = tuple(role for role in roles if role in context.resource_names)
-    return context.owned(core, context.core_count, present) if present else {}
-
-
-def _read_role(context: RecipeContext, *, vector=False) -> str:
-    return read_role(context.resource_names, aiv=0 if vector else None)
-
-
-def _write_role(context: RecipeContext) -> str | None:
-    return "mte3" if "mte3" in context.resource_names else None
-
-
-def _operand_role(context: RecipeContext) -> str | None:
-    return "mte1" if "mte1" in context.resource_names else None
-
-
-def _allocation(context: RecipeContext, core: int, pool: str, name: str,
-                size: float) -> Allocation | None:
-    if pool not in context.pool_names:
-        return None
-    if size <= 0:
-        return None
-    capacity = context.pool_capacities.get(pool)
-    if capacity is not None and size > capacity:
-        raise ModelingError(
-            f"attention_decode_buffer_exceeds_pool:{pool}:{name}:{size}>{capacity}")
-    units = unit_group(core, context.core_count,
-                       context.pool_units.get(pool, 1))
-    return Allocation(name, context.pool_names[pool], float(size), units)
-
-
-def _allocations(items) -> tuple[Allocation, ...]:
-    return tuple(item for item in items if item is not None)
-
-
-def _tile_counts(output: _Output, context: int, group: int,
-                 tile_start: int, tile_end: int) -> tuple[int, int]:
-    """Return (valid query/key pairs, active query rows) for one key tile."""
-    pairs = row_count = 0
-    for token in range(output.token_first, output.token_last + 1):
-        rows = _rows_per_token(output, group, token)
-        if not rows:
-            continue
-        valid = max(0, min(tile_end, context + token + 1) - tile_start)
-        if valid:
-            pairs += rows * valid
-            row_count += rows
-    return pairs, row_count
 
 
 # ---------------------------------------------------------------------------
@@ -477,6 +287,7 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
     cube = ("cube",)
     vector = ("vector",)
     copy_in = (read,)
+    vector_copy_in = (_read_role(context, vector=True),)
     copy_out = (write,) if write else ()
     operand_role = (operand,) if operand else ()
 
@@ -495,6 +306,35 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
         Stage("q_load", context.bind(Work(resources=q_work)),
               acquire=persistent, placement=q_place),
     ]
+    cache = spec.kv_cache
+    if cache.needs_conversion and not operand:
+        raise ModelingError("attention_decode_conversion_requires_mte1_operand_copy")
+    page_meta = page_scale = 0
+    page_scale_ub = None
+    if cache.paged:
+        page_start = contribution.tile_start * recipe.key_tile
+        page_end = min((contribution.tile_start + contribution.tile_count)
+                       * recipe.key_tile, output.horizon)
+        pages = cache.pages(page_start, page_end)
+        page_meta = pages * cache.page_meta_bytes
+        if cache.scale_scope == "page":
+            page_scale = pages * cache.page_scale_bytes
+    if page_meta or page_scale:
+        page_work = {"hbm": page_meta + page_scale}
+        if page_meta:
+            page_work[read] = page_work.get(read, 0) + page_meta
+        if page_scale:
+            vector_read = _read_role(context, vector=True)
+            page_work[vector_read] = page_work.get(vector_read, 0) + page_scale
+        if page_scale:
+            page_scale_ub = _allocation(
+                context, core, "ub", "page_scale_ub", page_scale)
+        stages.append(Stage(
+            "page_access", context.bind(Work(resources=page_work)),
+            acquire=_allocations((page_scale_ub,)), after=("q_load",),
+            placement={**_placement(context, core, *copy_in),
+                       **_placement(context, core, *vector_copy_in)}))
+    key_ready = "page_access" if (page_meta or page_scale) else "q_load"
 
     max_tile = min(recipe.key_tile, max(1, output.horizon))
 
@@ -504,104 +344,231 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
     )
     tail_count = max(2, contribution.tile_count - causal_start)
 
-    def tile(index: int):
+    def key_of(index: int):
         start = (contribution.tile_start + index) * recipe.key_tile
         end = min(start + recipe.key_tile, output.horizon)
         valid = max(0, end - start)
         pairs, active_rows = _tile_counts(
             output, context_len, spec.group, start, end)
-        return template(valid, pairs, active_rows, index % recipe.slots)
+        return valid, pairs, active_rows, index % recipe.slots
+
+    def tile(index: int):
+        valid, pairs, active_rows, slot = key_of(index)
+        return template(valid, pairs, active_rows, slot)
 
     @lru_cache(maxsize=4 * recipe.slots + tail_count)
     def template(valid: int, pairs: int, active_rows: int, slot: int):
         # Full tiles repeat immutable work and slot-local buffer descriptors.
         # Retain at most a full/tail pair per live slot, within this producer;
         # every tile still submits its original finite stages and dependencies.
-        k_bytes = valid * dim * spec.kv_bytes
+        key_needs = cache.key_needs_conversion
+        value_needs = cache.value_needs_conversion
+        key_payload = valid * cache.key_payload_row
+        value_payload = valid * cache.value_payload_row
+        key_operand = valid * cache.key_operand_row
+        value_operand = valid * cache.value_operand_row
+        key_scale = (valid * cache.key_scale_row
+                     if cache.scale_scope == "row" else 0)
+        value_scale = (valid * cache.value_scale_row
+                       if cache.scale_scope == "row" else 0)
         suffix = f"s{slot}"
-        k_l1 = _allocation(context, core, "l1", f"k_l1_{suffix}", k_bytes)
-        k_l0b = _allocation(context, core, "l0b", f"k_l0b_{suffix}", k_bytes)
         scores = _allocation(context, core, "l0c", f"scores_{suffix}",
                              rows * max_tile * _FP32_BYTES)
         probs = _allocation(context, core, "ub", f"probs_{suffix}",
                             rows * max_tile * _FP32_BYTES)
         p_l0a = _allocation(context, core, "l0a", f"p_l0a_{suffix}",
                            rows * valid * spec.query_bytes)
-        v_l1 = _allocation(context, core, "l1", f"v_l1_{suffix}", k_bytes)
-        v_l0b = _allocation(context, core, "l0b", f"v_l0b_{suffix}", k_bytes)
         pv_acc = _allocation(context, core, "l0c", f"pv_acc_{suffix}",
                              rows * dim * _FP32_BYTES)
-        k_acquire = _allocations((k_l1, k_l0b))
         score_acquire = _allocations((scores,))
         prob_acquire = _allocations((probs,))
-        v_acquire = _allocations((v_l1, v_l0b, pv_acc))
-        k_release = _allocations((k_l1, k_l0b))
+        pv_acc_acquire = _allocations((pv_acc,))
         score_release = _allocations((scores,))
-        v_release = _allocations((v_l1, v_l0b, pv_acc))
         prob_release = _allocations((probs,))
 
-        load_work = {"hbm": k_bytes, read: k_bytes}
-        if operand:
-            load_work["mte1"] = k_bytes
         qk = Work(
             matrix={spec.query_dtype: 2 * dim * pairs},
             resources={"vector": 2 * pairs},
         )
         softmax = Work(resources={"vector": 5 * pairs + active_rows})
-        vload_work = {"hbm": k_bytes, read: k_bytes}
-        if operand:
-            vload_work["mte1"] = k_bytes
         pv = Work(matrix={spec.query_dtype: 2 * dim * pairs})
         # Combine the tile-local numerator with the running numerator using
         # their maxima: two scalings plus one add per output element.
         online = Work(resources={"vector": active_rows * (3 * dim + 9)})
-        return (
-            Stage("k_load", context.bind(Work(resources=load_work)),
-                  acquire=k_acquire,
-                  placement={**_placement(context, core, *copy_in),
-                             **_placement(context, core, *operand_role)}),
-            Stage("qk", context.bind(qk), after=("k_load",),
-                  acquire=score_acquire, free=k_release,
-                  placement={**_placement(context, core, *cube),
-                             **_placement(context, core, *vector)}),
-            Stage("softmax", context.bind(softmax), after=("qk",),
-                  acquire=prob_acquire, free=score_release,
-                  placement=_placement(context, core, *vector)),
-            Stage("v_load", context.bind(Work(resources=vload_work)),
-                  after=("softmax",), acquire=v_acquire,
-                  placement={**_placement(context, core, *copy_in),
-                             **_placement(context, core, *operand_role)}),
+        stages_local = []
+
+        # K: packed -> UB, vector conversion -> UB, MTE3 -> L1, MTE1 -> L0B.
+        if key_needs:
+            k_payload_ub = _allocation(context, core, "ub", f"k_payload_{suffix}",
+                                       key_payload)
+            k_conv_ub = _allocation(context, core, "ub", f"k_conv_{suffix}",
+                                    key_operand)
+            k_post_l1 = _allocation(context, core, "l1", f"k_post_{suffix}",
+                                    key_operand)
+            k_l0b = _allocation(context, core, "l0b", f"k_l0b_{suffix}",
+                                key_operand)
+            k_scale_ub = (_allocation(context, core, "ub", f"k_scale_{suffix}",
+                                      key_scale) if key_scale else None)
+            stages_local.append(Stage(
+                "k_load", context.bind(Work(resources={
+                    "hbm": key_payload,
+                    _read_role(context, vector=True): key_payload})),
+                acquire=_allocations((k_payload_ub,)),
+                placement=_placement(context, core, *vector_copy_in)))
+            k_after = ("k_load",)
+            if key_scale:
+                stages_local.append(Stage(
+                    "k_scale_load", context.bind(Work(resources={
+                        "hbm": key_scale,
+                        _read_role(context, vector=True): key_scale})),
+                    after=("k_load",), acquire=_allocations((k_scale_ub,)),
+                    placement=_placement(context, core, *vector_copy_in)))
+                k_after = ("k_scale_load",)
+            stages_local.append(Stage(
+                "dequant_k", context.bind(Work(resources={
+                    "vector": cache.key_conversion_ops(valid)})),
+                after=k_after, acquire=_allocations((k_conv_ub,)),
+                free=_allocations((k_payload_ub, k_scale_ub)),
+                placement=_placement(context, core, *vector)))
+            stages_local.append(Stage(
+                "conv_store_k", context.bind(Work(resources={write: key_operand})),
+                after=("dequant_k",), acquire=_allocations((k_post_l1,)),
+                free=_allocations((k_conv_ub,)),
+                placement=_placement(context, core, *copy_out)))
+            stages_local.append(Stage(
+                "operand_k", context.bind(Work(resources={operand: key_operand})),
+                after=("conv_store_k",), acquire=_allocations((k_l0b,)),
+                free=_allocations((k_post_l1,)),
+                placement=_placement(context, core, *operand_role)))
+            k_ready = "operand_k"
+            k_free = _allocations((k_l0b,))
+        else:
+            k_l1 = _allocation(context, core, "l1", f"k_l1_{suffix}", key_payload)
+            k_l0b = _allocation(context, core, "l0b", f"k_l0b_{suffix}", key_payload)
+            k_load_work = {"hbm": key_payload, read: key_payload}
+            if operand:
+                k_load_work[operand] = key_payload
+            stages_local.append(Stage(
+                "k_load", context.bind(Work(resources=k_load_work)),
+                acquire=_allocations((k_l1, k_l0b)),
+                placement={**_placement(context, core, *copy_in),
+                           **_placement(context, core, *operand_role)}))
+            k_ready = "k_load"
+            k_free = _allocations((k_l1, k_l0b))
+        stages_local.append(Stage(
+            "qk", context.bind(qk), after=(k_ready,),
+            acquire=score_acquire, free=k_free, placement={
+                **_placement(context, core, *cube),
+                **_placement(context, core, *vector)}))
+        stages_local.append(Stage(
+            "softmax", context.bind(softmax), after=("qk",),
+            acquire=prob_acquire, free=score_release,
+            placement=_placement(context, core, *vector)))
+
+        # V mirrors K; PV consumes the materialized V operand and probability.
+        if value_needs:
+            v_payload_ub = _allocation(context, core, "ub", f"v_payload_{suffix}",
+                                       value_payload)
+            v_conv_ub = _allocation(context, core, "ub", f"v_conv_{suffix}",
+                                    value_operand)
+            v_post_l1 = _allocation(context, core, "l1", f"v_post_{suffix}",
+                                    value_operand)
+            v_l0b = _allocation(context, core, "l0b", f"v_l0b_{suffix}",
+                                value_operand)
+            v_scale_ub = (_allocation(context, core, "ub", f"v_scale_{suffix}",
+                                      value_scale) if value_scale else None)
+            stages_local.append(Stage(
+                "v_load", context.bind(Work(resources={
+                    "hbm": value_payload,
+                    _read_role(context, vector=True): value_payload})),
+                after=("softmax",),
+                acquire=_allocations((v_payload_ub,)) + tuple(pv_acc_acquire),
+                placement=_placement(context, core, *vector_copy_in)))
+            v_after = ("v_load",)
+            if value_scale:
+                stages_local.append(Stage(
+                    "v_scale_load", context.bind(Work(resources={
+                        "hbm": value_scale,
+                        _read_role(context, vector=True): value_scale})),
+                    after=("v_load",), acquire=_allocations((v_scale_ub,)),
+                    placement=_placement(context, core, *vector_copy_in)))
+                v_after = ("v_scale_load",)
+            stages_local.append(Stage(
+                "dequant_v", context.bind(Work(resources={
+                    "vector": cache.value_conversion_ops(valid)})),
+                after=v_after, acquire=_allocations((v_conv_ub,)),
+                free=_allocations((v_payload_ub, v_scale_ub)),
+                placement=_placement(context, core, *vector)))
+            stages_local.append(Stage(
+                "conv_store_v", context.bind(Work(resources={write: value_operand})),
+                after=("dequant_v",), acquire=_allocations((v_post_l1,)),
+                free=_allocations((v_conv_ub,)),
+                placement=_placement(context, core, *copy_out)))
+            stages_local.append(Stage(
+                "operand_v", context.bind(Work(resources={operand: value_operand})),
+                after=("conv_store_v",), acquire=_allocations((v_l0b,)),
+                free=_allocations((v_post_l1,)),
+                placement=_placement(context, core, *operand_role)))
+            v_ready = "operand_v"
+            v_free = _allocations((v_l0b,))
+        else:
+            v_l1 = _allocation(context, core, "l1", f"v_l1_{suffix}", value_payload)
+            v_l0b = _allocation(context, core, "l0b", f"v_l0b_{suffix}", value_payload)
+            v_load_work = {"hbm": value_payload, read: value_payload}
+            if operand:
+                v_load_work[operand] = value_payload
+            stages_local.append(Stage(
+                "v_load", context.bind(Work(resources=v_load_work)),
+                after=("softmax",),
+                acquire=_allocations((v_l1, v_l0b)) + tuple(pv_acc_acquire),
+                placement={**_placement(context, core, *copy_in),
+                           **_placement(context, core, *operand_role)}))
+            v_ready = "v_load"
+            v_free = _allocations((v_l1, v_l0b))
+        stages_local.extend((
             Stage("probability_operand", context.bind(Work(resources=(
-                      {"mte1": pairs * spec.query_bytes} if operand else {}))),
+                      {operand: pairs * spec.query_bytes} if operand else {}))),
                   after=("softmax",), acquire=_allocations((p_l0a,)),
                   placement=_placement(context, core, *operand_role)),
-            Stage("pv", context.bind(pv), after=("v_load", "probability_operand"),
-                  free=v_release + _allocations((p_l0a,)),
+            Stage("pv", context.bind(pv), after=(v_ready, "probability_operand"),
+                  free=v_free + _allocations((p_l0a,)) + tuple(pv_acc_acquire),
                   placement=_placement(context, core, *cube)),
             Stage("online_update", context.bind(online), after=("pv",),
                   free=prob_release, previous=("online_update",),
                   placement=_placement(context, core, *vector)),
-        )
+        ))
+        return tuple(stages_local)
 
     contributions = len(output.contributions)
     use_compact = len(set(spec.requests)) <= 1 and contributions == 1
+    # A head, the actual causal tail, and two complete slot periods are the
+    # structural minimum. The compactor verifies convergence before folding.
+    min_periodic_tiles = 1 + tail_count + 2 * recipe.slots
+    if use_compact and contribution.tile_count >= min_periodic_tiles:
+        key_program = compact_periodic_pipeline(
+            context, contribution.tile_count, recipe.slots, tile,
+            head=1, tail=tail_count, threshold=min_periodic_tiles - 1,
+            resident=persistent)
+    else:
+        finite_template = _attention_pipeline_template(
+            tile, key_of, contribution.tile_count,
+            rows=rows, key_tile=recipe.key_tile, slots=recipe.slots, core=core)
+        key_program = (PipelineTemplateProgram(finite_template)
+                       if finite_template is not None else PipelineProgram(
+                           contribution.tile_count, recipe.slots, tile))
     stages.append(Stage(
-        "key_tiles", after=("q_load",),
-        program=(
-            compact_periodic_pipeline(
-                context, contribution.tile_count, recipe.slots, tile,
-                head=1, tail=tail_count, resident=persistent)
-            if use_compact
-            else PipelineProgram(contribution.tile_count, recipe.slots, tile)
-        ),
+        "key_tiles", after=(key_ready,), program=key_program,
     ))
 
+    if page_scale_ub is not None:
+        stages.append(Stage("page_scale_release", after=("key_tiles",),
+                            free=_allocations((page_scale_ub,))))
     if contributions == 1:
         out_bytes = rows * dim * spec.query_bytes
-        final = Work(resources={
-            "hbm": out_bytes, "mte3": out_bytes,
-            "vector": rows * (dim + 1),
-        })
+        final_resources = {"hbm": out_bytes, "vector": rows * (dim + 1)}
+        if write:
+            final_resources[write] = out_bytes
+        final = Work(resources=final_resources)
         stages.append(Stage(
             "final_store", after=("key_tiles",),
             work=context.bind(final), free=persistent,
@@ -613,94 +580,13 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
         stages.append(Stage(
             "partial_store", after=("key_tiles",),
             work=context.bind(Work(resources={
-                "hbm": partial_bytes, "mte3": partial_bytes,
+                "hbm": partial_bytes,
+                **(({write: partial_bytes}) if write else {}),
             })),
             free=persistent,
             placement=_placement(context, core, *copy_out),
         ))
     return KernelProgram(tuple(stages))
-
-
-@dataclass(frozen=True)
-class _MergeStream:
-    """Serialize per-owner merges; each starts only after its split barrier."""
-
-    context: RecipeContext
-    recipe: StagedGQADecode
-    spec: _Spec
-    tasks: tuple[tuple[int, _Output], ...]
-    barriers: Mapping[int, object]
-    core: int = 0
-
-    def start(self, engine, name, ready, *, owner=""):
-        if not self.tasks:
-            return ready
-        complete = engine.future(name + ":complete")
-        cursor = [0]
-
-        def advance(predecessor):
-            index = cursor[0]
-            if index >= len(self.tasks):
-                engine.resolve(complete)
-                return
-            cursor[0] += 1
-            output_index, output = self.tasks[index]
-            barrier = self.barriers[output_index]
-            gate = engine.submit(
-                f"{name}:gate{index}", after=(predecessor, barrier), owner=owner,
-            )
-
-            def launch(_):
-                program = _merge_program(self.context, self.spec, output,
-                                         self.core)
-                end = program.start(engine, f"{name}:merge{index}::task",
-                                    gate, owner=owner)
-                engine.submit(
-                    f"{name}:next{index}", after=(end,), owner=owner,
-                    on_complete=lambda _: advance(end),
-                )
-
-            engine.submit(f"{name}:start{index}", after=(gate,),
-                          on_complete=launch, owner=owner)
-
-        advance(ready)
-        return complete
-
-
-def _merge_program(context: RecipeContext, spec: _Spec,
-                   output: _Output, core: int) -> KernelProgram:
-    dim, rows = spec.head_dim, output.rows
-    contributions = len(output.contributions)
-    partial = contributions * rows * _partial_row_bytes(dim)
-    out_bytes = rows * dim * spec.query_bytes
-    read = _read_role(context, vector=True)
-    write = _write_role(context)
-    ub_partial = _allocation(context, core, "ub", "merge_partial",
-                             rows * (dim * _FP32_BYTES + 2 * _FP32_BYTES))
-    ub_out = _allocation(context, core, "ub", "merge_out",
-                         rows * dim * _FP32_BYTES)
-    buffers = _allocations((ub_partial, ub_out))
-    def part(_):
-        return (
-            Stage("merge_load", context.bind(Work(resources={
-                "hbm": partial / contributions, read: partial / contributions,
-            })), placement=_placement(context, core, read)),
-            Stage("merge", context.bind(Work(resources={
-                "vector": rows * (3 * dim + 9),
-            })), after=("merge_load",),
-                  placement=_placement(context, core, "vector")),
-        )
-    return KernelProgram((
-        Stage("reserve", acquire=buffers),
-        Stage("parts", after=("reserve",),
-              program=PipelineProgram(contributions, 1, part)),
-        Stage("normalize", context.bind(Work(resources={"vector": rows * (dim + 1)})),
-              after=("parts",), placement=_placement(context, core, "vector")),
-        Stage("merge_store", context.bind(Work(resources={
-            "hbm": out_bytes, "mte3": out_bytes,
-        })), after=("normalize",), free=buffers,
-              placement=_placement(context, core, write, "vector")),
-    ))
 
 
 @dataclass(frozen=True)
@@ -776,11 +662,23 @@ class _GQADecodeProgram:
         )
 
 
+def planned_recipe(**options) -> PlannedRecipe:
+    """Return a planned recipe with every declared option preserved.
+
+    The recipe factory registers this callable as ``staged_gqa_decode``.
+    ``PlannedRecipe`` applies the work ledger and metadata once through
+    ``prepare`` on the caller's engine.
+    """
+    return PlannedRecipe(StagedGQADecode(**options).build)
+
+
 __all__ = [
     "IMPLEMENTATION",
+    "KVCacheAccess",
     "RECIPE_ID",
     "SOURCE_REFERENCES",
     "StagedGQADecode",
     "build",
     "causal_pairs",
+    "planned_recipe",
 ]

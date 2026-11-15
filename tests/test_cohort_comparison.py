@@ -26,7 +26,12 @@ def _captured_report(case, capture, kind, *, phase="decode", tokens=1, repeat=2,
     from mindie_profiler.normalized import kernel_rows
     from mindie_profiler.structure_mapping import map_structure
 
-    path = Path(mindie_profiler.__file__).resolve().parents[1] / "tests/fixtures/fusion_contracts" / capture
+    rel = Path("tests/fixtures/fusion_contracts") / capture
+    path = Path(mindie_profiler.__file__).resolve().parents[1] / rel
+    if not path.is_file():
+        path = Path(__file__).resolve().parents[2] / "profiler" / rel
+    if not path.is_file():
+        pytest.skip(f"retained fusion fixture unavailable: {path}")
     original = next(islice(
         (row.event for row in kernel_rows(path, rank_id=rank_id) if row.kind == kind),
         source_row, None))
@@ -232,6 +237,7 @@ def test_single_capture_rank_folds_symmetric_dp_without_multiplying_instances(pr
 
 def test_real_kimi_decode_matrix_crosses_semantic_recipes_without_choosing_a_replica(profiler_api):
     case = json.loads((ROOT / "examples/cases/kimi-k3-a5.json").read_text())
+    case["model"]["layers"] = 4
     mapping, events = _captured_report(
         case, "kimi_matmul_decode.csv", "MatMulV3", source_row=1, context=32768)
     group = mapping["windows"][0]["cohorts"][0]
@@ -294,6 +300,7 @@ def test_w4a8_real_grouped_cohort_retains_totals_but_not_full_program_error(prof
 
 def test_source_declared_w8a8_epilogue_still_compares_real_dense_cohort(profiler_api):
     case = json.loads((ROOT / "examples/cases/glm53-a3-w4a8.json").read_text())
+    case["model"]["layers"] = 4
     mapping, _ = _captured_report(
         case, "a3_glm53_prefill.csv", "QuantBatchMatmulV3", phase="prefill", tokens=4096)
     result = compare_cohorts(case, mapping)
@@ -354,6 +361,7 @@ def test_cached_cost_keeps_each_host_bound_cohorts_own_representative(profiler_a
 
 def test_real_hyper_connection_is_only_an_unfused_reference_until_resource_selection(profiler_api):
     case = json.loads((ROOT / "examples/cases/v4f-a3-w8a8-tp8.json").read_text())
+    case["model"]["layers"] = 4
     mapping, _ = _captured_report(
         case, "a3_v4f.csv", "HcPre", phase="prefill", tokens=4096, repeat=1)
     assert mapping["windows"][0]["cohorts"]
@@ -369,6 +377,7 @@ def test_real_hyper_connection_is_only_an_unfused_reference_until_resource_selec
 
 def test_selected_native_fusion_prices_the_physical_program_without_binding_a_layer(profiler_api):
     case = json.loads((ROOT / "examples/cases/v4f-a3-w8a8-tp8.json").read_text())
+    case["model"]["layers"] = 4
     case["runtime"].setdefault("kernels", {}).setdefault("lowerings", {})["native_fusion"] = {
         "implementation": "declared_native_fusion",
         "options": {"roles": ["hc_pre"], "traffic_profile": "hc_pre_m_k_split_175ef4d4"},

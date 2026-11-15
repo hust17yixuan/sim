@@ -36,6 +36,8 @@ from mindie_sim.schema.model import LayerPlan, ModelSpec
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.coverage import model_coverage
+from mindie_sim.catalog.config import flatten_config
+from mindie_sim.catalog.hf_config import model_value_formats
 from mindie_sim.catalog.specs import build_model_spec as _build_model_spec
 from mindie_sim.catalog.fleet import FLEET_CATALOG_ENTRIES, FLEET_MODEL_ALIASES
 from mindie_sim.catalog.weights import (
@@ -196,6 +198,23 @@ class ModelArchitectureProfile:
     dense_weight_bytes: float
     routed_expert_weight_bytes: float
     single_expert_weight_bytes: float
+    # Declared value formats and rope/context geometry.  Empty/zero means the
+    # source did not declare it; no profile default is another model's value.
+    compute_dtype: str = "bf16"
+    output_dtype: str = "bf16"
+    rope_theta: float = 0.0
+    rope_type: str = ""
+    rope_scaling_factor: float = 1.0
+    partial_rotary_factor: float = 1.0
+    rotary_dim: int = 0
+    mla_use_nope: bool = False
+    mrope_section: tuple[int, ...] = ()
+    mrope_interleaved: bool = False
+    max_position_embeddings: int = 0
+    index_topk: int = 0
+    index_n_heads: int = 0
+    sliding_window: int = 0
+    quant_method: str = ""
 
     @property
     def moe_dispatch_token_width(self) -> int:
@@ -308,12 +327,36 @@ class ModelArchitectureProfile:
             "total_dit_tokens": self.total_dit_tokens,
             "state_bytes_per_seq_tp1": self.total_state_bytes_per_seq(1, 1),
             "kv_bytes_per_token_tp1": self.kv_bytes_per_token_per_rank(1, 1, 1),
+            "compute_dtype": self.compute_dtype,
+            "output_dtype": self.output_dtype,
+            "rope_theta": self.rope_theta,
+            "rope_type": self.rope_type,
+            "rope_scaling_factor": self.rope_scaling_factor,
+            "partial_rotary_factor": self.partial_rotary_factor,
+            "rotary_dim": self.rotary_dim,
+            "mla_use_nope": self.mla_use_nope,
+            "mrope_section": list(self.mrope_section),
+            "mrope_interleaved": self.mrope_interleaved,
+            "max_position_embeddings": self.max_position_embeddings,
+            "index_topk": self.index_topk,
+            "index_n_heads": self.index_n_heads,
+            "sliding_window": self.sliding_window,
+            "quant_method": self.quant_method,
         }
+
+
+def _profile_dtype(value: Any, default: str) -> str:
+    if value is None:
+        value = default
+    text = str(value).strip().lower()
+    return {"bfloat16": "bf16", "float16": "fp16", "float32": "fp32"}.get(text, text)
 
 
 def build_architecture_profile(config: Mapping[str, Any], *, key: str | None = None) -> ModelArchitectureProfile:
     if not isinstance(config, Mapping):
         raise ModelingError("architecture_profile_config_invalid")
+    from mindie_sim.catalog.hf_config import declared_context, declared_rope, native_dtype
+    flat, _, _ = flatten_config(config)
     model_key = str(key or config.get("model_key") or config.get("name") or "custom").strip()
     name = str(config.get("name") or model_key)
     model_type = str(config.get("model_type") or config.get("family") or "custom")
@@ -468,9 +511,37 @@ def build_architecture_profile(config: Mapping[str, Any], *, key: str | None = N
         config.get("index_head_dim")
         or (sparse_cfg.get("index_head_dim", 0) if isinstance(sparse_cfg, Mapping) else 0)
     )
-    weight_dtype = str(config.get("weight_dtype") or "bf16")
-    kv_dtype = str(config.get("kv_dtype") or "bf16")
-    act_dtype = str(config.get("activation_dtype") or "bf16")
+    act_dtype = _profile_dtype(flat.get("activation_dtype"), native_dtype(flat))
+    if act_dtype not in {"bf16", "fp16", "fp32"}:
+        act_dtype = "bf16"
+    weight_dtype = _profile_dtype(flat.get("weight_dtype"), act_dtype)
+    kv_dtype = _profile_dtype(flat.get("kv_dtype"), act_dtype)
+    compute_dtype = _profile_dtype(flat.get("compute_dtype"), act_dtype)
+    output_dtype = _profile_dtype(flat.get("output_dtype"), act_dtype)
+    rope = declared_rope(flat)
+    context = declared_context(flat)
+    rope_theta = float(rope.get("rope_theta") or 0.0)
+    rope_type = str(rope.get("rope_type") or rope.get("type") or "")
+    rope_factor = float(rope.get("factor") or rope.get("rope_factor") or 1.0)
+    partial_rotary = float(rope.get("partial_rotary_factor") or 1.0)
+    raw_section = rope.get("mrope_section")
+    mrope_section = (
+        tuple(int(item) for item in raw_section)
+        if isinstance(raw_section, (list, tuple)) and raw_section else ()
+    )
+    mrope_interleaved = bool(rope.get("mrope_interleaved", False))
+    # MLA stores its explicit compressed rotary width (0 means NoPE).  GQA
+    # applies partial_rotary_factor to the head width; full rotary is head_dim.
+    if kv_lora > 0:
+        rotary_dim = qk_rope
+    elif 0.0 < partial_rotary < 1.0:
+        rotary_dim = int(round(head_dim * partial_rotary))
+    else:
+        rotary_dim = head_dim
+    max_position = int(context.get("max_position_embeddings") or 0)
+    raw_quant = flat.get("quantization_config")
+    quant_method = (str(raw_quant.get("quant_method", ""))
+                    if isinstance(raw_quant, Mapping) else "")
     wb = dtype_bytes(weight_dtype)
 
     moe_layers = max(0, num_layers - first_k_dense) if ffn_type == "moe" and num_routed > 0 else 0
@@ -514,6 +585,16 @@ def build_architecture_profile(config: Mapping[str, Any], *, key: str | None = N
         kv_dtype=kv_dtype, activation_dtype=act_dtype, dense_weight_bytes=dense_weight_bytes,
         routed_expert_weight_bytes=routed_expert_weight_bytes,
         single_expert_weight_bytes=single_expert_weight_bytes,
+        compute_dtype=compute_dtype, output_dtype=output_dtype,
+        rope_theta=rope_theta, rope_type=rope_type,
+        rope_scaling_factor=rope_factor, partial_rotary_factor=partial_rotary,
+        rotary_dim=rotary_dim, mla_use_nope=bool(rope.get("mla_use_nope", False)),
+        mrope_section=mrope_section, mrope_interleaved=mrope_interleaved,
+        max_position_embeddings=max_position,
+        index_topk=int(flat.get("index_topk") or 0),
+        index_n_heads=int(flat.get("index_n_heads") or 0),
+        sliding_window=int(context.get("sliding_window") or 0),
+        quant_method=quant_method,
     )
 
 
@@ -530,21 +611,39 @@ def load_architecture_profile(
             if plan.attention in _TOKEN_KV_KINDS and (plan.owns_long_kv or plan.attention == "gqa" or plan.compress_ratio == 0)
         ]
         profile_name = dict(model.catalog_facts).get("profile", resolved)
-        return build_architecture_profile(
-            {
-                "model_key": resolved, "name": model.name, "model_type": profile_name,
-                "family": profile_name, "num_layers": model.layers, "hidden_size": model.hidden_size,
-                "vocab_size": model.vocab_size, "num_attention_heads": model.num_heads,
-                "num_key_value_heads": model.num_kv_heads, "head_dim": model.head_dim,
-                "attention_type": model.attention, "layer_attention_schedule": schedule,
-                "kv_owner_layers": owners, "ffn_type": model.ffn,
-                "ffn_hidden_size": model.intermediate_size, "moe_intermediate_size": model.moe_intermediate_size,
-                "num_routed_experts": model.num_experts, "top_k": model.top_k,
-                "kv_lora_rank": model.mla.kv_lora_rank if model.mla else 0,
-                "qk_rope_head_dim": model.mla.qk_rope_head_dim if model.mla else 0,
-            },
-            key=resolved,
-        )
+        path = root / CATALOG[resolved]
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except TimeoutError:
+            raise
+        except OSError as exc:
+            raise ModelingError(f"catalog_profile_unreadable:{resolved}:{type(exc).__name__}") from exc
+        flat, _, _ = flatten_config(raw)
+        mla = model.mla
+        # Keep every declared source attribute (dtype/rope/context/quant) while
+        # the normalized geometry and schedule still come from the parsed model.
+        derived = {
+            "model_key": resolved, "name": model.name, "model_type": profile_name,
+            "family": profile_name, "num_layers": model.layers, "hidden_size": model.hidden_size,
+            "vocab_size": model.vocab_size, "num_attention_heads": model.num_heads,
+            "num_key_value_heads": model.num_kv_heads, "head_dim": model.head_dim,
+            "attention_type": model.attention, "layer_attention_schedule": schedule,
+            "kv_owner_layers": owners, "ffn_type": model.ffn,
+            "ffn_hidden_size": model.intermediate_size, "moe_intermediate_size": model.moe_intermediate_size,
+            "num_routed_experts": model.num_experts, "top_k": model.top_k,
+            "activation_dtype": model.activation_dtype, "weight_dtype": model.weight_dtype,
+            "kv_dtype": model.kv_dtype, "compute_dtype": model.compute_dtype,
+            "q_lora_rank": mla.q_lora_rank if mla else 0,
+            "kv_lora_rank": mla.kv_lora_rank if mla else 0,
+            "qk_nope_head_dim": mla.qk_nope_head_dim if mla else 0,
+            "qk_rope_head_dim": mla.qk_rope_head_dim if mla else 0,
+            "v_head_dim": mla.v_head_dim if mla else 0,
+            "index_topk": mla.index_topk if mla else 0,
+            "index_head_dim": mla.index_head_dim if mla else 0,
+            "index_n_heads": mla.index_n_heads if mla else 0,
+            "sliding_window": mla.sliding_window if mla else 0,
+        }
+        return build_architecture_profile({**flat, **derived}, key=resolved)
     if resolved in ARCHITECTURE_PRESET_CATALOG:
         path = root / ARCHITECTURE_PRESET_CATALOG[resolved]
         try:

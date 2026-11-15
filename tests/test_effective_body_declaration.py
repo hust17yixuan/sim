@@ -17,6 +17,31 @@ from test_prediction_system import case as small_case
 
 
 GEOMETRY = dict(phase="decode", tokens=1, context=128, sequences=2, scope="body")
+def _assert_timeline_close(left, right, *, rel=1e-9):
+    """Identical structure and ids; engine float sums may differ by one ulp."""
+    assert [row["id"] for row in left] == [row["id"] for row in right]
+
+    def close(a, b, path):
+        if isinstance(a, dict) and isinstance(b, dict):
+            assert set(a) == set(b), path
+            for key in a:
+                close(a[key], b[key], f"{path}.{key}")
+            return
+        if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+            assert len(a) == len(b), path
+            for index, (x, y) in enumerate(zip(a, b)):
+                close(x, y, f"{path}[{index}]")
+            return
+        if isinstance(a, bool) or isinstance(b, bool):
+            assert a == b, path
+        elif isinstance(a, float) and isinstance(b, float):
+            assert a == pytest.approx(b, rel=rel, abs=1e-15), path
+        else:
+            assert a == b, path
+
+    for x, y in zip(left, right):
+        close(x, y, x["id"])
+
 
 
 def _gqa_case():
@@ -38,9 +63,11 @@ def test_gdn_body_graph_operator_and_structure_share_actual_caller():
     direct = _graph(raw, graphs)
     isolated = operator_costs(raw, target_operators(raw, **GEOMETRY))
     structure = export_structure(raw, **GEOMETRY)
-    assert direct["timeline"] == body["timeline"]
-    assert direct["duration_ms"] == body["body_forward_ms"]
-    assert direct["execution"]["serviced"] == body["execution"]["serviced"]
+    _assert_timeline_close(direct["timeline"], body["timeline"])
+    assert direct["duration_ms"] == pytest.approx(
+        body["body_forward_ms"], rel=1e-9, abs=1e-15)
+    assert direct["execution"]["serviced"] == pytest.approx(
+        body["execution"]["serviced"], rel=1e-9, abs=1e-9)
     for recipe in ("ascend_causal_conv1d_update", "ascend_gdn_decode_gating",
                    "ascend_recurrent_gdn_fp32_state"):
         assert sum(row["recipe"] == recipe for row in structure["nodes"]) == 1
@@ -59,13 +86,17 @@ def test_graph_carrier_keeps_current_hardware_and_explicit_book_or_recipe_overri
     attention = lambda result: [row for row in result["timeline"] if row["family"] == "attention"]
     assert all(row["program"] == "StagedGQADecode" for row in attention(automatic))
     single_rank = _graph(raw, graphs[0])
-    assert single_rank["timeline"] == automatic["timeline"]
-    assert single_rank["execution"]["serviced"] == automatic["execution"]["serviced"]
-    assert _graph(raw, dict(graphs))["timeline"] == automatic["timeline"]
-    assert _graph(raw, {0: graphs[0]})["timeline"] == automatic["timeline"]
+    _assert_timeline_close(single_rank["timeline"], automatic["timeline"])
+    assert single_rank["execution"]["serviced"] == pytest.approx(
+        automatic["execution"]["serviced"], rel=1e-9, abs=1e-9)
+    _assert_timeline_close(_graph(raw, dict(graphs))["timeline"],
+                           automatic["timeline"])
+    _assert_timeline_close(_graph(raw, {0: graphs[0]})["timeline"],
+                           automatic["timeline"])
     cloned = deepcopy(graphs)
     assert cloned[0].effective_kernels is cloned.effective_kernels
-    assert _graph(raw, cloned)["timeline"] == automatic["timeline"]
+    _assert_timeline_close(_graph(raw, cloned)["timeline"],
+                           automatic["timeline"])
     rank_costs = operator_costs(raw, graphs[0])
     assert all(row["program"] == "StagedGQADecode" for row in rank_costs["operators"]
                if row["operator"]["family"] == "attention")
@@ -96,7 +127,7 @@ def test_explicit_book_does_not_install_structural_caller_and_model_scope_is_unc
     body = predict(raw, recipes=explicit, **GEOMETRY)
     graphs = target_graphs(raw, apply_body_defaults=False, **GEOMETRY)
     direct = _graph(raw, graphs, recipes=explicit)
-    assert body["timeline"] == direct["timeline"]
+    _assert_timeline_close(body["timeline"], direct["timeline"])
     assert not any(row["recipe"] == "ascend_gdn_decode_gating" for row in body["timeline"])
     model = {**GEOMETRY, "scope": "model"}
     assert target_graphs(raw, **model) == target_graphs(raw, apply_body_defaults=False, **model)

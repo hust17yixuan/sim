@@ -103,7 +103,8 @@ def test_q28_physical32_requires_mask_and_keeps_valid_group_rows56(scope):
     assert sum(ledger["global_expert_rows"]) == 28 * 8
     assert ops["s0.l0.router"].local_shape[0] == 32
     assert ops["s0.l0.topk"].local_shape[0] == 8
-    payload = next(o for o in ops.values() if o.op_id == "s0.l0.dispatch.payload_network")
+    payload = next(o for o in ops.values()
+                   if "source_force_eplb" in dict(o.metadata))
     assert dict(payload.metadata)["source_force_eplb"]["valid_global_tokens"] == 28
 
 
@@ -161,7 +162,8 @@ def test_unfused_contract_rejects_fused_selection_and_foreign_receiver():
 def test_cast_and_allocated_pointwise_wait_for_received_inputs():
     raw = case(); ops = graph(raw)
     selected = [o for o in ops if o.op_id in {"s0.l0.expert_up.weight_scale_cast", "s0.l0.expert_up",
-                "s0.l0.expert_act", "s0.l0.expert_down.quantize", "s0.l0.expert_down"}]
+                "s0.l0.expert_act", "s0.l0.expert_down.quantize", "s0.l0.expert_down.weight_scale_cast",
+                "s0.l0.expert_down"}]
     result = graph_costs(raw, {0: selected}, input_ready_ms=7,
                          external_inputs={"s0.l0.dispatch": 7})
     times = {r["op_id"]: r for r in result["timeline"]}
@@ -170,3 +172,72 @@ def test_cast_and_allocated_pointwise_wait_for_received_inputs():
         assert times[after.op_id]["ready_ms"] >= times[before.op_id]["complete_ms"]
     assert result["execution"]["live_tasks"] == result["execution"]["live_programs"] == 0
     assert result["execution"]["work"]["flops"] == sum(o.flops for o in selected)
+
+
+def test_runtime_bf16_scale_needs_no_cast_and_legacy_fp32_is_converted_once():
+    bindings = case()["runtime"]["kernels"]["lowerings"]
+    ops = graph(case(selected=False))
+    runtime = tuple(
+        replace(o, metadata=tuple({**dict(o.metadata),
+                                   "weight_scale_storage_format": "bf16",
+                                   "weight_scale_storage_bytes": 2.0}.items()))
+        if o.family == "grouped_gemm" else o for o in ops)
+    lowered = lower(runtime, bindings)
+    assert not any(o.recipe == "expert_weight_scale_cast" for o in lowered)
+    by_id = {o.op_id: o for o in lowered}
+    before = {o.op_id: o for o in ops}
+    for key in ("s0.l0.expert_up", "s0.l0.expert_down"):
+        meta = dict(by_id[key].metadata)
+        assert meta["weight_scale_format"] == "bf16"
+        assert meta["weight_scale_storage_format"] == "bf16"
+        assert meta[METADATA]["weight_scale_cast_required"] is False
+        assert (dict(by_id[key].metadata)["packed_weight_bytes"]
+                == dict(before[key].metadata)["packed_weight_bytes"])
+        assert by_id[key].mte2_bytes == before[key].mte2_bytes
+
+    legacy = []
+    for op in ops:
+        if op.family != "grouped_gemm":
+            legacy.append(op); continue
+        meta = dict(op.metadata)
+        banks = len(tuple(meta["matrix_group_rows"]))
+        columns = op.local_shape[1]
+        active = sum(n > 0 for n in meta["matrix_group_rows"])
+        old_scale = active * columns * 2
+        meta.update(weight_scale_format="fp32", weight_scale_bytes=4.0,
+                    packed_weight_bytes=meta["packed_weight_bytes"] + old_scale * 2,
+                    matrix_epilogue={**meta["matrix_epilogue"],
+                                     "column_scale_bytes": active * columns * 4})
+        meta.pop("weight_scale_storage_format", None)
+        meta.pop("weight_scale_storage_bytes", None)
+        legacy.append(replace(op, mte2_bytes=op.mte2_bytes + old_scale * 2,
+                              metadata=tuple(meta.items())))
+    converted = lower(tuple(legacy), bindings)
+    casts = {o.op_id: o for o in converted if o.recipe == "expert_weight_scale_cast"}
+    assert set(casts) == {"s0.l0.expert_up.weight_scale_cast",
+                          "s0.l0.expert_down.weight_scale_cast"}
+    assert casts["s0.l0.expert_up.weight_scale_cast"].local_shape == (64, 1024)
+    assert casts["s0.l0.expert_down.weight_scale_cast"].local_shape == (64, 2048)
+    for cast in casts.values():
+        cast_rows, cast_columns = cast.local_shape
+        assert (cast.mte2_bytes, cast.mte3_bytes) == (
+            cast_rows * cast_columns * 4, cast_rows * cast_columns * 2)
+    by_id = {o.op_id: o for o in converted}
+    for key in ("s0.l0.expert_up", "s0.l0.expert_down"):
+        meta = dict(by_id[key].metadata)
+        assert meta["weight_scale_format"] == "bf16"
+        assert meta["weight_scale_storage_format"] == "fp32"
+        assert (dict(by_id[key].metadata)["packed_weight_bytes"]
+                == dict(before[key].metadata)["packed_weight_bytes"])
+        assert by_id[key].mte2_bytes == before[key].mte2_bytes
+
+
+def test_mc2_capability_registry_declares_storage_and_runtime_formats():
+    from mindie_sim.prediction.family_mc2_unfused import capabilities
+
+    caps = capabilities()
+    assert caps["selector"] == "grouped_int8_caller"
+    assert caps["weight_scale_runtime_format"] == "bf16"
+    assert caps["weight_scale_storage_formats"] == ("fp32", "bf16")
+    assert caps["activation_scale_format"] == "fp32"
+    assert "explicit_global_bs_zero" in caps["requires"]

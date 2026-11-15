@@ -96,11 +96,17 @@ def bind_gate_prepare(ops, *, gate, local_ops, lengths, heads, key_heads, dk, dv
 
 
 def bind_prefill_scans(scans, *, lengths, heads, key_heads, dk, dv, chunk,
-                       dtype, state_dtype, requests, pcp=1, speculative=False):
+                       dtype, state_dtype, requests, pcp=1, speculative=False,
+                       state_contexts=None, state_targets=None,
+                       state_values=None, layout_values=None,
+                       state_ready=(), state_grants=()):
     return family_kda_state.bind_prefill_scans(
         scans, lengths=lengths, heads=heads, key_heads=key_heads, dk=dk,
         dv=dv, chunk=chunk, dtype=dtype, state_dtype=state_dtype,
-        requests=requests, pcp=pcp, speculative=speculative)
+        requests=requests, pcp=pcp, speculative=speculative,
+        state_contexts=state_contexts, state_targets=state_targets,
+        state_values=state_values, layout_values=layout_values,
+        state_ready=state_ready, state_grants=state_grants)
 
 
 __all__ = [

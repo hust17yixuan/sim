@@ -85,7 +85,10 @@ def validate(*, key_heads, value_heads, key_width, value_width, model):
 
 
 def bind_prefill_scans(scans, *, lengths, heads, key_heads, dk, dv, chunk,
-                       dtype, state_dtype, requests, pcp=1, speculative=False):
+                       dtype, state_dtype, requests, pcp=1, speculative=False,
+                       state_contexts=None, state_targets=None,
+                       state_values=None, layout_values=None,
+                       state_ready=(), state_grants=()):
     """Replace the prefill scan members with one actual varlen FWD_H op.
 
     ``pcp >= 1`` is accepted. Inter-chunk state transfer is a caller collective.
@@ -110,6 +113,9 @@ def bind_prefill_scans(scans, *, lengths, heads, key_heads, dk, dv, chunk,
         params, op_id=first.op_id, deps=deps, requests=requests,
         stage=first.stage, layer=first.layer, phase=first.phase,
         stream=first.stream, notes=first.notes,
+        state_contexts=state_contexts, state_targets=state_targets,
+        state_values=state_values, layout_values=layout_values,
+        state_ready=state_ready, state_grants=state_grants,
     )
 
 

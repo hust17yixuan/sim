@@ -39,7 +39,8 @@ def test_draft_prefill_populates_cache_after_target_first_token_then_verifies_on
     assert result["requests"][0]["generated_tokens"] == 6
     assert result["requests"][0]["speculative"]["proposed_tokens"] > 0
     assert result["requests"][0]["ttft_ms"] == baseline["requests"][0]["ttft_ms"]
-    commits = [event for event in result["events"] if event["task"].endswith("token_commit:complete")]
+    commits = [event for event in result["events"]
+               if "token_commit" in event["task"] and not event["task"].endswith(":submit")]
     prepared = [event for event in result["events"] if "draft_prefill." in event["task"]
                 and not event["task"].endswith(":submit")]
     assert prepared and min(event["start_ms"] for event in prepared) >= commits[0]["end_ms"]
@@ -163,7 +164,7 @@ def test_kimi_k3_dspark_kv_cache_footprint_and_block_draft_subgraph():
 
     # Subgraph D0 instantiation for Kimi-K3 DSpark
     inst = instantiate_model(model, FeatureConfig.from_model(model, tp=8, ep=32, dp=4))
-    d0 = next(g for g in inst.globals if g.kind == "D0")
+    d0 = next(g for g in inst.globals if g.kind == "spec_decode")
     assert d0.template.variant == "dspark"
     proj = d0.operator("draft_projection")
     assert proj.theta.find("K") == 5 * model.hidden_size
@@ -211,7 +212,7 @@ def _assert_mla_d0(model, *, hidden: int) -> None:
     assert wkv.rows == 512 + 64
     assert out.cols == 64 * 128
     inst = instantiate_model(model, FeatureConfig.from_model(model, tp=1, ep=1, dp=1))
-    d0 = next(graph for graph in inst.globals if graph.kind == "D0")
+    d0 = next(graph for graph in inst.globals if graph.kind == "spec_decode")
     for name in (
         "draft_layer0_attn_norm", "draft_layer0_q_a", "draft_layer0_q_norm",
         "draft_layer0_q_b", "draft_layer0_kv_a", "draft_layer0_kv_norm",

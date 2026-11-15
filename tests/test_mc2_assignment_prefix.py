@@ -42,15 +42,21 @@ def test_engine_keeps_owner_specific_prefix_then_payload_and_exact_total_work(to
     assert engine.serviced['vector'] == pytest.approx(sum(expected.values()))
     for owner in plan.metadata['active_owner_domain']:
         trace = [x for x in engine.trace if f'owner{owner}:' in x['task']]
-        scan = next(x for x in trace if x['task'].endswith(':assignment_prefix_scan'))
         read = next(x for x in trace if x['task'].endswith(':read'))
-        # Resource rates are per-device; each owner gets exactly one lane.
-        assert scan['end_ms'] - scan['start_ms'] == pytest.approx(expected[owner] / (64000 / units))
-        assert read['start_ms'] >= scan['end_ms']
+        if expected[owner] > 0:
+            scan = next(x for x in trace if x['task'].endswith(':assignment_prefix_scan'))
+            # Resource rates are per-device; each owner gets exactly one lane.
+            assert scan['end_ms'] - scan['start_ms'] == pytest.approx(expected[owner] / (64000 / units))
+            assert read['start_ms'] >= scan['end_ms']
+        else:
+            assert not any(x['task'].endswith(':assignment_prefix_scan') for x in trace)
     assert elapsed > 0
     counts = next(p for p in contract.phases if p.name == 'count_compute')
     c = len(counts.owner_domain)
-    assert dict(counts.work)['vector'] == 16 * (5 * tokens * topk - 1) + c * 9 * 16
+    # Count computation owns only the zero-filled expert-count vector.  The
+    # per-assignment quantize scan remains in send_read_quantize above; it is
+    # not charged a second time here.
+    assert dict(counts.work)['vector'] == c * 9 * ((16 + 7) // 8 * 8)
     assert engine.serviced['hbm'] == pytest.approx(tokens * topk * 480)
 
 

@@ -24,10 +24,16 @@ def test_glm_prefill_prices_independent_query_selections_in_the_ordinary_graph()
     assert meta["indexed_gather_rows"] == meta["kv_sweeps"] == selected
     assert meta["logical_pairs"] == selected
     assert meta["selection_index_read_bytes"] == 4 * selected
-    query_transfer = 4096 * 8 * (512 + 64 + 512) * 2
-    assert op.mte2_bytes == pytest.approx(selected * (512 + 64) * 2
-                                         + 4 * selected + query_transfer / 2)
-    assert op.flops == 2 * selected * 8 * (512 + 64 + 512)
+    # Q read and O write are distinct external payloads.  The old
+    # half-transfer approximation hid the 512-wide output write; qk_dim is
+    # 512 latent + 64 rope and the output is 512 latent wide.
+    qk_dim, latent = 512 + 64, 512
+    q_read = 4096 * 8 * qk_dim * 2
+    out_write = 4096 * 8 * latent * 2
+    assert op.mte2_bytes == pytest.approx(
+        selected * qk_dim * 2 + 4 * selected + q_read)
+    assert op.mte3_bytes == pytest.approx(out_write)
+    assert op.flops == 2 * selected * 8 * (qk_dim + latent)
 
 
 def test_index_pool_prices_unpooled_causal_tail_row():

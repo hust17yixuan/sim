@@ -237,4 +237,134 @@ def _normalize_shares(shares: Mapping[str, Any]) -> dict[str, float]:
     return {name: round(value / scale, 9) for name, value in totals.items() if value > 0.0}
 
 
+def memory_stage_facts(case, *, phase: str, prefix_tokens: int, tokens: int,
+                       context: int, sequences: int, output_tokens: int):
+    """Pair per-stage supply with the executing and complete-service windows.
+
+    The executing window, delayed-release hold, workspace, peak and both
+    headroom values come from the same ``capacity_window`` projection used by
+    the public SLA solver and ``capacity_feedback``.  Active-window headroom is
+    retained under its explicit name; guardrails consume the complete peak.
+    """
+    from .prediction.capacity import Memory
+    from .prediction.efficiency import _resolve_speculative_tokens, capacity_window
+    memory = Memory(case, workspace_tokens=max(1, sequences * tokens))
+    window_context = prefix_tokens if phase == "prefill" else context
+    if phase == "decode":
+        _, emitted = _resolve_speculative_tokens(
+            case, output_budget=output_tokens, tokens_per_seq=tokens,
+            emitted_tokens_per_seq=None)
+    else:
+        _, emitted = _resolve_speculative_tokens(
+            case, output_budget=output_tokens, tokens_per_seq=None,
+            emitted_tokens_per_seq=None)
+    current = capacity_window(
+        case, phase=phase, context=window_context, tokens_per_seq=tokens,
+        sequences=sequences, output_budget=output_tokens,
+        emitted_tokens_per_seq=emitted, memory=memory)
+    if phase == "prefill":
+        decode_q, decode_emit = _resolve_speculative_tokens(
+            case, output_budget=output_tokens, tokens_per_seq=None,
+            emitted_tokens_per_seq=None)
+        life_memory = Memory(case, workspace_tokens=max(1, sequences * decode_q))
+        lifecycle = capacity_window(
+            case, phase="decode", context=prefix_tokens + tokens,
+            tokens_per_seq=decode_q, sequences=sequences,
+            output_budget=output_tokens, emitted_tokens_per_seq=decode_emit,
+            memory=life_memory)
+    else:
+        lifecycle = current
+
+    def _legacy_stages(window):
+        count = max(1, int(window.get("sequences") or 1))
+        rows = []
+        for row in window.get("stages", ()):
+            active = float(row.get("active_kv_bytes", 0.0) or 0.0)
+            external = float(row.get("external_held_bytes", 0.0) or 0.0)
+            rows.append({
+                "stage": int(row["stage"]),
+                "available_bytes": round(float(row.get("supply_bytes", 0.0) or 0.0), 3),
+                "kv_bytes_per_sequence": round(active / count, 3),
+                "headroom_bytes": round(float(row.get("active_headroom_bytes", 0.0) or 0.0), 3),
+                "used_bytes": round(float(row.get("fixed_bytes", 0.0) or 0.0) + external + active, 3),
+                "hbm_bytes_per_die": round(float(row.get("hbm_bytes_per_die", 0.0) or 0.0), 3),
+                "hbm_utilization_ratio": round(float(row.get("hbm_utilization_ratio", 0.0) or 0.0), 9),
+                "workspace_bytes": round(float(row.get("workspace_bytes", 0.0) or 0.0), 3),
+                "external_held_bytes": round(external, 3),
+                "active_kv_bytes": round(active, 3),
+                "retiring_kv_bytes": round(float(row.get("retiring_kv_bytes", 0.0) or 0.0), 3),
+                "peak_bytes": round(float(row.get("peak_bytes", 0.0) or 0.0), 3),
+                "full_headroom_bytes": round(float(row.get("headroom_bytes", 0.0) or 0.0), 3),
+            })
+        return rows
+
+    stages = _legacy_stages(current)
+    lifecycle_stages = _legacy_stages(lifecycle)
+    hbm_by_stage = [float(row["hbm_bytes_per_die"]) for row in stages]
+    hbm = min(hbm_by_stage, default=min(float(die.hbm_bytes) for die in case.machine.dies))
+    return {
+        "memory": memory, "hbm_bytes": hbm, "hbm_bytes_by_stage": hbm_by_stage,
+        "kv_tokens": int(current["window"]["active_tokens_per_sequence"]),
+        "available_by_stage": [float(row["available_bytes"]) for row in stages],
+        "kv_by_stage": [float(row["kv_bytes_per_sequence"]) for row in stages],
+        "headroom_by_stage": [float(row["headroom_bytes"]) for row in stages],
+        "used_by_stage": [float(row["used_bytes"]) for row in stages],
+        "min_available_bytes": min((float(row["available_bytes"]) for row in stages), default=0.0),
+        "max_kv_bytes_per_sequence": max((float(row["kv_bytes_per_sequence"]) for row in stages), default=0.0),
+        "min_headroom_bytes": min((float(row["headroom_bytes"]) for row in stages), default=0.0),
+        "max_used_bytes": max((float(row["used_bytes"]) for row in stages), default=0.0),
+        "max_workspace_bytes": float(current.get("workspace_bytes", 0.0) or 0.0),
+        "lifecycle_kv_bytes_per_sequence": max((float(row["kv_bytes_per_sequence"]) for row in lifecycle_stages), default=0.0),
+        "lifecycle_min_headroom_bytes": float(lifecycle.get("headroom_bytes", 0.0) or 0.0),
+        "joint_min_headroom_bytes": min(
+            float(current.get("active_headroom_bytes", 0.0) or 0.0),
+            float(lifecycle.get("headroom_bytes", 0.0) or 0.0)),
+        "headroom_basis": "active_window_kv_only; joint is complete_peak_after_workspace_and_fixed_reserve",
+        "capacity_window": current,
+        "lifecycle_capacity_window": lifecycle,
+        "lifecycle_stages": lifecycle_stages if phase == "prefill" else None,
+        "stages": stages,
+    }
+
+
+def capacity_metrics(case, cfg, b_sync: int, b_async: int,
+                     b_lifecycle_sync: int | None = None,
+                     b_lifecycle_async: int | None = None,
+                     b_joint_sync: int | None = None,
+                     b_joint_async: int | None = None):
+    facts = memory_stage_facts(case, phase=cfg.phase, prefix_tokens=cfg.prefix_tokens,
+                               tokens=cfg.tokens, context=cfg.context,
+                               sequences=cfg.sequences, output_tokens=cfg.output_tokens)
+    headroom = float(facts["min_headroom_bytes"])
+    b_eff = b_async if case.runtime.async_scheduling else b_sync
+    b_life = (b_lifecycle_async if case.runtime.async_scheduling else b_lifecycle_sync)
+    b_joint = (b_joint_async if case.runtime.async_scheduling else b_joint_sync)
+    return {
+        "vram_max_sequences_per_dp_sync": int(b_sync),
+        "vram_max_sequences_per_dp_async": int(b_async),
+        "vram_max_sequences_per_dp_lifecycle_sync": int(b_lifecycle_sync) if b_lifecycle_sync is not None else None,
+        "vram_max_sequences_per_dp_lifecycle_async": int(b_lifecycle_async) if b_lifecycle_async is not None else None,
+        "vram_max_sequences_per_dp_joint_sync": int(b_joint_sync) if b_joint_sync is not None else None,
+        "vram_max_sequences_per_dp_joint_async": int(b_joint_async) if b_joint_async is not None else None,
+        "weight_bytes_per_die": round(float(max(facts["memory"].weights, default=0.0)), 3),
+        "kv_bytes_per_seq": round(float(facts["max_kv_bytes_per_sequence"]), 3),
+        "workspace_bytes": round(float(facts["max_workspace_bytes"]), 3),
+        "available_kv_capacity_bytes_per_die": round(float(facts["min_available_bytes"]), 3),
+        "hbm_utilization_ratio": round(max((stage["hbm_utilization_ratio"] for stage in facts["stages"]), default=0.0), 9),
+        "capacity_headroom_bytes": round(headroom, 3),
+        "capacity_headroom_basis": facts["headroom_basis"],
+        "capacity_by_stage": facts["stages"],
+        "capacity_by_stage_lifecycle": facts["lifecycle_stages"] or facts["stages"],
+        "lifecycle_capacity_headroom_bytes": round(float(facts["lifecycle_min_headroom_bytes"]), 3),
+        "joint_capacity_headroom_bytes": round(float(facts["joint_min_headroom_bytes"]), 3),
+        "capacity_window": facts["capacity_window"],
+        "lifecycle_capacity_window": facts["lifecycle_capacity_window"],
+        "is_vram_feasible": bool(b_eff >= cfg.sequences and headroom >= -1e-6),
+        "is_lifecycle_feasible": bool(b_life is not None and b_life >= cfg.sequences
+                                      and float(facts["lifecycle_min_headroom_bytes"]) >= -1e-6),
+        "is_joint_feasible": bool(b_joint is not None and b_joint >= cfg.sequences
+                                  and float(facts["joint_min_headroom_bytes"]) >= -1e-6),
+    }
+
+
 __all__ = [name for name in globals() if not name.startswith("__")]

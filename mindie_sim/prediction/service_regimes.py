@@ -12,6 +12,8 @@
   observations and validation roles remain provenance, not simulation admission.
 [Timeouts & Locks] Finite rule list and bounded aggregate records; no I/O/locks.
 [Side-Effect Policy] Read physical axes and return an explicit service selection.
+  Migration assessment and observation replay are diagnostic entry points; they
+  never select a production service, mutate a case or become a second solver.
 """
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -21,8 +23,11 @@ import json
 import math
 
 from mindie_sim.schema.common import ModelingError
-from .response_functions import ResponseFunction, nonnegative as _nonnegative, scaled_coordinate
-from .service_regime_domains import validate_service_regime_domains
+from .response_functions import (ResponseFunction, nonnegative as _nonnegative,
+                                 normalize_migration_plan, provenance_roles,
+                                 scaled_coordinate)
+from .service_regime_domains import (evaluate_migration_binding,
+                                     validate_service_regime_domains)
 
 
 ROOTS = {"hardware", "runtime", "revision", "format", "kernel", "implementation",
@@ -35,6 +40,8 @@ MISSING = object()
 RULE_FIELDS = {"id", "match", "coordinates", "domain", "response", "provenance",
                "execution", "continuity"}
 EXECUTION_FIELDS = {"kind", "resource", "reference_rate", "native_kernel"}
+MAC_EXECUTION_FIELDS = {"kind", "resource", "native_kernel",
+                        "tile_m", "tile_n", "tile_k", "slots"}
 
 
 @dataclass(frozen=True)
@@ -46,11 +53,19 @@ class RegimeSelection:
     response_basis: str | None = None
     coordinate_values: Mapping | None = None
     exterior_policy: str | None = None
+    issued_work: float | None = None
+    rate_flops_per_s: float | None = None
+    active_owners: int | None = None
+    stage: str | None = None
+    #: The selected rule's declared provenance; physical admission reads it.
+    provenance: Mapping | None = None
 
     @property
     def mode(self):
         """Normalized execution semantics, never an arbitrary mapping probe."""
-        return "joint_native" if self.execution is not None else "completion_floor"
+        if self.execution is not None:
+            return str(self.execution.get("kind"))
+        return "completion_floor"
 
     def bind_joint(self, context):
         """Observed joint service occupies an explicitly declared device queue.
@@ -77,6 +92,10 @@ class RegimeSelection:
         return {"rule_id": self.rule_id, "continuity_group": self.continuity_group,
                 "execution_mode": self.mode, "response_basis": self.response_basis,
                 "response_duration_ms": self.duration_ms,
+                "issued_work": self.issued_work,
+                "rate_flops_per_s": self.rate_flops_per_s,
+                "active_owners": self.active_owners,
+                "stage": self.stage,
                 "coordinate_values": dict(self.coordinate_values or {}),
                 "exterior_policy": self.exterior_policy}
 
@@ -116,7 +135,9 @@ def coordinates(axes, declarations):
     for name, raw in declarations.items():
         value = lookup(axes, raw["path"])
         if value is MISSING:
-            return None
+            if "default" not in raw:
+                return None
+            value = raw["default"]
         if "reduce" in raw:
             if not isinstance(value, (list, tuple)) or not value:
                 return None
@@ -185,6 +206,16 @@ def _execution(raw):
         if set(execution) != {"kind"}:
             raise ModelingError("service_regime_completion_floor_execution_requires_only_kind")
         return None
+    if execution.get("kind") == "mac_service":
+        if (set(execution) != MAC_EXECUTION_FIELDS
+                or execution.get("resource") != "cube"
+                or not execution.get("native_kernel")):
+            raise ModelingError("mac_service_requires_cube_and_native_kernel")
+        for key in ("tile_m", "tile_n", "tile_k", "slots"):
+            value = execution.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ModelingError("mac_service_requires_positive_tile_geometry")
+        return {**execution}
     if (set(execution) != EXECUTION_FIELDS or execution.get("kind") != "joint_native"
             or not execution.get("resource") or not execution.get("native_kernel")
             or _nonnegative(execution.get("reference_rate", 0)) == 0):
@@ -258,9 +289,12 @@ class RegimePolicy:
                 if not isinstance(coord, Mapping):
                     raise ModelingError("service_regime_coordinate_unknown_reducer")
                 self.physical_rates |= _path(coord["path"])[0] == "physical_rates"
-                if set(coord) - {"path", "reduce", "scale"} or coord.get("reduce", "sum") not in REDUCERS:
+                if (set(coord) - {"path", "reduce", "scale", "default"}
+                        or coord.get("reduce", "sum") not in REDUCERS):
                     raise ModelingError("service_regime_coordinate_unknown_reducer")
                 _nonnegative(coord.get("scale", 1))
+                if "default" in coord:
+                    _nonnegative(coord["default"])
             for name, bounds in raw.get("domain", {}).items():
                 if (name not in raw.get("coordinates", {})
                         or set(bounds) - {"min", "max", "min_inclusive", "max_inclusive"}):
@@ -312,7 +346,8 @@ class RegimePolicy:
         """Native multi-phase groups keep their source/transport program."""
         selected = self.resolve(context, record)
         if selected is not None and selected.mode != "completion_floor":
-            raise ModelingError("joint_native_service_requires_single_local_kernel")
+            raise ModelingError(
+                "joint_native_or_mac_service_requires_single_local_kernel")
         return selected.duration_ms if selected is not None else 0.0
 
     def resolve(self, context, record):
@@ -370,13 +405,20 @@ class RegimePolicy:
         raw, key, result, values = matches[0]
         execution = self.executions[key]
         continuity = raw.get("continuity") or {}
-        mode = "joint_native" if execution is not None else "completion_floor"
-        record(raw, key, "joint_native_service" if execution else "observable_response",
+        mode = str(execution.get("kind")) if execution is not None else "completion_floor"
+        record(raw, key, ("joint_native_service" if mode == "joint_native"
+                          else "observable_response"),
                duration_us=result.duration_us, coordinate_values=values,
                response_basis=result.basis, continuity_group=continuity.get("group"),
-               execution_mode=mode)
-        return RegimeSelection(result.duration_us / 1000, execution, raw["id"],
-                               continuity.get("group"), result.basis, values)
+               execution_mode=mode, issued_work=result.issued_work,
+               rate_flops_per_s=result.rate_flops_per_s,
+               active_owners=result.active_owners, stage=result.stage)
+        return RegimeSelection(
+            result.duration_us / 1000, execution, raw["id"],
+            continuity.get("group"), result.basis, values,
+            issued_work=result.issued_work, rate_flops_per_s=result.rate_flops_per_s,
+            active_owners=result.active_owners, stage=result.stage,
+            provenance=dict(raw.get("provenance") or {}))
 
     def _exterior(self, context, axes, record):
         """Apply one declared exterior policy; never clamp or silently select."""
@@ -431,7 +473,8 @@ class RegimePolicy:
                continuity_group=group["group"], execution_mode=mode,
                exterior_policy="linear")
         return RegimeSelection(result.duration_us / 1000, execution, raw["id"],
-                               group["group"], result.basis, values, "linear")
+                               group["group"], result.basis, values, "linear",
+                               provenance=dict(raw.get("provenance") or {}))
 
     def _nearest(self, context, group, values):
         ranked = []
@@ -462,3 +505,314 @@ class RegimePolicy:
                 raise ModelingError("service_regime_ambiguous_exterior_extrapolation:"
                                     + group["group"] + ":" + evaluated[0][0]["id"] + ":" + raw["id"])
         return evaluated[0]
+
+
+MIGRATION_SCHEMA = "mindie-sim.regime-migration-readiness/1"
+HANDOFF_SCHEMA = "mindie-sim.regime-resource-phase-handoff/1"
+MIGRATION_STATUSES = frozenset({
+    "resource_phase_ready", "slice_ready", "awaiting_binding_plan",
+    "awaiting_resource_service", "awaiting_program_binding", "awaiting_conditions",
+    "partial", "conflict", "link_rejected", "observation_replay"})
+_PUBLIC_STATUS = {
+    "ready": "resource_phase_ready", "slice_ready": "slice_ready", "partial": "partial",
+    "awaiting_conditions": "awaiting_conditions", "conflict": "conflict",
+    "awaiting_program_binding": "awaiting_program_binding",
+    "no_binding": "awaiting_binding_plan", "not_eligible": "observation_replay",
+    "observation_replay": "observation_replay"}
+_IDENTIFIABILITY_KEYS = frozenset({
+    "resource_identifiability", "limitations", "boundary", "parameter_boundary",
+    "scaling_assumption", "response_semantics", "combination",
+    "measurement_identity", "assignment", "data_roles"})
+_NEGATIVE_IDENTIFIABILITY_MARKERS = (
+    "not independent", "no independent", "not independently", "does not identify",
+    "not identify", "no guessed", "not assigned to a guessed", "not a hardware",
+    "not a bandwidth", "effective call response only", "engineered", "inclusive",
+    "whole native", "whole-call", "whole call", "total duration", "not measured")
+
+
+def _provenance_identifiability(provenance):
+    """Preserve old evidence; its negative result does not gate a new service."""
+    evidence = []
+    for key in sorted(_IDENTIFIABILITY_KEYS):
+        value = provenance.get(key) if isinstance(provenance, Mapping) else None
+        if value is None:
+            continue
+        text = value if isinstance(value, str) else json.dumps(
+            value, sort_keys=True, ensure_ascii=False, default=str)
+        lowered = text.lower()
+        marker = next((item for item in _NEGATIVE_IDENTIFIABILITY_MARKERS
+                       if item in lowered), None)
+        if marker is not None:
+            evidence.append({"key": key, "marker": marker, "text": text})
+    return {"negative": bool(evidence), "evidence": evidence}
+
+
+def _split_links(links):
+    """Separate explicit binding plans from old candidate-only lists."""
+    if links is None:
+        return {}, {}
+    if not isinstance(links, Mapping):
+        raise ModelingError("migration_links_require_mapping")
+    plans, legacy = {}, {}
+    for rule_id, value in links.items():
+        if not isinstance(rule_id, str) or not rule_id:
+            raise ModelingError("migration_link_requires_rule_id")
+        if isinstance(value, Mapping):
+            plans[rule_id] = value
+            continue
+        ids = (value,) if isinstance(value, str) else tuple(value) if isinstance(
+            value, (list, tuple)) else None
+        if ids is None or any(not isinstance(item, str) or not item for item in ids):
+            raise ModelingError("migration_link_requires_service_id_sequence:" + rule_id)
+        if len(set(ids)) != len(ids):
+            raise ModelingError("migration_link_repeats_service:" + rule_id)
+        legacy[rule_id] = ids
+    return plans, legacy
+
+
+def _service_field(service, name, default=MISSING):
+    if isinstance(service, Mapping):
+        return service.get(name, default)
+    return getattr(service, name, default)
+
+
+def normalize_service_handoff(service):
+    """Read one already-normalized T06 handoff without re-normalizing it."""
+    service_id = _service_field(service, "service_id")
+    if service_id is MISSING:
+        service_id = _service_field(service, "id")
+    if not isinstance(service_id, str) or not service_id:
+        raise ModelingError("migration_service_handoff_requires_id")
+    resources = _service_field(service, "resources", ())
+    if isinstance(resources, str):
+        resources = (resources,)
+    if not isinstance(resources, (list, tuple)):
+        raise ModelingError("migration_service_handoff_requires_resources:" + service_id)
+    conditions = _service_field(service, "conditions", {}) or {}
+    identification = _service_field(service, "identification", {}) or {}
+    provenance = _service_field(service, "provenance", {}) or {}
+    if not all(isinstance(item, Mapping) for item in (conditions, identification, provenance)):
+        raise ModelingError("migration_service_handoff_requires_mappings:" + service_id)
+    native_boundary = (_service_field(service, "native_boundary", None)
+                       or _service_field(service, "native_kernel", None)
+                       or conditions.get("native_boundary")
+                       or conditions.get("native_kernel") or "")
+    return {
+        "service_id": service_id,
+        "scope": str(_service_field(service, "scope", "")),
+        "resources": tuple(str(item) for item in resources),
+        "phase": str(_service_field(service, "phase", "")),
+        "work_unit": str(_service_field(service, "work_unit", "")),
+        "boundary": str(_service_field(service, "boundary", "")),
+        "fixed_us": _nonnegative(_service_field(service, "fixed_us", 0)),
+        "effective_rate": _service_field(service, "effective_rate"),
+        "aggregate_rate": _service_field(service, "aggregate_rate"),
+        "per_owner_rate": _service_field(service, "per_owner_rate"),
+        "rate_scope": str(_service_field(service, "rate_scope", "")),
+        "active_units": _service_field(service, "active_units", 1),
+        "conditions": dict(conditions),
+        "identification": dict(identification),
+        "provenance": dict(provenance),
+        "native_boundary": str(native_boundary).strip(),
+    }
+
+
+def _target_authority(kind):
+    return ("resource_rate_service" if kind == "independent_service"
+            else "joint_phase_service")
+
+
+def _no_plan_record(raw, decomposition, mode, old_evidence):
+    rule_id = raw["id"]
+    response_class = decomposition["response_class"]
+    target, replacement_scope = "diagnostic_observation_replay", None
+    blockers = list(decomposition.get("blockers", ()))
+    if response_class == "resource_phase_supply":
+        status, target = "resource_phase_ready", "resource_phase_supply"
+        replacement_scope = "declared_physical_rates"
+        blockers += ["t04_executor_must_bind_declared_supply_as_resource_work"]
+        requires = ["T04"]
+    elif old_evidence["negative"] and decomposition["decomposable"]:
+        status = "observation_replay"
+        blockers += ["explicit_observation_replay_only",
+                     "provenance_declares_no_independent_resource_identifiability",
+                     "t06_normalized_resource_service_required_for_switch"]
+        requires = ["T06", "T04"]
+    elif mode == "joint_native":
+        status = "observation_replay"
+        blockers += ["explicit_observation_replay_only",
+                     "joint_native_total_duration_must_not_become_a_busy_ns_rate",
+                     "t06_normalized_joint_or_resource_service_required_for_switch"]
+        requires = ["T06", "T04"]
+    elif mode == "mac_service" or response_class == "measured_issue_class":
+        status = "observation_replay"
+        blockers += ["explicit_observation_replay_only",
+                     "measured_issue_class_is_not_a_shape_generalization",
+                     "t06_normalized_shape_service_required_for_switch"]
+        requires = ["T06", "T04"]
+    elif decomposition["decomposable"]:
+        status, target = "awaiting_resource_service", "resource_rate_service"
+        blockers += ["t06_normalized_resource_service_not_linked"]
+        requires = ["T06", "T04"]
+    else:
+        status = "observation_replay"
+        blockers += ["explicit_observation_replay_only",
+                     "whole_call_response_requires_explicit_observation_replay"]
+        requires = []
+    return {
+        "rule_id": rule_id, "execution_mode": mode,
+        "response_class": response_class,
+        "production_authority": {
+            "completion_floor": "legacy_completion_floor",
+            "joint_native": "legacy_joint_native_busy_ns",
+            "mac_service": "legacy_mac_service"}.get(mode, "legacy_" + mode),
+        "target_authority": target, "status": status,
+        "replacement_scope": replacement_scope,
+        "decomposition": decomposition, "linked_services": [],
+        "blockers": sorted(set(blockers)),
+        "provenance_evidence": list(old_evidence["evidence"]),
+        "coverage": None, "conditions": None, "diagnostics": None,
+        "service_evidence": {}, "scope": None, "requires": requires}
+
+
+def assess_regime_migration(declarations, *, resource_services=(), links=None,
+                            hardware=None):
+    """Return T20 readiness from explicit legacy-work -> service bindings.
+
+    Old provenance is diagnostic evidence, not an admission gate for a new
+    identified service. A rule is ready only when every declared work term and
+    its fixed component has a complete binding, the service's own conditions are
+    present and satisfied, and no binding conflicts remain. The evaluation is
+    read-only and is never consumed by ``Execution``.
+    """
+    policy = RegimePolicy(declarations)
+    by_id = {raw["id"] for raw, _ in policy.rules}
+    services = {}
+    for service in resource_services or ():
+        record = normalize_service_handoff(service)
+        if record["service_id"] in services:
+            raise ModelingError("migration_resource_service_id_not_unique:"
+                                + record["service_id"])
+        services[record["service_id"]] = record
+    plans, legacy_links = _split_links(links)
+    unknown = sorted((set(plans) | set(legacy_links)) - by_id)
+    if unknown:
+        raise ModelingError("migration_link_unknown_regime_rule:" + ",".join(unknown))
+    for rule_id, ids in legacy_links.items():
+        missing = [sid for sid in ids if sid not in services]
+        if missing:
+            raise ModelingError("migration_link_unknown_resource_service:"
+                                + ",".join(missing))
+    records = []
+    for raw, key in policy.rules:
+        rule_id = raw["id"]
+        decomposition = policy.responses[key].service_decomposition()
+        execution = policy.executions[key]
+        mode = str(execution.get("kind")) if execution is not None else "completion_floor"
+        old = _provenance_identifiability(raw.get("provenance") or {})
+        old_roles = provenance_roles(raw.get("provenance") or {})
+        old_tokens = (old_roles["training"] or old_roles["other"]) if old["negative"] else []
+        plan = plans.get(rule_id)
+        if plan is None:
+            candidates = legacy_links.get(rule_id)
+            if candidates:
+                record = _no_plan_record(raw, decomposition, mode, old)
+                record.update({
+                    "status": "awaiting_binding_plan",
+                    "target_authority": "resource_rate_service",
+                    "linked_services": list(candidates),
+                    "blockers": ["migration_binding_plan_required",
+                                 "t06_normalized_resource_service_not_linked"],
+                    "requires": ["T06", "T04"],
+                })
+            else:
+                record = _no_plan_record(raw, decomposition, mode, old)
+        else:
+            normalized = normalize_migration_plan(plan, decomposition)
+            evaluation = evaluate_migration_binding(
+                decomposition, raw.get("match") or {}, rule_id, normalized, services,
+                execution=execution,
+                old_provenance_negative=old["negative"],
+                old_training_tokens=old_tokens,
+                coordinate_declarations=raw.get("coordinates") or {})
+            status = _PUBLIC_STATUS[evaluation["status"]]
+            kind = normalized["replacement_kind"]
+            target = "diagnostic_observation_replay"
+            if status in {"resource_phase_ready", "slice_ready", "partial",
+                          "awaiting_binding_plan", "awaiting_conditions",
+                          "awaiting_program_binding"}:
+                target = _target_authority(kind)
+            if status in {"conflict", "link_rejected"}:
+                target = "unresolved"
+            blockers = list(evaluation["blockers"])
+            if (not decomposition.get("terms")
+                    and not (evaluation["coverage"].get("external_work") or ())):
+                status, target = "observation_replay", "diagnostic_observation_replay"
+                blockers.append("actual_stage_work_reference_required")
+            if status in {"resource_phase_ready", "slice_ready"}:
+                blockers.append("t04_executor_switch_pending")
+            requires = (["T04"] if status in {"resource_phase_ready", "slice_ready"}
+                        else ["T06", "T04"] if status in {
+                            "awaiting_binding_plan", "awaiting_conditions",
+                            "awaiting_program_binding", "partial"}
+                        else [])
+            record = {
+                "rule_id": rule_id, "execution_mode": mode,
+                "response_class": decomposition["response_class"],
+                "production_authority": {
+                    "completion_floor": "legacy_completion_floor",
+                    "joint_native": "legacy_joint_native_busy_ns",
+                    "mac_service": "legacy_mac_service"}.get(mode, "legacy_" + mode),
+                "target_authority": target, "status": status,
+                "replacement_scope": evaluation["replacement_scope"],
+                "decomposition": decomposition,
+                "linked_services": sorted({item["service_id"]
+                                           for item in normalized["work"]}
+                                          | {item["service_id"]
+                                             for item in normalized["fixed"]}),
+                "blockers": sorted(set(blockers)),
+                "provenance_evidence": list(old["evidence"]),
+                "coverage": evaluation["coverage"],
+                "conditions": evaluation["conditions"],
+                "diagnostics": evaluation["diagnostics"],
+                "service_evidence": evaluation["service_evidence"],
+                "scope": evaluation["scope"], "requires": requires,
+            }
+        records.append(record)
+    summary = {status: sum(record["status"] == status for record in records)
+               for status in sorted(MIGRATION_STATUSES)}
+    return {
+        "schema": MIGRATION_SCHEMA, "role": "diagnostic_migration_assessment",
+        "production_prediction": False, "production_switch_performed": False,
+        "switch_gate": {"status": "pending_t18_rolling_chain",
+                        "requires": ["T04", "T06", "T18", "T19"],
+                        "note": "readiness is not a production switch; T19 must "
+                                "validate the candidate after T18/T20"},
+        "hardware": hardware, "summary": {"rules": len(records), **summary},
+        "rules": records,
+    }
+
+
+def resource_phase_bindings(declarations, *, resource_services=(), links=None):
+    """Return concrete T04/T17 handoff bindings for ready rules only.
+
+    Each binding carries the rule, service evidence, work-term coverage,
+    multiplicity, fixed ownership and the old-evidence diagnostics. It is a
+    read-only producer handoff, not a second execution mode.
+    """
+    readiness = assess_regime_migration(
+        declarations, resource_services=resource_services, links=links)
+    bindings = [record for record in readiness["rules"]
+                if record["status"] in {"resource_phase_ready", "slice_ready"}
+                and record.get("coverage") and record["coverage"].get("complete")
+                and record.get("service_evidence")]
+    return {
+        "schema": HANDOFF_SCHEMA, "role": "resource_phase_binding_handoff",
+        "production_prediction": False, "production_switch_performed": False,
+        "switch_gate": readiness["switch_gate"],
+        "readiness": readiness["summary"], "bindings": bindings,
+    }
+
+__all__ = ["RegimePolicy", "RegimeSelection", "assess_regime_migration",
+           "resource_phase_bindings", "normalize_service_handoff",
+           "MIGRATION_SCHEMA", "HANDOFF_SCHEMA"]

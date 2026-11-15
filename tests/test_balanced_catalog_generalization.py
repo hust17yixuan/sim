@@ -142,4 +142,7 @@ def test_real_ffn_component_runs_on_common_engine_without_balanced_recipe_overri
     result = graph_costs(case, {0: ops}, external_inputs={"input": 0})
     assert result["duration_ms"] > 0
     assert result["execution"]["live_tasks"] == result["execution"]["live_programs"] == 0
-    assert result["bounds"]["combined_ms"] <= result["duration_ms"] + 1e-8
+    # Independent bound components are summed in a different order from the
+    # simulated body clock; keep the physical claim (a bound covers the body)
+    # with a tolerance far below any measurable duration.
+    assert result["bounds"]["combined_ms"] <= result["duration_ms"] * (1 + 1e-6) + 1e-9

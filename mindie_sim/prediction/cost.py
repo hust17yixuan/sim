@@ -1,14 +1,18 @@
 """One model-independent pricing path for lowered operations.
 
-[Role] Combine physical work with optional primitive calibration parameters.
+[Role] Combine physical work with the declared resource/phase supply.  Primitive
+  observations are explicit diagnostics, never a production completion floor.
 [Invariants] Physical FLOPs/bytes are never inflated to fit a measured latency.
-  A measured duration is a separate kernel completion constraint. Missing
-  calibration leaves the mechanism's declared parameters unchanged.
-[Timeouts & Locks] Pure arithmetic and indexed, cached PrimitiveStore reads.
+  Ordinary ``price`` consumes physical work only.  A PrimitiveStore lookup is
+  available only through ``lookup_diagnostic`` and never enters ``OpCost.timing``
+  or ``minimum_ms``.  A normalized T06 profile attached to the Case is exposed
+  for the executor/recipe owner; this module does not invent a second service.
+[Timeouts & Locks] Pure arithmetic; diagnostic store reads are indexed/cached.
 [Side-Effect Policy] Pricing does not record measurements or start device work.
 """
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -22,11 +26,13 @@ class OpCost:
     op: OpSpec
     key: PrimitiveKey | None
     work: Mapping[str, float]
-    timing: PrimitiveTiming | None
+    #: Always ``None`` in production.  Kept for callers that read the old
+    #: attribute; a diagnostic lookup is returned by ``CostModel.lookup_diagnostic``.
+    timing: PrimitiveTiming | None = None
 
     @property
     def basis(self) -> str:
-        return "measured_primitive" if self.timing is not None else "analytic_work"
+        return "analytic_work"
 
 
 def primitive_key(case: CaseSpec, op: OpSpec, replay_scope: str, *, hardware=None) -> PrimitiveKey:
@@ -73,10 +79,58 @@ def primitive_key(case: CaseSpec, op: OpSpec, replay_scope: str, *, hardware=Non
     })
 
 
+def _resource_service_context(context):
+    """Map a real T04 RecipeContext (or a mapping) to applicability fields.
+
+    T04 owns the execution context.  This adapter only presents its actual
+    service identity, resource binding, units and phase to the T06 condition
+    matcher.  An A5/T09 domain may be attached as ``service_domain``; missing
+    declared fields remain missing and produce the normal explicit rejection.
+    """
+    if isinstance(context, Mapping):
+        return dict(context)
+    identity = dict(getattr(context, "service_identity", {}) or {})
+    hardware = dict(identity.get("hardware") or {})
+    op = getattr(context, "op", None)
+    metadata = dict(getattr(op, "metadata", ()) or ())
+    domain = dict(getattr(context, "service_domain", {}) or {})
+    if not domain:
+        domain = dict(metadata.get("service_domain") or {})
+    view = {
+        "service_identity": identity,
+        "hardware": hardware.get("key"),
+        "platform": {
+            "key": hardware.get("key"),
+            "family": hardware.get("architecture"),
+        },
+        "runtime": identity.get("runtime"),
+        "revision": identity.get("revision"),
+        "format": identity.get("format"),
+        "dtype": identity.get("dtype"),
+        "layout": identity.get("layout"),
+        "axes": dict(identity.get("axes") or {}),
+        "resource_names": dict(getattr(context, "resource_names", {}) or {}),
+        "resource_units": dict(getattr(context, "resource_units", {}) or {}),
+        "work_units": dict(getattr(context, "work_units", {}) or {}),
+        "work": dict(getattr(context, "work", {}) or {}),
+        "phase": getattr(op, "phase", None),
+        "op_id": getattr(op, "op_id", None),
+        "op_family": getattr(op, "family", None),
+        "op_stage": getattr(op, "stage", None),
+    }
+    if domain:
+        view = {**view, **deepcopy(domain)}
+    return view
+
+
 class CostModel:
     def __init__(self, case: CaseSpec, primitives: PrimitiveStore | None = None):
         self.case = case
+        # The store is retained only for explicit diagnostic reads.  It is not
+        # consulted by price() and cannot set a production completion floor.
         self.primitives = primitives
+        self.diagnostic_primitive_lookups = 0
+        self.diagnostic_primitive_hits = 0
         self.hardware = {
             "identity": case.machine.hardware_key or case.machine.sku,
             "dies": [die.to_dict() for die in case.machine.dies],
@@ -89,14 +143,84 @@ class CostModel:
         self.invocations = {}
         self.regimes = {}
         self.joint_native = {}
+        self.resource_service_profile = None
+        self.resource_services = ()
+        self._load_resource_services()
+
+    def _load_resource_services(self):
+        metadata = dict(getattr(self.case.runtime, "metadata", ()) or ())
+        profile = metadata.get("resource_service_profile")
+        if profile is None:
+            return
+        if not isinstance(profile, Mapping):
+            raise ValueError("resource_service_profile_requires_mapping")
+        # Delegate to the one public profile loader: schema validation,
+        # top-level hardware propagation, file/mapping consistency, frozen
+        # reload and provenance all stay in the observations layer.
+        from mindie_sim.observations.calibration import load_resource_profile
+        loaded = load_resource_profile(profile)
+        from mindie_sim.observations.resource_services import (
+            normalize_resource_service,
+        )
+        normalized = tuple(
+            normalize_resource_service(item) for item in loaded["services"])
+        identifiers = [item.service_id for item in normalized]
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError("resource_service_profile_requires_distinct_ids")
+        self.resource_service_profile = loaded
+        self.resource_services = normalized
+
+    def lookup_diagnostic(self, op: OpSpec, replay_scope: str):
+        """Explicit primitive-evidence read; never a production price or floor."""
+        if self.primitives is None:
+            return None
+        key = primitive_key(self.case, op, replay_scope, hardware=self.hardware)
+        self.diagnostic_primitive_lookups += 1
+        timing = self.primitives.lookup(key)
+        if timing is not None:
+            self.diagnostic_primitive_hits += 1
+        return {"key": key, "timing": timing}
+
+    def select_resource_service(self, context: Mapping[str, Any], *,
+                                service_id: str | None = None):
+        """Select one declared T06 service for a real placement context.
+
+        The executor supplies the actual stage rates/units/owner/software
+        context.  A missing or ambiguous declaration is an explicit input
+        error, not a fallback to a nominal rate.
+        """
+        from mindie_sim.observations.calibration import (
+            select_resource_service_candidate,
+        )
+        context = _resource_service_context(context)
+        return select_resource_service_candidate(
+            self.resource_services, context, service_id=service_id)
+
+    def bind_operator_resource_service(self, op: OpSpec, context: Mapping[str, Any],
+                                       *, service_id: str | None = None,
+                                       resource_role: str | None = None,
+                                       phase: str | None = None):
+        """Select a profile service and generate its exact op metadata binding.
+
+        T14 calls this after choosing the actual program/phase/context; the
+        returned OpSpec is what T04's existing resource-service stage cap/fixed
+        path consumes.  Selection and binding are one operation, not a
+        separate unconsumed lookup.
+        """
+        from mindie_sim.observations.calibration import (
+            bind_operator_resource_service as _bind,
+        )
+        context = _resource_service_context(context)
+        service = self.select_resource_service(context, service_id=service_id)
+        return _bind(
+            op, service, resource_role=resource_role, phase=phase or op.phase,
+            work_unit=service.work_unit, conditions=context)
 
     def price(self, op: OpSpec, replay_scope: str) -> OpCost:
         if op.matrix_flops:
             import math
             if not math.isclose(sum(v for _, v in op.matrix_flops), op.flops, rel_tol=1e-12):
                 raise ValueError("matrix_precision_work_must_sum_to_operator_flops")
-        key = primitive_key(self.case, op, replay_scope, hardware=self.hardware) if self.primitives else None
-        timing = self.primitives.lookup(key) if self.primitives is not None else None
         work = {
             "cube": op.flops, "vector": op.vector_ops, "hbm": op.hbm_bytes,
             "mte2": op.mte2_bytes, "mte3": op.mte3_bytes, "link": op.link_bytes,
@@ -108,7 +232,7 @@ class CostModel:
                 work[resource] = value
         for resource, amount in dict(metadata.get("resource_work", {})).items():
             work[resource] = work.get(resource, 0) + amount
-        result = OpCost(op, key, {k: float(v) for k, v in work.items() if v}, timing)
+        result = OpCost(op, None, {k: float(v) for k, v in work.items() if v})
         self.counts[result.basis] += 1
         return result
 
@@ -144,7 +268,8 @@ class CostModel:
 
     def record_regime(self, model, key, basis, *, duration_us=None, coordinate_values=None,
                       response_basis=None, mismatched_axes=(), continuity_group=None,
-                      execution_mode=None, exterior_policy=None):
+                      execution_mode=None, exterior_policy=None, issued_work=None,
+                      rate_flops_per_s=None, active_owners=None, stage=None):
         record = self.regimes.setdefault(key, {
             "model_id": key, **model, "queries": {}, "response_us_min": None,
             "response_us_max": None})
@@ -163,6 +288,15 @@ class CostModel:
         if exterior_policy is not None:
             policies = record.setdefault("exterior_policies", {})
             policies[exterior_policy] = policies.get(exterior_policy, 0) + 1
+        if issued_work is not None:
+            record["issued_work"] = max(
+                float(record.get("issued_work", 0.0)), float(issued_work))
+        if rate_flops_per_s is not None:
+            record["rate_flops_per_s"] = float(rate_flops_per_s)
+        if active_owners is not None:
+            record["active_owners"] = int(active_owners)
+        if stage is not None:
+            record["stage"] = str(stage)
         for axis in mismatched_axes:
             counts = record.setdefault("mismatched_axes", {})
             counts[axis] = counts.get(axis, 0) + 1
@@ -187,7 +321,13 @@ class CostModel:
             "execution_basis": "declared_joint_native_service_queue",
             "unmodeled": ["internal_resource_occupancy", "internal_buffer_occupancy"]})
         row["invocations"] += 1
-        row["replaced_primitive_count"] += int(reference_cost.timing is not None)
+        has_primitive = reference_cost.timing is not None
+        if not has_primitive and self.primitives is not None:
+            for scope in dict.fromkeys((self.case.runtime.graph_capture_mode, "none")):
+                if self.primitives.lookup(primitive_key(self.case, reference_cost.op, scope, hardware=self.hardware)) is not None:
+                    has_primitive = True
+                    break
+        row["replaced_primitive_count"] += int(has_primitive)
         rule_counts = dict(row.get("rule_counts", {}))
         if selection.rule_id is not None:
             rule_counts[selection.rule_id] = rule_counts.get(selection.rule_id, 0) + 1
@@ -222,8 +362,8 @@ class CostModel:
     def summary(self) -> dict[str, Any]:
         sources = dict(self.case.runtime.metadata).get("primitive_parameter_sources", ())
         calibration = []
-        if self.primitives and self.counts["measured_primitive"]:
-            calibration.append("primitive_completion_parameters")
+        if self.diagnostic_primitive_hits:
+            calibration.append("diagnostic_primitive_evidence_not_production")
         if sources:
             calibration.append("declared_primitive_service_parameters")
         if self.services:
@@ -240,8 +380,17 @@ class CostModel:
         declared_regimes = [row["id"] for row in self.case.runtime.kernels.get("service_regimes", ())]
         return {
             "operator_occurrences": dict(self.counts),
+            "production_price_basis": "physical_work_only",
+            "diagnostic_primitive_lookups": self.diagnostic_primitive_lookups,
+            "diagnostic_primitive_hits": self.diagnostic_primitive_hits,
             "calibration": "+".join(calibration) or "none",
             "declared_parameter_sources": sources,
+            **({"resource_services": [item.service_id
+                                      for item in self.resource_services],
+                "resource_service_profile_source": deepcopy(
+                    self.resource_service_profile.get("source"))
+                if isinstance(self.resource_service_profile, Mapping) else None}
+               if self.resource_services else {}),
             **({"invocation_models": list(self.invocations.values())} if self.invocations else {}),
             **({"service_models": list(self.services.values())} if self.services else {}),
             **({"service_regimes": list(self.regimes.values())} if self.regimes else {}),

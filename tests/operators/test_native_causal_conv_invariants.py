@@ -92,7 +92,7 @@ def test_token_prefetch_respects_outer_ready_and_history(metadata, bias):
     execution.engine.advance(horizon=6.5)
     assert not any(execution.engine.summary()["serviced"].values())
     rows = _finish(execution, step)
-    gate = _stage(rows, ":pairs")
+    gate = _stage(rows, ":pairs:program:begin")
     load = _stage(rows, ":pairs:program:tile1:load")
     history = _stage(rows, ":history")
     assert load["start_ms"] == pytest.approx(gate["end_ms"])
@@ -116,9 +116,10 @@ def test_prefetch_holds_source_ub_buffers_until_kernel_drain():
     rows = _finish(execution, step)
     reserve = _stage(rows, ":reserve0")
     prefetch = [row for row in rows if ":prefetch0:program:" in row["task"] and row["demand"]]
-    release, drain = _stage(rows, ":release0"), _stage(rows, ":drain")
+    release = _stage(rows, ":release0")
+    drain_end = max(row["end_ms"] for row in rows if ":body0:" in row["task"])
     assert reserve["end_ms"] <= min(row["start_ms"] for row in prefetch)
-    assert release["start_ms"] >= drain["end_ms"]
+    assert release["start_ms"] >= drain_end
 
 
 @pytest.mark.parametrize("width", [2, 3, 4])
@@ -235,7 +236,7 @@ def test_generic_arithmetic_competes_before_old_output_slot_is_released():
     token_ops = 18 * 16
     hardware = _hardware(read=320000, write=8000, vector=token_ops * 1000)
     baseline, baseline_step = _start(params, hardware)
-    start = _stage(_finish(baseline, baseline_step), ":pairs")["end_ms"]
+    start = _stage(_finish(baseline, baseline_step), ":pairs:program:begin")["end_ms"]
 
     execution, step = _start(params, hardware)
     companion = execution.engine.submit(

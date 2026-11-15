@@ -287,7 +287,9 @@ _EXPAND_KEYS = frozenset({
     "split", "run_id", "repeat_index", "single", "boundary", "observed_expansion_mode",
     "observed_execution", "requested_expansion_mode", "profiler_evidence", "stack",
     "cann", "algorithm", "protocol", "machine", "stack_binding",
-    "payload_bytes", "size_bytes", "work", "dtype"})
+    "payload_bytes", "size_bytes", "work", "dtype",
+    "measurement", "transport_window", "direction_observed",
+    "algorithm_identified"})
 def _selectors(document, row=None):
     row = row or {}
     row_proto, doc_proto = row.get("protocol"), document.get("protocol")
@@ -307,6 +309,78 @@ def _merge_obs(parent, child):
         if sel[key] is not None:
             merged[key] = sel[key]
     return merged
+def _canonical_semantic(value):
+    if value is None:
+        return None
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                          allow_nan=False)
+    except (TypeError, ValueError):
+        return repr(value)
+
+
+def _fallback_measurement(collective, boundary, algorithm_identified=False):
+    """Explicit campaign fallback; never claims a native AI_CPU child."""
+    if boundary == "resource_phase":
+        return {
+            "kind": "resource_phase", "phase": "collective_phase",
+            "resource": "collective_phase",
+            "work_coordinate": "captured_per_rank_payload",
+            "duration_unit": "ms", "source_kind": "campaign_resource_phase",
+            "service_semantics": "collective_phase_service",
+            "complete_collective_call": False, "complete_directed_call": False,
+            "link_transit_identified": False, "hop_scaling": "not_derived",
+            "algorithm_identified": bool(algorithm_identified),
+            "direction_observed": False, "explicit": False,
+        }
+    if collective == "p2p_send_recv":
+        return {
+            "kind": "device_call", "phase": "directed_p2p_call",
+            "resource": "directed_p2p_call",
+            "work_coordinate": "captured_per_rank_payload",
+            "duration_unit": "ms", "source_kind": "campaign_device_call",
+            "service_semantics": "directed_p2p_call",
+            "complete_collective_call": False, "complete_directed_call": True,
+            "link_transit_identified": False, "hop_scaling": "not_derived",
+            "algorithm_identified": bool(algorithm_identified),
+            "direction_observed": True, "explicit": False,
+        }
+    return {
+        "kind": "device_call", "phase": "collective_call",
+        "resource": "collective_call",
+        "work_coordinate": "captured_per_rank_payload",
+        "duration_unit": "ms", "source_kind": "campaign_device_call",
+        "service_semantics": "whole_collective_call_envelope",
+        "complete_collective_call": True, "complete_directed_call": False,
+        "link_transit_identified": False, "hop_scaling": "not_derived",
+        "algorithm_identified": bool(algorithm_identified),
+        "direction_observed": False, "explicit": False,
+    }
+
+
+def _validate_measurement_window(measurement, window):
+    phase = measurement.get("phase")
+    kind = window.get("kind")
+    if phase == "aicpu_child" and kind != "native_single_target_call":
+        raise ValueError("a5_measurement_transport_window_mismatch")
+    if phase in {"collective_call", "directed_p2p_call", "collective_phase"} \
+            and kind == "native_single_target_call":
+        raise ValueError("a5_measurement_transport_window_mismatch")
+
+
+def _fallback_transport_window(measurement):
+    if measurement.get("phase") == "aicpu_child":
+        return {
+            "kind": "native_single_target_call", "phase": "aicpu_child",
+            "warmup_calls": 3, "admitted_repeats": 5,
+            "profiled_ranks": "0,group_size-1",
+            "clock_domain": "device", "concurrent_collectives": False,
+        }
+    return {"kind": "campaign_steady_state", "phase": "per_op",
+            "warmup_calls": None, "admitted_repeats": None,
+            "clock_domain": "device", "concurrent_collectives": False}
+
+
 def _base_row(document, label, origin, collective, world, scope, pair, payload,
               duration, dtype, single, row=None, requested=None, observed=None,
               evidence=None, run_id=None, repeat_index=0, split=None):
@@ -317,6 +391,19 @@ def _base_row(document, label, origin, collective, world, scope, pair, payload,
         row.get("requested_expansion_mode", requested),
         row.get("observed_expansion_mode", row.get("observed_execution", observed)),
         profiler_evidence=row.get("profiler_evidence", evidence))
+    algorithm_identified = (row.get("algorithm", document.get("algorithm"))
+                            is not None)
+    declared_measurement = row.get("measurement", document.get("measurement"))
+    if isinstance(declared_measurement, Mapping):
+        measurement = dict(declared_measurement)
+        measurement.setdefault("explicit", True)
+    else:
+        measurement = _fallback_measurement(
+            collective, boundary, algorithm_identified)
+    declared_window = row.get("transport_window", document.get("transport_window"))
+    window = (dict(declared_window) if isinstance(declared_window, Mapping)
+              else _fallback_transport_window(measurement))
+    _validate_measurement_window(measurement, window)
     return {
         "campaign": label, "collective": collective, "world_size": int(world),
         "placement_scope": scope, "dtype": _dtype(row.get("dtype") or dtype),
@@ -328,6 +415,11 @@ def _base_row(document, label, origin, collective, world, scope, pair, payload,
         **_selectors(document, row), "canary": row.get("canary", row.get("correctness")),
         "run_id": run_id or label, "repeat_index": int(repeat_index or 0),
         "split": split, "source": origin, "boundary": boundary,
+        "measurement": measurement, "transport_window": window,
+        "direction_observed": bool(measurement.get("direction_observed",
+                                                   False)),
+        "algorithm_identified": bool(measurement.get(
+            "algorithm_identified", algorithm_identified)),
         **{k: row[k] for k in ("_repeats", "_weights") if k in row}}
 def _rank_rows(document, origin, p2p_pair=None, default_run_id=None, default_repeat=0):
     protocol = document.get("protocol") if isinstance(document.get("protocol"), Mapping) else {}
@@ -691,7 +783,10 @@ def _dedupe_conditions(rows, keep_meta=False):
         base = (row["campaign"], row["run_id"], row["collective"], row["world_size"],
                 row["placement_scope"], row["dtype"], row["payload_bytes"], row["single"], row["pair"],
                 row["regime"], row.get("unconfirmed_tag"), row.get("profiler_confirmed"), row.get("stack"),
-                row.get("cann"), row.get("algorithm"), _protocol_key(row.get("protocol")), row.get("boundary"))
+                row.get("cann"), row.get("algorithm"), _protocol_key(row.get("protocol")), row.get("boundary"),
+                _canonical_semantic(row.get("measurement")),
+                _canonical_semantic(row.get("transport_window")),
+                row.get("direction_observed"), row.get("algorithm_identified"))
         spans = ([(lo, hi, (ms, eff_sp)) for lo, hi, ms in reps[0]]
                  + [(r, r, (ms, eff_sp)) for r, ms in reps[1].items()]
                  if reps else [(row["repeat_index"], row["repeat_index"], (row["per_op_ms"], eff_sp))])

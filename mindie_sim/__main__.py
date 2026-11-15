@@ -13,30 +13,57 @@ import json
 from pathlib import Path
 import sys
 
+from ._diff_support import ProfilerUsageError, load_cli_json
 from . import predict
 from .prediction.structure import parse_case
 from .prediction.primitives import PrimitiveKey, PrimitiveStore
 
 
-def read_json(path):
+def read_json(path, *, bounded=False):
     path = Path(path)
     if path.stat().st_size > 50 * 1024**2:
         raise ValueError("metadata_input_exceeds_50_MiB:use_streaming_observation_import")
+    if bounded:
+        return load_cli_json(path)
     with path.open(encoding="utf-8") as stream:
         return json.load(stream)
 
 
 def emit(value, output):
+    text = json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+    data = text.encode("utf-8")
     if output:
-        with Path(output).open("w", encoding="utf-8", newline="\n") as stream:
-            json.dump(value, stream, ensure_ascii=False, indent=2, allow_nan=False)
-            stream.write("\n")
+        Path(output).write_bytes(data)
     else:
-        rendered = json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False)
         try:
-            print(rendered)
+            print(text, end="")
         except UnicodeEncodeError:
             print(json.dumps(value, ensure_ascii=True, indent=2, allow_nan=False))
+
+
+def _add_supply_arguments(command):
+    command.add_argument(
+        "--supply", help="profiler C7 report or mindie-profiler-measured-supply/1 JSON")
+    command.add_argument("--supply-recipe", help="selected operator recipe to bind")
+    command.add_argument("--supply-kernel", help="selected native kernel name to bind")
+    command.add_argument("--supply-hardware", help="explicit hardware key for the binding")
+    command.add_argument("--supply-owners", type=int,
+                         help="selected implementation active-owner default")
+    command.add_argument("--supply-legacy-diagnostics", action="store_true",
+                         help="retain legacy service_regimes alongside C7 resource_services")
+
+
+def _case_with_supply(args):
+    raw = read_json(args.case)
+    if getattr(args, "supply", None):
+        from .observations.calibration import apply_profiler_supply
+        raw = apply_profiler_supply(
+            raw, args.supply, recipe=getattr(args, "supply_recipe", None),
+            kernel=getattr(args, "supply_kernel", None),
+            hardware=getattr(args, "supply_hardware", None),
+            owners=getattr(args, "supply_owners", None),
+            legacy_diagnostics=bool(getattr(args, "supply_legacy_diagnostics", False)))
+    return raw
 
 
 def parser():
@@ -55,6 +82,7 @@ def parser():
             cmd.add_argument("--tokens", type=int, help="target verification rows per sequence")
             cmd.add_argument("--context", type=int)
             cmd.add_argument("--sequences", type=int, help="sequences per participating DP replica")
+            _add_supply_arguments(cmd)
     operators = sub.add_parser("operators", help="isolated target-body device program costs")
     operators.add_argument("case")
     operators.add_argument("--phase", choices=("prefill", "decode"), required=True)
@@ -66,7 +94,15 @@ def parser():
     operators.add_argument("--draft-prepare", action="store_true",
                            help="include declared draft cache preparation after model prefill")
     operators.add_argument("--no-body-defaults", dest="apply_body_defaults", action="store_false")
+    _add_supply_arguments(operators)
     operators.add_argument("--output", "-o")
+    native_invoke = sub.add_parser(
+        "native-invoke",
+        help="execute one already-prepared standalone QBMM occurrence once")
+    native_invoke.add_argument("--occurrence", type=Path, required=True)
+    native_invoke.add_argument("--tensors", type=Path, required=True)
+    native_invoke.add_argument("--device", required=True)
+    native_invoke.add_argument("--output", type=Path, required=True)
     graph = sub.add_parser("graph", help="compose a pure target graph on shared device resources")
     graph.add_argument("case")
     graph.add_argument("--phase", choices=("prefill", "decode"), required=True)
@@ -85,6 +121,7 @@ def parser():
     graph.add_argument("--primitives")
     graph.add_argument("--event-limit", type=int, default=0)
     graph.add_argument("--no-body-defaults", dest="apply_body_defaults", action="store_false")
+    _add_supply_arguments(graph)
     graph.add_argument("--output", "-o")
     catalog = sub.add_parser("catalog")
     catalog.add_argument("name", nargs="?")
@@ -247,6 +284,18 @@ def parser():
         sla.add_argument(flag, type=float)
     sla.add_argument("--scenarios")
     sla.add_argument("--output", "-o")
+    accel = sub.add_parser("build-accel", help="compile or verify the C11 runtime kernel")
+    accel.add_argument("--force", action="store_true", help="recompile even when cached")
+    accel.add_argument("--check", action="store_true", help="verify cached artifact without compiling")
+    accel.add_argument("--output", "-o")
+    diff = sub.add_parser("diff-trace", help="4-way conserving why-off attribution")
+    diff.add_argument("--predicted", required=True, help="sim step prediction JSON")
+    diff.add_argument("--captured", required=True, help="profiler steady-state JSON")
+    diff.add_argument("--padding", help="optional bucket/logical operator map")
+    diff.add_argument("--cann-version", default=None, help="explicit CANN release for padding semantics")
+    diff.add_argument("--capture-path", default="capture.json", help="capture path embedded in repro-op commands")
+    diff.add_argument("--top", type=int, default=5)
+    diff.add_argument("--output", "-o")
     return root
 
 
@@ -286,7 +335,7 @@ def run(args):
     if args.command == "graph":
         from .prediction.graph_analysis import graph_costs
         from .prediction.operator_analysis import target_graphs
-        case = parse_case(read_json(args.case))
+        case = parse_case(_case_with_supply(args))
         graphs = target_graphs(case, phase=args.phase, tokens=args.tokens, context=args.context,
                                sequences=args.sequences, scope=args.scope,
                                media_tokens_per_sequence=args.media_tokens_per_sequence,
@@ -306,9 +355,24 @@ def run(args):
                 "draft_prepare": args.draft_prepare,
                 "deployment_scope": "first_independent_dp_cohort",
             }
+    if args.command == "native-invoke":
+        from .prediction.piecewise.native_invocation import invoke_qbmm
+        import torch
+        occurrence = read_json(args.occurrence)
+        loaded = torch.load(args.tensors, map_location="cpu", weights_only=True)
+        if not isinstance(loaded, dict):
+            raise ValueError("native_invoke_tensors_mapping_required")
+        tensors = {key: (value.to(args.device) if torch.is_tensor(value) else value)
+                   for key, value in loaded.items()}
+        result = invoke_qbmm(occurrence, tensors, device=args.device)
+        torch.save(result, args.output)
+        return {"entry": "torch_npu.npu_quant_matmul",
+                "output": str(args.output), "shape": list(result.shape),
+                "dtype": str(result.dtype), "device": str(result.device),
+                "runtime_executed": True}
     if args.command == "operators":
         from .prediction.operator_analysis import operator_costs, target_graphs
-        case = parse_case(read_json(args.case))
+        case = parse_case(_case_with_supply(args))
         ops = target_graphs(case, phase=args.phase, tokens=args.tokens, context=args.context,
                             sequences=args.sequences, scope=args.scope,
                             media_tokens_per_sequence=args.media_tokens_per_sequence,
@@ -321,7 +385,7 @@ def run(args):
                 "deployment_scope": "first_independent_dp_cohort"}
     if args.command == "predict":
         with PrimitiveStore(args.primitives) if args.primitives else nullcontext(None) as store:
-            return predict(read_json(args.case), primitives=store,
+            return predict(_case_with_supply(args), primitives=store,
                            trace_limit=args.trace_limit, event_limit=args.event_limit,
                            scope=args.scope, phase=args.phase, tokens=args.tokens,
                            context=args.context, sequences=args.sequences)
@@ -536,6 +600,24 @@ def run(args):
             target_cube_mfu=args.target_cube_mfu, target_vec_mfu=args.target_vec_mfu,
             scenarios=scenarios,
         )
+    if args.command == "build-accel":
+        from .prediction.runtime.accel_build import build_accel
+
+        return build_accel(force=bool(args.force), check_only=bool(args.check))
+    if args.command == "diff-trace":
+        from .diff_trace import attribute_diff
+
+        predicted = read_json(args.predicted, bounded=True)
+        captured = read_json(args.captured, bounded=True)
+        padding = read_json(args.padding, bounded=True) if args.padding else None
+        return attribute_diff(
+            predicted,
+            captured,
+            padding=padding,
+            top_n=args.top,
+            cann_version=args.cann_version,
+            capture_path=args.capture_path,
+        )
     raise ValueError("unknown_command")
 
 
@@ -546,9 +628,13 @@ def main(argv=None):
         emit(result, args.output)
         if args.command in {"study", "compare-calls"} and result["status"] != "completed":
             return 2
+        if args.command == "build-accel" and not result.get("ok"):
+            return 2
+        if args.command == "diff-trace" and result.get("status") != "reconciled":
+            return 2
     except TimeoutError:
         raise
-    except (ValueError, OSError) as exc:
+    except (ProfilerUsageError, TypeError, ValueError, OverflowError, OSError) as exc:
         print(json.dumps({"status": "failed", "error": str(exc)}), file=sys.stderr)
         return 2
     return 0

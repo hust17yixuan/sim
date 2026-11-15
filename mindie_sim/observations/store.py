@@ -14,7 +14,10 @@ from pathlib import Path
 import sqlite3
 import time
 
-import ijson
+try:
+    import ijson
+except ImportError:  # pragma: no cover - stdlib fallback when ijson is absent
+    ijson = None
 
 
 def digest_file(path):
@@ -25,9 +28,68 @@ def digest_file(path):
     return digest.hexdigest()
 
 
+def _iter_prefix(value, parts):
+    if not parts:
+        yield value
+        return
+    head, *tail = parts
+    if head == "item":
+        if isinstance(value, list):
+            for item in value:
+                yield from _iter_prefix(item, tail)
+    elif isinstance(value, dict) and head in value:
+        yield from _iter_prefix(value[head], tail)
+
+
 def json_items(path, prefix=""):
+    if ijson is not None:
+        with Path(path).open("rb") as stream:
+            yield from ijson.items(stream, prefix, use_float=True)
+        return
     with Path(path).open("rb") as stream:
-        yield from ijson.items(stream, prefix, use_float=True)
+        doc = json.load(stream)
+    parts = [part for part in prefix.split(".") if part] if prefix else []
+    yield from _iter_prefix(doc, parts)
+
+
+def json_kvitems(path, prefix=""):
+    if ijson is not None:
+        with Path(path).open("rb") as stream:
+            yield from ijson.kvitems(stream, prefix, use_float=True)
+        return
+    parts = [part for part in prefix.split(".") if part] if prefix else []
+    for item in json_items(path, ".".join(parts)):
+        if isinstance(item, dict):
+            yield from item.items()
+
+
+def json_top_fields(path, wanted):
+    if ijson is not None:
+        from ijson.common import ObjectBuilder
+
+        result, builder, selected, depth = {}, None, None, 0
+        with Path(path).open("rb") as stream:
+            for prefix, event, value in ijson.parse(stream, use_float=True):
+                if builder is None:
+                    if prefix not in wanted:
+                        continue
+                    if event not in {"start_map", "start_array"}:
+                        result[prefix] = value
+                        continue
+                    selected, builder, depth = prefix, ObjectBuilder(), 0
+                builder.event(event, value)
+                if event in {"start_map", "start_array"}:
+                    depth += 1
+                elif event in {"end_map", "end_array"}:
+                    depth -= 1
+                    if not depth:
+                        result[selected], builder = builder.value, None
+        return result
+    with Path(path).open("rb") as stream:
+        doc = json.load(stream)
+    if not isinstance(doc, dict):
+        return {}
+    return {key: doc[key] for key in wanted if key in doc}
 
 
 def profiler_rows(path):

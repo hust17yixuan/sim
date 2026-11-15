@@ -13,6 +13,9 @@
     invalid dimensions raise ``ModelingError`` or ``ValueError`` without silent
     fallback.
   * Every synthesized dictionary is verified via ``parse_case`` before return.
+  * ``assemble`` submits model and no-layer framework fragments into one
+    execution context; pure-model scope is an explicit selection, never a
+    fabricated layer or an independent ``simulate_model`` timing splice.
 
 [Timeouts & Locks]
   Bounded local JSON config reads (< 50 MiB); no network, NPU, subprocess, or
@@ -634,7 +637,13 @@ def compose_case(
         runtime_meta["enable_shared_expert_dp"] = True
 
     runtime_dict: dict[str, Any] = {
-        "parallel": {"dp": dp, "tp": tp, "pp": pp, "ep": ep, "cp": dcp, "dcp": dcp, "pcp": pcp},
+        "parallel": {
+            "dp": dp, "tp": tp, "pp": pp, "ep": ep, "cp": dcp, "dcp": dcp, "pcp": pcp,
+            **({"rank_table": [list(range(g * int(ep), (g + 1) * int(ep)))
+                               for g in range((int(dp) * int(tp) * int(pcp)) // int(ep))]}
+               if int(pcp) > 1 and int(ep) > int(dp) * int(tp)
+               and (int(dp) * int(tp) * int(pcp)) % int(ep) == 0 else {}),
+        },
         "max_num_seqs": resolved_max_seqs,
         "max_num_batched_tokens": resolved_max_batched,
         "max_model_len": resolved_max_model_len,
@@ -675,6 +684,18 @@ def compose_case(
     if va_profile is not None:
         runtime_meta["va_recommended"] = True
         runtime_meta["va_profile"] = deepcopy(va_profile)
+        # A documented vLLM ``compilation_config`` is forwarded only when it
+        # agrees with the resolved graph mode; an explicit caller choice is
+        # never silently overridden.
+        compilation = va_profile.get("compilation_config")
+        if (isinstance(compilation, dict)
+                and str(compilation.get("cudagraph_mode") or "").upper()
+                in {"FULL", "FULL_DECODE_ONLY"}
+                and str(graph_capture_mode) == "full"):
+            runtime_dict["compilation_config"] = deepcopy(compilation)
+        backend = va_profile.get("all2all_backend")
+        if isinstance(backend, str) and backend:
+            runtime_dict["all2all_backend"] = backend
         runtime_meta["va_env"] = dict(va_profile["env"])
         runtime_meta["va_recommended_mtp_proposal_tokens"] = int(va_profile["mtp_proposal_tokens"])
         passes: tuple[str, ...] = ()
@@ -699,6 +720,547 @@ def compose_case(
     }
     parse_case(case_dict)
     return case_dict
+
+
+def _assembly_request_specs(case, requests):
+    from mindie_sim.schema.model import RequestSpec
+    if requests is None:
+        return tuple(case.workload.requests)
+    result = []
+    for index, item in enumerate(requests):
+        result.append(item if isinstance(item, RequestSpec)
+                      else RequestSpec.from_mapping(item, index))
+    return tuple(result)
+
+
+def _assembly_emit_counts(specs, generated, override):
+    """One ordinary model step emits at most one token per active request.
+
+    A speculative step can emit more; this entry has no draft contract and
+    therefore never batches several undecoded tokens into one forward/commit.
+    """
+    if override is not None:
+        return {str(key): int(value) for key, value in override.items() if int(value) > 0}
+    return {spec.request_id: 1 for spec in specs
+            if spec.output_tokens - generated[spec.request_id] > 0}
+
+
+def _assembly_metric_rows(specs, rows):
+    records = {
+        spec.request_id: {
+            "request_id": spec.request_id,
+            "arrival_ms": spec.arrival_ms,
+            "output_tokens": spec.output_tokens,
+            "generated_tokens": 0,
+            "commits": [],
+            "host_results": [],
+            "deliveries": [],
+        }
+        for spec in specs
+    }
+    for row in rows:
+        for request, count in row["emitted_tokens"].items():
+            record = records[request]
+            record["generated_tokens"] += count
+            commit = row["commit_ms"].get(request)
+            if commit is not None:
+                record["commits"].append((commit, count))
+        for request, at_ms in row["host_result_ms"].items():
+            records[request]["host_results"].append(at_ms)
+        for request, at_ms in row["delivery_ms"].items():
+            records[request]["deliveries"].append(at_ms)
+    result = []
+    for spec in specs:
+        record = records[spec.request_id]
+        commits = sorted(record["commits"])
+        host = sorted(record["host_results"])
+        delivered = sorted(record["deliveries"])
+        first_commit = commits[0][0] if commits else None
+        last_commit = commits[-1][0] if commits else None
+        generated = record["generated_tokens"]
+        intervals = max(0, generated - 1)
+        tpot = ((last_commit - first_commit) / intervals
+                if intervals and first_commit is not None else None)
+        window = (last_commit - spec.arrival_ms
+                  if last_commit is not None else None)
+        result.append({
+            "request_id": spec.request_id,
+            "arrival_ms": spec.arrival_ms,
+            "generated_tokens": generated,
+            "first_commit_ms": first_commit,
+            "last_commit_ms": last_commit,
+            "ttft_ms": (first_commit - spec.arrival_ms
+                        if first_commit is not None else None),
+            "tpot_ms": tpot,
+            "e2e_ms": window,
+            "output_tps": (generated * 1000.0 / window
+                           if window and window > 0 else None),
+            "first_host_result_ms": host[0] if host else None,
+            "last_host_result_ms": host[-1] if host else None,
+            "first_delivery_ms": delivered[0] if delivered else None,
+            "last_delivery_ms": delivered[-1] if delivered else None,
+            "delivery_e2e_ms": (delivered[-1] - spec.arrival_ms
+                               if delivered else None),
+        })
+    return result
+
+
+def assemble(case, *, scope="service", iterations=None, phase=None, tokens=None,
+             context=None, requests=None, emitted_tokens=None,
+             include_submission=None, trace_limit=0, resource_fusion=True,
+             primitives=None, recipes=None, full_service=False,
+             diagnostic_window=False, lower=None):
+    """Submit model and framework fragments into one execution context.
+
+    ``scope="model"`` selects the pure forward program and excludes
+    sampling/acceptance/token commit. ``scope="service"`` keeps those service
+    fragments and attaches the declared serving I/O. ``scope="framework"``
+    executes only no-layer host/transfer/delivery work; it has no model layer
+    and no fabricated placeholder operator.
+
+    Iterations are serialized by actual completion/delivery events, not by an
+    externally injected latency. Every iteration uses the same ``Execution``
+    and its resource/service state. For decode, one ordinary model step emits
+    one token per active request; ``tokens`` is a per-outer-iteration budget
+    expanded into that many real microsteps. There is no batched multi-token
+    decode step and no fabricated sleep.
+
+    ``submitted_ms`` is bound only to actual engine host-launch events observed
+    in this run (currently the last launch per stage). It is never the
+    scheduler event; framework-only work with no launch reports no submit.
+    """
+    from mindie_sim.prediction.attention import AttentionPolicy
+    from mindie_sim.prediction.cost import CostModel
+    from mindie_sim.prediction.execution import Execution
+    from mindie_sim.prediction.frontend import Frontend, SERVICE_FAMILIES
+    from mindie_sim.schema.operators import IterationWork
+    from mindie_sim.schema.workload import IterationPlan, RequestView, selected_mode
+
+    if scope not in {"model", "service", "framework"}:
+        raise ModelingError(f"assembly_scope_unknown:{scope}")
+    explicit_window = iterations is not None or tokens is not None
+    if phase is None:
+        # A full service run starts from the real prefill. A bounded decode
+        # window retains the historical decode default.
+        phase = ("prefill" if scope == "service" and not explicit_window
+                 else "decode")
+    if phase not in {"decode", "prefill"}:
+        raise ModelingError(f"assembly_phase_unknown:{phase}")
+    if iterations is not None and int(iterations) < 1:
+        raise ModelingError("assembly_requires_positive_iterations")
+    if tokens is not None and int(tokens) < 1:
+        raise ModelingError("assembly_requires_positive_tokens")
+    if context is not None and int(context) < 0:
+        raise ModelingError("assembly_context_requires_nonnegative_tokens")
+    if phase == "decode" and tokens is not None and int(tokens) < 1:
+        raise ModelingError("assembly_decode_requires_positive_token_budget")
+    parsed = parse_case(case)
+    specs = _assembly_request_specs(parsed, requests)
+    if scope == "service" and not diagnostic_window:
+        # Ordinary service assembly is the same production cohort driver used
+        # by predict/simulate_service. The former hand loop below is retained
+        # only as an explicit diagnostic window.
+        from mindie_sim.prediction.api import simulate_service
+        scheduler_specs = tuple(specs)
+        quota = None
+        quotas = None
+        if explicit_window and phase == "decode":
+            # The quota is an observation/emission boundary for the driver.
+            # The request keeps its original output_tokens, KV and closed-loop
+            # successor; a short window never retires it as complete.
+            quota = int(iterations or 1) * int(tokens or 1)
+            quotas = {spec.request_id: quota for spec in specs}
+        window_case = replace(parsed, workload=replace(
+            parsed.workload, requests=scheduler_specs))
+        window = None
+        if phase == "decode":
+            window = {
+                spec.request_id: {
+                    "computed": (int(context) if context is not None
+                                 else spec.prompt_tokens),
+                    "generated": 0,
+                }
+                for spec in specs
+            }
+        steps = (None if full_service or not explicit_window
+                 or phase == "decode" else int(iterations or 1))
+        observed_steps = []
+        observed_total = [0]
+        def observe(step):
+            observed_total[0] += 1
+            if len(observed_steps) < 256:
+                observed_steps.append(step.to_dict())
+        result = simulate_service(
+            window_case, primitives=primitives, recipes=recipes,
+            trace_limit=trace_limit, max_model_steps=steps, window=window,
+            token_quotas=quotas,
+            include_submission=(scope != "model" if include_submission is None
+                                else bool(include_submission)),
+            resource_fusion=resource_fusion, lower=lower,
+            observer=observe,
+        )
+        result["steps"] = observed_steps
+        result["steps_total"] = observed_total[0]
+        result["assemble_backend"] = "cohort_driver"
+        result["assembly_scope"] = scope
+        result["assembly"] = result.get("execution", {}).get("assembly")
+        original_outputs = {spec.request_id: spec.output_tokens for spec in specs}
+        unfinished = [request_id for request_id, output in original_outputs.items()
+                      if next((row["generated_tokens"] for row in result["requests"]
+                               if row["request_id"] == request_id), 0) < output]
+        result["window"] = {
+            "iterations": (int(iterations) if iterations is not None else None),
+            "tokens": (int(tokens) if tokens is not None else None),
+            "phase": phase, "context": context,
+            "request_ids": [spec.request_id for spec in specs],
+            "original_output_tokens": original_outputs,
+            "per_request_token_quota": quota,
+            "token_quota_by_request": dict(quotas or {}),
+            "unfinished_request_ids": unfinished,
+            "max_model_steps": steps,
+            "cohort_stop": result.get("execution", {}).get("cohort_stop"),
+        }
+        if unfinished:
+            result["status"] = "incomplete"
+            result["execution_status"] = "incomplete"
+        return result
+    iterations = 1 if iterations is None else int(iterations)
+    tokens = 1 if tokens is None else int(tokens)
+    if parsed.runtime.parallel.dp != 1:
+        raise ModelingError(
+            "diagnostic_assembly_window_requires_one_data_replica")
+    if not specs:
+        raise ModelingError("assembly_requires_at_least_one_request")
+    include_submission = (scope != "model" if include_submission is None
+                          else bool(include_submission))
+    execution = Execution(
+        parsed, CostModel(parsed, primitives), recipes=recipes,
+        include_submission=include_submission, trace_limit=trace_limit,
+        include_serving_io=scope != "model",
+    )
+    frontend = Frontend(attention_policy=AttentionPolicy(
+        **parsed.runtime.attention_policy))
+    if scope == "framework" and not execution.serving_io.enabled:
+        raise ModelingError("framework_assembly_requires_declared_serving_io")
+    execution.serving_io.record_events = True
+    generated = {spec.request_id: 0 for spec in specs}
+    # Actual KV positions already computed/visible before this assembly window.
+    # This is deliberately separate from emitted-token counts: a prefill of
+    # prompt_tokens positions computes that KV, while its sampled output token
+    # has not yet been written as KV.
+    computed_kv = {
+        spec.request_id: (int(context) if context is not None
+                          else spec.prompt_tokens)
+        for spec in specs
+    }
+    release_ms = max(spec.arrival_ms for spec in specs)
+    rows, program_count, first_program = [], 0, None
+    service_counts = {family: 0 for family in SERVICE_FAMILIES}
+    serving = execution.serving_io
+    # A non-draft decode step advances one token. ``tokens`` is the requested
+    # token budget per outer iteration and expands into real microsteps, each
+    # with its own forward/commit/state dependency; it is never one batched
+    # multi-token commit or a sleep for the rest of the budget.
+    decode_tokens = int(tokens) if phase == "decode" else 1
+    total_steps = (int(iterations) * decode_tokens if phase == "decode"
+                   else int(iterations))
+    for step_index in range(total_steps):
+        views = []
+        for spec in specs:
+            remaining = spec.output_tokens - generated[spec.request_id]
+            if remaining <= 0:
+                continue
+            if phase == "prefill" and step_index == 0:
+                q_len, view_phase = spec.prompt_tokens, "prefill"
+                count = 1
+            else:
+                q_len = 1
+                view_phase = "decode"
+                count = 1
+            if view_phase == "prefill":
+                view_context = 0
+            elif scope == "framework":
+                # Framework-only has no model KV write; its view context tracks
+                # declared external request progress, not claimed model KV.
+                view_context = (int(context) if context is not None
+                                else spec.prompt_tokens + generated[spec.request_id])
+            else:
+                view_context = computed_kv[spec.request_id]
+            views.append(RequestView(
+                spec.request_id, q_len, view_context, True, view_phase,
+                draft_verify=False, draft_prepare=False,
+                draft_advanced_tokens=count, prompt_tokens=spec.prompt_tokens,
+            ))
+        if not views:
+            break
+        plan = IterationPlan(
+            tuple(views), iteration=step_index,
+            output_tokens=tuple((spec.request_id, spec.output_tokens) for spec in specs),
+        )
+        if scope == "framework":
+            work = IterationWork(
+                (), plan, parsed.runtime.parallel.pp,
+                sum(view.logical_q_len for view in views),
+                sum(view.logical_q_len for view in views),
+                None, selected_mode(plan), "framework_only", replay_scope="none",
+            )
+            program = None
+        else:
+            program = frontend.program(
+                plan, parsed.model, parsed.runtime, parsed.machine,
+                assembly=("model" if scope == "model" else "service"),
+                resource_fusion=resource_fusion,
+            )
+            work = program.work
+            program_count += 1
+            if first_program is None:
+                first_program = program
+            for family in SERVICE_FAMILIES:
+                service_counts[family] += sum(
+                    op.family == family for op in work.ops)
+        override = (emitted_tokens if scope == "framework" else None)
+        if scope == "framework" and override is None:
+            override = {}
+        before_submission = dict(execution.submission_counts)
+        emit = (_assembly_emit_counts(specs, generated, override)
+                if scope != "model" else None)
+        active_requests = {view.request_id for view in views}
+        if emit is not None:
+            emit = {request: count for request, count in emit.items()
+                    if request in generated and request in active_requests}
+        step = execution.add(work, 0, release_ms, emitted_tokens=emit)
+        events = (step.completion, *step.client_deliveries.values())
+        execution.engine.advance(until=tuple(events), first=False)
+        prefix = f"{execution.namespace}r0:i{plan.iteration}"
+        io = serving.pop_batch_events(prefix) or {}
+        # T04 exposes the actual host-submit start events created by this step.
+        # Keep only the chosen first/last event and a count; an eager step can
+        # create thousands of launches, so the report must stay bounded.
+        host_launches = [(replica, stage, event) for replica, stage, event
+                         in step.host_submits if event.time is not None]
+        host_submit_times = [event.time for _, _, event in host_launches]
+        submitted_ms = min(host_submit_times) if host_submit_times else None
+        submitted_last_ms = max(host_submit_times) if host_submit_times else None
+
+        def host_event(item):
+            replica, stage, event = item
+            return {"replica": replica, "stage": stage, "event": event.name,
+                    "sequence": event.sequence, "submit_ms": event.time}
+
+        host_first = min(host_launches,
+                         key=lambda item: (item[2].time, item[2].sequence),
+                         default=None)
+        host_last = max(host_launches,
+                        key=lambda item: (item[2].time, item[2].sequence),
+                        default=None)
+        submitted_basis = (
+            "actual_step_host_submissions" if host_submit_times else
+            ("submission_not_included" if not include_submission
+             else "no_engine_launch"))
+        # Execution.add owns the per-request split; consume both maps directly.
+        # The merged ``commits`` map is retained only as a compatibility view.
+        declared_times = {
+            request: event.time for request, event in step.declared_commits.items()
+            if event.time is not None}
+        fallback_times = {
+            request: event.time for request, event in step.fallback_commits.items()
+            if event.time is not None}
+        merged_times = {
+            request: event.time for request, event in step.commits.items()
+            if event.time is not None}
+        commit_times = declared_times
+        host_times = ({request: event.time for request, event in step.host_results.items()
+                       if event.time is not None} if serving.enabled else {})
+        delivery_times = ({request: event.time for request, event in
+                           step.client_deliveries.items() if event.time is not None}
+                          if serving.enabled else {})
+        for view in views:
+            if scope == "framework":
+                continue
+            if view.phase == "prefill":
+                computed_kv[view.request_id] = view.prompt_tokens
+            else:
+                computed_kv[view.request_id] += view.q_len
+        row = {
+            "iteration": step_index,
+            "outer_iteration": (step_index // decode_tokens
+                                if phase == "decode" else step_index),
+            "decode_step_in_iteration": (step_index % decode_tokens
+                                         if phase == "decode" else 0),
+            "mode": step.mode,
+            "valid_tokens": step.valid_tokens,
+            "padded_tokens": step.padded_tokens,
+            "graph_bucket": step.graph_bucket,
+            "replay_scope": step.replay_scope,
+            "release_ms": release_ms,
+            "submitted_ms": submitted_ms,
+            "submitted_first_ms": submitted_ms,
+            "submitted_last_ms": submitted_last_ms,
+            "submitted_basis": submitted_basis,
+            "submitted_scope": ("actual_step_host_submissions"
+                                if host_submit_times else "none"),
+            "host_submit_first": host_event(host_first) if host_first else None,
+            "host_submit_last": host_event(host_last) if host_last else None,
+            "host_submit_event_count": len(host_launches),
+            "input_ready_ms": (io.get("input_ready").time
+                               if io.get("input_ready") is not None
+                               and io["input_ready"].time is not None else None),
+            "host_prepare_done_ms": (io.get("host_prepare").time
+                                     if io.get("host_prepare") is not None
+                                     and io["host_prepare"].time is not None else None),
+            "device_done_ms": step.device_complete.time,
+            "step_ready_ms": step.completion.time,
+            "commit_ms": commit_times,
+            "declared_commit_ms": declared_times,
+            "fallback_commit_ms": fallback_times,
+            "merged_commit_ms": merged_times,
+            "host_result_ms": host_times,
+            "host_complete_ms": (io.get("host_result").time
+                                 if io.get("host_result") is not None
+                                 and io["host_result"].time is not None else None),
+            "client_propagation_ms": (io.get("client_propagation").time
+                                      if io.get("client_propagation") is not None
+                                      and io["client_propagation"].time is not None
+                                      else None),
+            "delivery_ms": delivery_times,
+            "emitted_tokens": dict(emit or {}),
+            "active_requests": sorted(active_requests),
+            "context_tokens": {view.request_id: view.context for view in views},
+            "computed_kv_tokens_after": (
+                {view.request_id: computed_kv[view.request_id] for view in views}
+                if scope != "framework" else None),
+            "output_ready_ms": (io.get("output_ready").time
+                                if io.get("output_ready") is not None
+                                and io["output_ready"].time is not None else None),
+            "input_bytes": io.get("input_bytes", 0.0),
+            "d2h_bytes": io.get("d2h_bytes", 0.0),
+            "declared_commit": bool(step.declared_commits),
+            "program_assembly": (program.assembly if program is not None else "framework"),
+            "graph_replay_submissions": (
+                execution.submission_counts["graph_replays"]
+                - before_submission["graph_replays"]),
+            "eager_submissions": (
+                execution.submission_counts["eager_invocations"]
+                - before_submission["eager_invocations"]),
+        }
+        rows.append(row)
+        for request, count in (emit or {}).items():
+            if request in generated:
+                generated[request] += count
+        # The next invocation starts from an actual completion/delivery edge.
+        edges = [step.completion.time, *delivery_times.values()]
+        release_ms = max(edge for edge in edges if edge is not None)
+    execution.engine.advance()
+    metrics = _assembly_metric_rows(specs, rows)
+    fragments = serving.fragments(
+        h2d_hbm=execution.stage_names.get((0, 0), {}).get("hbm"),
+        d2h_hbm=execution.stage_names.get(
+            (0, parsed.runtime.parallel.pp - 1), {}).get("hbm"),
+    )
+    has_h2d = serving.transfers.get("h2d") is not None
+    has_d2h = serving.transfers.get("d2h") is not None
+    occurrence = {
+        "host_prepare": sum(row["host_prepare_done_ms"] is not None for row in rows),
+        "input_transfer": (len(rows) if has_h2d else 0),
+        "output_ready": sum(row["output_ready_ms"] is not None for row in rows),
+        "output_transfer": (sum(bool(row["emitted_tokens"]) for row in rows)
+                            if has_d2h else 0),
+        "host_result": sum(row["host_complete_ms"] is not None for row in rows),
+        "client_delivery": sum(row["client_propagation_ms"] is not None
+                               for row in rows),
+        "client_order": sum(len(row["delivery_ms"]) for row in rows),
+    }
+    framework = [
+        {**fragment.to_dict(), "occurrences": occurrence.get(fragment.name, 0)}
+        for fragment in fragments
+    ]
+    model_fragment = None
+    if first_program is not None:
+        model_fragment = {
+            **first_program.to_dict(include_ops=False),
+            "op_count": len(first_program.work.ops),
+            "families": sorted({op.family for op in first_program.work.ops}),
+            "service_families_present": sorted({
+                op.family for op in first_program.work.ops} & SERVICE_FAMILIES),
+            "iterations": program_count,
+        }
+    total_tokens = sum(row["generated_tokens"]
+                       for row in metrics if row["generated_tokens"])
+    declared_commit_events = sum(len(row["declared_commit_ms"]) for row in rows)
+    fallback_commit_events = sum(len(row["fallback_commit_ms"]) for row in rows)
+    merged_commit_events = sum(len(row["merged_commit_ms"]) for row in rows)
+    return {
+        "schema": "mindie-sim.assembly/1",
+        "scope": scope,
+        "phase": phase,
+        "same_context": True,
+        "independent_model_invocations": 0,
+        "submission_included": include_submission,
+        "iterations_requested": int(iterations),
+        "decode_tokens_per_iteration": decode_tokens,
+        "steps_requested": total_steps,
+        "iterations_executed": len(rows),
+        "steps_executed": len(rows),
+        "model_fragment": model_fragment,
+        "framework_fragments": framework,
+        "framework_occurrences": occurrence,
+        "triggers": {
+            "model_invocation": len(rows) if scope != "framework" else 0,
+            "batch_prepare": occurrence["host_prepare"],
+            "input_transfer": occurrence["input_transfer"],
+            "output_ready": occurrence["output_ready"],
+            "output_transfer": occurrence["output_transfer"],
+            "host_result": occurrence["host_result"],
+            "client_delivery_batches": occurrence["client_delivery"],
+            "client_order_events": occurrence["client_order"],
+            "request_commit_callbacks": declared_commit_events,
+            "fallback_completion_callbacks": fallback_commit_events,
+            "merged_commit_callbacks": merged_commit_events,
+            "sampling": service_counts["sampling"],
+            "acceptance": service_counts["acceptance"],
+            "token_commit_nodes": service_counts["token_commit"],
+            "graph_replay_submissions": sum(
+                row["graph_replay_submissions"] for row in rows),
+            "eager_submissions": sum(row["eager_submissions"] for row in rows),
+        },
+        "state_contract": {
+            "decode_step": "one_token_per_active_request",
+            "release": "previous_step_commit_and_delivery_event",
+            "context": "actual_computed_kv_positions_before_each_forward; "
+                       "prefill writes prompt_tokens, decode adds its query rows",
+            "commit": "declared_token_commit_event_per_step",
+        },
+        "steps": rows,
+        "requests": metrics,
+        "metrics": {
+            "boundary": "declared commit and delivery events in this context",
+            "output_tokens": total_tokens,
+            "window_end_ms": max((row["last_commit_ms"] for row in metrics
+                                  if row["last_commit_ms"] is not None), default=None),
+            "delivery_window_end_ms": max(
+                (row["last_delivery_ms"] for row in metrics
+                 if row["last_delivery_ms"] is not None), default=None),
+            "commit_events": declared_commit_events,
+            "fallback_completion_events": fallback_commit_events,
+            "merged_commit_events": merged_commit_events,
+            "client_propagation_events": sum(
+                row["client_propagation_ms"] is not None for row in rows),
+            "delivery_events": sum(len(row["delivery_ms"]) for row in rows),
+            "model_elapsed_ms": (sum(row["step_ready_ms"] - row["release_ms"]
+                                     for row in rows)),
+            "host_submit_events": sum(row["host_submit_event_count"]
+                                      for row in rows),
+        },
+        "event_boundaries": {
+            "ready": "input value/state producer completion",
+            "submit": ("actual engine host-launch event when observed; "
+                       "scheduler completion is not a submit boundary"),
+            "done": "all declared device work complete",
+            "commit": "declared token_commit event, else step completion fallback",
+            "delivery": "client-visible completion after host result",
+        },
+        "execution": execution.summary(),
+    }
 
 
 def apply_va_recommended(case: Mapping[str, Any]) -> dict[str, Any]:
@@ -753,5 +1315,5 @@ def apply_va_recommended(case: Mapping[str, Any]) -> dict[str, Any]:
 
 
 __all__ = ["HARDWARE_ALIASES", "HARDWARE_TOPOLOGY_ALIASES", "VA_RECOMMENDED_PROFILES",
-           "apply_va_recommended", "compose_case", "resolve_hardware_sku",
+           "apply_va_recommended", "assemble", "compose_case", "resolve_hardware_sku",
            "va_recommended_config"]

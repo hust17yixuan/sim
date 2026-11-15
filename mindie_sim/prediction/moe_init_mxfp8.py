@@ -201,7 +201,7 @@ def build(op, geometry):
                 return tuple(chain)
             if any(role in primitive_work.resources for role in ('scalar_ub_access','scalar_alu_issue')):
                 scalar_stages.append(Stage('scalar_count_sum',after=(previous,),
-                    program=PipelineProgram(experts,1,scalar_iteration)))
+                    program=PipelineProgram(experts,1,scalar_iteration,interior_fold=False)))
                 previous='scalar_count_sum'
             if 'scalar_ub_access' in primitive_work.resources:
                 scalar_stages.append(stage('store_total_count',

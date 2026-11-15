@@ -247,10 +247,16 @@ def test_sweep_topology_grid_pareto_frontier_node_topology_and_infeasible_honest
     slow_link["machine"]["intra_node_bw_gbps"] = 10.0
     slow_link["machine"]["inter_node_bw_gbps"] = 8.0
     rep_from_dict = sweep_topology_grid(
-        slow_link, candidates=[{"dp": 1, "tp": 4, "ep": 1, "pp": 1, "pcp": 1}], num_devices=4
+        slow_link,
+        candidates=[{"dp": 1, "tp": 4, "ep": 1, "pp": 1, "pcp": 1}],
+        num_devices=4,
+        max_sequences_per_dp=4,
     )
     rep_from_case = sweep_topology_grid(
-        parse_case(slow_link), candidates=[{"dp": 1, "tp": 4, "ep": 1, "pp": 1, "pcp": 1}], num_devices=4
+        parse_case(slow_link),
+        candidates=[{"dp": 1, "tp": 4, "ep": 1, "pp": 1, "pcp": 1}],
+        num_devices=4,
+        max_sequences_per_dp=4,
     )
     assert math.isclose(
         rep_from_dict["candidates"][0]["step_ms_at_b1"],
@@ -311,15 +317,15 @@ def test_sweep_topology_grid_pareto_frontier_node_topology_and_infeasible_honest
 def test_sweep_pd_disaggregation_ratios_kv_conservation_handoff_tpot_and_oom():
     """Verify P/D ratio sweep across total_dies=16, KV conservation, p_dp/output_tokens-1 RPS, handoff TPOT, and OOM."""
     # Use dp=2, tp=2 (4 dies per prefill instance) to verify p_dp=2 multiplicity!
-    prefill_case = _make_dense_gqa_case(layers=2, dp=2, tp=2)
-    decode_case = _make_dense_gqa_case(layers=2, dp=1, tp=4)
-    decode_case["runtime"]["max_num_seqs"] = 8
+    prefill_case = _make_dense_gqa_case(layers=1, dp=2, tp=2)
+    decode_case = _make_dense_gqa_case(layers=1, dp=1, tp=4)
+    decode_case["runtime"]["max_num_seqs"] = 4
 
     pd_report = sweep_pd_disaggregation_ratios(
         prefill_case,
         decode_case,
         total_dies=16,
-        prompt_tokens=1024,
+        prompt_tokens=128,
         output_tokens=256,
         ttft_sla_ms=2000.0,
         tpot_sla_ms=25.0,
@@ -339,7 +345,7 @@ def test_sweep_pd_disaggregation_ratios_kv_conservation_handoff_tpot_and_oom():
     # Verify exact physical KV handoff bytes conservation and handoff contribution to effective_tpot_ms
     parsed_dec = parse_case(decode_case)
     expected_kv_bytes = (
-        sum(Memory(parsed_dec).cache_bytes(1024, padded=False))
+        sum(Memory(parsed_dec).cache_bytes(128, padded=False))
         * parsed_dec.runtime.parallel.tp
         * parsed_dec.runtime.parallel.pcp
     )
@@ -376,17 +382,17 @@ def test_sweep_pd_disaggregation_ratios_kv_conservation_handoff_tpot_and_oom():
     assert pd_report["best_configuration"] in pd_report["pareto_frontier"]
     assert ratios["3P:1D"]["bottleneck_stage"] == "decode"
 
-    # Moderate KV bandwidth (0.05 GB/s -> ~167.8ms transfer, +0.66ms TPOT): feasible, bottleneck="kv_transfer"
+    # Moderate KV bandwidth (0.003125 GB/s -> ~167.8ms transfer, +0.66ms TPOT): feasible, bottleneck="kv_transfer"
     kv_bound_feasible = sweep_pd_disaggregation_ratios(
-        prefill_case, decode_case, total_dies=16, prompt_tokens=1024, output_tokens=256,
-        ttft_sla_ms=2000.0, tpot_sla_ms=25.0, kv_transfer_bw_gbps=0.05,
+        prefill_case, decode_case, total_dies=16, prompt_tokens=128, output_tokens=256,
+        ttft_sla_ms=2000.0, tpot_sla_ms=25.0, kv_transfer_bw_gbps=0.003125,
     )
     assert all(r["feasible"] and r["bottleneck_stage"] == "kv_transfer" for r in kv_bound_feasible["candidates"])
 
-    # Severe KV bandwidth throttling (0.001 GB/s -> ~8388ms transfer, +32.9ms TPOT > 25ms SLA): infeasible!
+    # Severe KV bandwidth throttling (0.0000625 GB/s -> ~8388ms transfer, +32.9ms TPOT > 25ms SLA): infeasible!
     kv_tpot_exceeded = sweep_pd_disaggregation_ratios(
-        prefill_case, decode_case, total_dies=16, prompt_tokens=1024, output_tokens=256,
-        ttft_sla_ms=2000.0, tpot_sla_ms=25.0, kv_transfer_bw_gbps=0.001,
+        prefill_case, decode_case, total_dies=16, prompt_tokens=128, output_tokens=256,
+        ttft_sla_ms=2000.0, tpot_sla_ms=25.0, kv_transfer_bw_gbps=0.0000625,
     )
     assert all(
         not r["feasible"] and r["infeasible_reason"] == "effective_tpot_sla_exceeded"
@@ -397,7 +403,7 @@ def test_sweep_pd_disaggregation_ratios_kv_conservation_handoff_tpot_and_oom():
     oom_prefill = deepcopy(prefill_case)
     oom_prefill["runtime"]["memory"] = {"workspace_bytes": 64 * 1024**3}
     oom_report = sweep_pd_disaggregation_ratios(
-        oom_prefill, decode_case, total_dies=16, prompt_tokens=1024, output_tokens=256,
+        oom_prefill, decode_case, total_dies=16, prompt_tokens=128, output_tokens=256,
     )
     assert oom_report["prefill_instance"]["hbm_ok"] is False
     assert all(
@@ -419,7 +425,7 @@ def test_sweep_pd_disaggregation_ratios_kv_conservation_handoff_tpot_and_oom():
     oom_decode = deepcopy(decode_case)
     oom_decode["runtime"]["memory"] = {"workspace_bytes": 64 * 1024**3}
     out1_report = sweep_pd_disaggregation_ratios(
-        prefill_case, oom_decode, total_dies=16, prompt_tokens=1024, output_tokens=1,
+        prefill_case, oom_decode, total_dies=16, prompt_tokens=128, output_tokens=1,
     )
     assert out1_report["kv_bytes_per_request"] == 0.0
     assert out1_report["kv_transfer_ms_per_request"] == 0.0
@@ -430,8 +436,8 @@ def test_sweep_pd_disaggregation_ratios_kv_conservation_handoff_tpot_and_oom():
     one_slot_prefill = deepcopy(prefill_case)
     one_slot_prefill["runtime"]["max_num_seqs"] = 1
     one_slot_rep = sweep_pd_disaggregation_ratios(
-        one_slot_prefill, decode_case, total_dies=16, prompt_tokens=1024, output_tokens=256,
-        kv_transfer_bw_gbps=0.05,
+        one_slot_prefill, decode_case, total_dies=16, prompt_tokens=128, output_tokens=256,
+        kv_transfer_bw_gbps=0.003125,
     )
     p_step = one_slot_rep["prefill_instance"]["step_ms"]
     xfer_ms = one_slot_rep["kv_transfer_ms_per_request"]

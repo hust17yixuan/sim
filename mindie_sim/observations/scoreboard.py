@@ -9,10 +9,17 @@
 """
 from __future__ import annotations
 
+import argparse
 from copy import deepcopy
+import json
 import math
+from pathlib import Path
 
-from .scoreboard_accuracy import annotate_call, group_fields, policy, step_fields
+from ..coverage import source_identity
+from .scoreboard_accuracy import (
+    annotate_call, group_fields, native_comparison_scoreboard, policy,
+    render_native_comparison_markdown, step_fields,
+)
 
 
 CONDITION_FIELDS = (
@@ -600,3 +607,66 @@ def render_markdown(report):
                           "No event was removed. Wait columns remain separate from duration; "
                           "AICPU activities are not additional physical link work."])
     return "\n".join(lines) + "\n"
+
+
+def _read_json(path):
+    path = Path(path)
+    if path.stat().st_size > 50 * 1024 * 1024:
+        raise ValueError("native_scoreboard_metadata_exceeds_50_mib")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def main(argv=None):
+    """Publish one independent native comparison slice as JSON and markdown."""
+    parser = argparse.ArgumentParser(
+        prog="python -m mindie_sim.observations.scoreboard",
+        description=("Project a profiler native comparison (formal/diagnostic "
+                     "tolerance plus source coverage) into the sim scoreboard."))
+    parser.add_argument(
+        "comparison", type=Path, help="mindie-profiler-native-comparison/1 JSON")
+    parser.add_argument("--inventory", type=Path, help="7337-ledger inventory summary JSON")
+    parser.add_argument("--captures", type=Path, help="capture recovery summary JSON")
+    parser.add_argument("--captures-manifest", type=Path,
+                        help="T03 capture manifest JSON (actual version)")
+    parser.add_argument("--ledger", type=Path, help="scope_map_7337.csv identity ledger")
+    parser.add_argument("--records", type=Path, help="a5_records.csv recovery fields")
+    parser.add_argument("--record-dispositions", type=Path,
+                        help="T03 record_dispositions_7337.csv")
+    parser.add_argument("--record-sources", type=Path,
+                        help="T03 record_sources.csv")
+    parser.add_argument("--source-registry", type=Path,
+                        help="T03 source_registry.csv")
+    parser.add_argument("--captures-index", type=Path,
+                        help="T03 captures/index_all.csv")
+    parser.add_argument("--source-edges", type=Path,
+                        help="declared item -> source_id/path edge JSON")
+    parser.add_argument("--label", help="campaign label retained in the report")
+    parser.add_argument("--output", "-o", type=Path)
+    parser.add_argument("--markdown", type=Path)
+    args = parser.parse_args(argv)
+    review = native_comparison_scoreboard(
+        _read_json(args.comparison),
+        inventory=args.inventory, captures=args.captures,
+        ledger=args.ledger, records=args.records,
+        captures_manifest=args.captures_manifest,
+        record_dispositions=args.record_dispositions,
+        record_sources=args.record_sources,
+        source_registry=args.source_registry,
+        captures_index=args.captures_index,
+        source_edges=(_read_json(args.source_edges)
+                      if args.source_edges is not None else None),
+        label=args.label, source=source_identity(args.comparison))
+    text = json.dumps(review, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+    if args.output:
+        args.output.write_text(text, encoding="utf-8")
+    else:
+        print(text, end="")
+    if args.markdown:
+        args.markdown.write_text(
+            render_native_comparison_markdown(review), encoding="utf-8")
+    return {"failed": 3, "incomplete": 4, "conditional": 4,
+            "empty": 5}.get(review["status"], 0)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

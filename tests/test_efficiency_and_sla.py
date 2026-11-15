@@ -455,11 +455,12 @@ def test_hardware_scaling_roundtrip_and_independent_graph_costs():
     # Verify reg_issue_slots scaled by vector_ops_scale (3.0) and switch_capacity scaled by link_bw_scale (2.5)
     assert math.isclose(dict(scaled.machine.dies[0].service_modes)["reg_issue_slots"][1], 6.0e12, rel_tol=1e-9)
     assert math.isclose(scaled.machine.links[0].switch_capacity_bytes_per_ms, rich_case.machine.links[0].switch_capacity_bytes_per_ms * 2.5, rel_tol=1e-9)
-    # Verify work.hbm term scaled by 1/2.0 while geometry.tokens term was NOT scaled
+    # Legacy service_regimes stay byte-identical and are explicitly marked unscaled in diagnostics
     scaled_rule = scaled.runtime.kernels["service_regimes"][0]
     terms_by_coord = {t["coordinate"]: t["us_per_unit"] for t in scaled_rule["response"]["terms"]}
-    assert math.isclose(terms_by_coord["bytes"], 0.5e-6, rel_tol=1e-9)
+    assert math.isclose(terms_by_coord["bytes"], 1.0e-6, rel_tol=1e-9)
     assert math.isclose(terms_by_coord["tokens"], 0.25, rel_tol=1e-9)
+    assert dict(scaled.runtime.metadata)["legacy_service_regime_diagnostics"]["scaled"] is False
 
     # Independent graph_costs verification under 2x HBM and 2x Compute
     for hbm_s, cube_s, vec_s in ((1.0, 1.0, 1.0), (2.0, 1.0, 1.0), (1.0, 2.0, 2.0)):
@@ -474,11 +475,14 @@ def test_hardware_scaling_roundtrip_and_independent_graph_costs():
 
 def test_sla_solver_exact_threshold_and_speculative_tokens():
     """Verify SLA solver on a multi-layer case against independent graph_costs, plus speculative token & VRAM-feasible metrics."""
-    case_ml = parse_case(_make_representative_moe_case(layers=4))
-    # Choose an interior SLA threshold (0.88 ms) where B=1 fits (0.71ms) and B=8 exceeds SLA (0.98ms)
+    raw_ml = _make_representative_moe_case(layers=4)
+    # Declare HBM below aggregate MTE2 so 2x HBM genuinely lifts the memory bottleneck
+    # while MTE pipes stay independent of hbm_bw_scale.
+    raw_ml["machine"]["device"]["rates"]["hbm"] = 4e11
+    case_ml = parse_case(raw_ml)
     sla_report = solve_hardware_sla_throughput(
         case_ml,
-        sla_ms=0.88,
+        sla_ms=1.25,
         context=4096,
         tokens_per_seq=1,
         max_sequences_per_dp=8,
@@ -497,23 +501,23 @@ def test_sla_solver_exact_threshold_and_speculative_tokens():
     assert math.isclose(base["tps_gain_vs_baseline"], 1.0, rel_tol=1e-9)
     assert math.isclose(base["tps_feasible_gain_vs_baseline"], 1.0, rel_tol=1e-9)
     assert 1 < base["b_sla"] < 8
-    assert base["step_ms_at_sla"] <= 0.88
-    assert base["step_ms_feasible"] <= 0.88
+    assert base["step_ms_at_sla"] <= 1.25
+    assert base["step_ms_feasible"] <= 1.25
     assert base["total_feasible_concurrency"] == base["b_feasible"] * case_ml.runtime.parallel.dp
     assert hbm2["b_sla"] > base["b_sla"]
     assert hbm2["tps_gain_vs_baseline"] > 1.0
 
-    # Independently verify on the multi-layer graph that b_sla <= 0.88ms and b_sla + 1 > 0.88ms
+    # Independently verify on the multi-layer graph that b_sla <= 1.25ms and b_sla + 1 > 1.25ms
     g_at_sla = target_graphs(case_ml, phase="decode", tokens=1, context=4096, sequences=base["b_sla"], scope="body")
     ec_at_sla = consume_target_declaration(case_ml, g_at_sla)
     gr_at_sla = graph_costs(ec_at_sla, TargetGraphSet({0: g_at_sla[0]}, kernels=g_at_sla.effective_kernels, selection=g_at_sla.default_selection), external_inputs={"analysis_input": 0}, include_submission=False, isolated=False)
     assert math.isclose(base["step_ms_at_sla"], gr_at_sla["duration_ms"], rel_tol=1e-12)
-    assert gr_at_sla["duration_ms"] <= 0.88
+    assert gr_at_sla["duration_ms"] <= 1.25
 
     g_next = target_graphs(case_ml, phase="decode", tokens=1, context=4096, sequences=base["b_sla"] + 1, scope="body")
     ec_next = consume_target_declaration(case_ml, g_next)
     gr_next = graph_costs(ec_next, TargetGraphSet({0: g_next[0]}, kernels=g_next.effective_kernels, selection=g_next.default_selection), external_inputs={"analysis_input": 0}, include_submission=False, isolated=False)
-    assert gr_next["duration_ms"] > 0.88
+    assert gr_next["duration_ms"] > 1.25
 
     # Speculative token resolution: SpeculativeSpec draft_len=3, conditional 0.7 -> q_tokens=4, emit=1+0.7+0.49+0.343=2.533
     raw_spec = _make_representative_moe_case(layers=2)

@@ -24,10 +24,15 @@ def services(raw,**rates):
 def changed(case,**intervals):
     raw=case.to_dict()
     for device in raw['machine']['devices']:
-        device['compute_arch']={'instruction_services':{
+        arch=dict(device.get('compute_arch') or {})
+        # Keep the declared capability preset and its typed PIPE_S services:
+        # the control adds one interval, it does not retract the source
+        # instruction inventory the base case runs with.
+        arch['instruction_services']={**dict(arch.get('instruction_services') or {}), **{
             role:{'unit':'calls','owner_axis':'vector','issue_ns':ns,
                 'provenance':{'kind':'synthetic_capacity_control_not_measurement'}}
             for role,ns in intervals.items()}}
+        device['compute_arch']=arch
     return parse_case(raw)
 
 

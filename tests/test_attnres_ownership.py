@@ -88,3 +88,15 @@ def test_contiguous_tail_ownership_and_explicit_source_dtype():
     wrong_dtype = replace(case, model=replace(case.model, activation_dtype="fp16"))
     with pytest.raises(ModelingError, match="attn_res_source_requires_bf16"):
         _point(wrong_dtype)
+
+
+def test_attnres_capability_registry_matches_source_domain():
+    from mindie_sim.prediction.family_attnres import capabilities
+
+    caps = capabilities()
+    assert caps["recipe"] == "attn_res_fwd"
+    assert caps["soc_families"] == ("A5",)
+    assert caps["auto_phases"] == ("decode",)
+    assert caps["dtypes"] == ("bf16",)
+    assert caps["source_boundary"] == "kernel"
+    assert "valid_blocks" in caps["dynamic_attributes"]

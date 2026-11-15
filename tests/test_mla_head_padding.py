@@ -39,7 +39,7 @@ def test_projection_and_fia_pad_only_the_physical_head_axis(logical, physical):
     graph = ops(control(logical))
     assert graph['q_b'].local_shape == (2, physical * 192, 32)
     assert dict(graph['q_absorb'].metadata)['matrix_groups'] == physical
-    assert graph['latent_attention0'].local_shape[2] == physical
+    assert graph['latent_attention0'].local_shape[1] == physical
     assert dict(graph['v_expand'].metadata)['matrix_groups'] == logical
     assert graph['output'].local_shape == (2, 32, logical * 128)
     assert graph['kv_store'].mte3_bytes == 2 * (512 + 64) * 2
@@ -60,7 +60,7 @@ def test_views_are_free_but_stride_copy_and_pad_traffic_are_real(batch):
         assert pad.mte2_bytes == batch * 12 * width * 2
         assert pad.mte3_bytes == batch * 16 * width * 2
         assert dict(pad.metadata)['zero_fill_bytes'] == batch * 4 * width * 2
-    assert graph['v_expand'].deps == tuple(graph[f'latent_attention{i}'].op_id for i in range(batch))
+    assert graph['v_expand'].deps == (graph['latent_attention0'].op_id,)
     assert not any('slice' in recipe for recipe in graph)
     assert not any(op.mte2_bytes or op.mte3_bytes for name, op in graph.items() if name.endswith('_view'))
 
@@ -130,8 +130,12 @@ def test_real_engine_respects_input_readiness_and_releases_all_resources():
     assert not any(result['execution']['live_allocated'].values())
     timeline = {row['op_id']: row for row in result['timeline']}
     assert timeline['s0.l0.mla_query_contiguous']['ready_ms'] >= timeline['s0.l0.q_absorb']['complete_ms']
-    assert timeline['s0.l0.v_expand']['ready_ms'] >= max(
-        timeline[f's0.l0.latent_attention{i}']['complete_ms'] for i in range(2))
+    attn_complete = (
+        timeline['s0.l0.latent_attention_batch']['complete_ms']
+        if 's0.l0.latent_attention_batch' in timeline
+        else max(timeline[f's0.l0.latent_attention{i}']['complete_ms'] for i in range(2))
+    )
+    assert timeline['s0.l0.v_expand']['ready_ms'] >= attn_complete
 
 
 def test_all_twelve_new_cases_parse_with_independent_logical_and_physical_axes():

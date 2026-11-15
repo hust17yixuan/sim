@@ -13,7 +13,7 @@ import math
 
 from mindie_sim.schema.common import dtype_bytes
 from .matrix_epilogue import MatrixEpilogue
-from .matrix_mapping import MappedMatmul, owner_tiles
+from .matrix_mapping import MappedMatmul, matrix_geometry, owner_tiles
 from .ownership import read_role
 from .program import KernelProgram, ParallelProgram, Stage
 
@@ -24,27 +24,28 @@ class PhaseMatmul(MappedMatmul):
 
     def lower(self, context):
         recipe, record = self.select(context)
+        op, names = context.op, context.resource_names
+        geometry = matrix_geometry(context, recipe)
         record.update({
             "execution_abstraction": "serial_per_owner_resource_phases",
             "overlap": "between_owners_only; within_owner_K_micro_overlap_omitted",
             "buffer_model": "selected_tile_capacity_screening_only; no_phase_residency",
+            "geometry": geometry.to_dict(),
         })
         if context.record_mapping is not None:
             context.record_mapping(record)
-        op, names = context.op, context.resource_names
-        total_m, n, k = op.local_shape[-3:]
+        total_m, n, k = geometry.local_shape
         if not total_m:
             return KernelProgram((Stage("setup", latency=context.setup_ms),),
                                  minimum_ms=context.minimum_ms)
         meta, cores = dict(op.metadata), context.core_count
-        groups = int(meta.get("matrix_groups", 1))
-        m = total_m // groups
+        groups, m = geometry.groups, geometry.m_per_group
         epilogue = MatrixEpilogue.from_op(op)
         inputs, weight = epilogue.operands(op)
         operand_read = read_role(names)
         scale_read = read_role(names, aiv=0)
         width = dtype_bytes(meta.get("compute_format", op.dtype or "bf16"))
-        owners = owner_tiles(m, n, recipe.tile_m, recipe.tile_n, cores, groups)
+        owners = geometry.owners
         left = owner_tiles(m, math.ceil(n / recipe.compute_n), recipe.tile_m,
                            recipe.tile_n // recipe.compute_n, cores, groups)
         right = owner_tiles(math.ceil(m / recipe.compute_m), n,

@@ -45,10 +45,12 @@ KVSPARSE = (
     ("kv_quant_sparse_flash_attention_service_vector_mla_arch35.h",
      "8a0c40168f4c55b9238933f354d5f0c7220a3e1e23d55e94dae42880023c2b1b"),
 )
-PUBLIC = ("SCHEMA", "PROVED_CORES", "NativeCallBinding", "declare_native_call",
-          "bind_native_call", "bind_expanded_call", "validate_invocation",
-          "native_call_coverage", "coverage_from_records", "join_profiler_rows",
-          "member_physical_view", "family_is_hccl", "self_non_claims")
+PUBLIC = ("SCHEMA", "PROVED_CORES", "NativeCallBinding", "NativeAbiRegion",
+          "declare_native_call", "bind_abi_call", "bind_selected_native_call",
+          "selection_delivery_for_op", "bind_native_call", "bind_expanded_call",
+          "validate_invocation", "native_call_coverage", "coverage_from_records",
+          "join_profiler_rows", "member_physical_view", "family_is_hccl",
+          "self_non_claims")
 
 
 @pytest.fixture(autouse=True)
@@ -124,9 +126,11 @@ def test_public_reexports_are_the_single_coverage_implementation():
     import mindie_sim.prediction.native_binding as binding
 
     assert binding.__all__ == PUBLIC
-    assert len(PUBLIC) == 13
+    assert len(PUBLIC) == 17
     assert all(getattr(binding, name) is not None for name in PUBLIC)
-    for name in ("native_call_coverage", "coverage_from_records", "join_profiler_rows"):
+    for name in ("NativeAbiRegion", "bind_abi_call", "bind_selected_native_call",
+                 "selection_delivery_for_op", "native_call_coverage",
+                 "coverage_from_records", "join_profiler_rows"):
         assert getattr(binding, name) is getattr(native_coverage, name)
     assert binding.self_non_claims() == self_non_claims()
     assert "hccl" in PROVED_CORES and "host" in PROVED_CORES
@@ -421,11 +425,12 @@ def test_structure_attaches_native_calls_outside_graph_identity_and_interns():
 
 
 def test_d0_accepts_every_attention_macro_and_rejects_plain_ffn():
-    for kinds in (("D0", "A0"), ("D0", "A1"), ("D0", "A2", "K0"),
-                  ("D0", "A3"), ("D0", "A4")):
+    for kinds in (("spec_decode", "gqa_attention"), ("spec_decode", "mla_attention"),
+                  ("spec_decode", "csa_attention", "kv_cache"),
+                  ("spec_decode", "gdn_linear_attn"), ("spec_decode", "dsa_attention")):
         assert validate_combination(kinds) == kinds
-    with pytest.raises(ModelingError, match="subgraph_combination_invalid:D0"):
-        validate_combination(("D0", "F0"))
+    with pytest.raises(ModelingError, match="subgraph_combination_invalid:spec_decode"):
+        validate_combination(("spec_decode", "mlp"))
 
 
 def test_piecewise_and_subgraph_sources_never_name_retired_mechanisms():

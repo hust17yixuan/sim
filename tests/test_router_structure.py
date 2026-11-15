@@ -95,8 +95,12 @@ def test_real_selection_candidates_preserve_repeated_layers(name, capture, kind,
 
     case = catalog(name)
     graph = export_structure(case, phase="prefill", tokens=tokens, scope="body")
-    path = Path(mindie_profiler.__file__).resolve().parents[1] / (
-        f"tests/fixtures/fusion_contracts/{capture}.csv")
+    rel = Path(f"tests/fixtures/fusion_contracts/{capture}.csv")
+    path = Path(mindie_profiler.__file__).resolve().parents[1] / rel
+    if not path.is_file():
+        path = Path(__file__).resolve().parents[2] / "profiler" / rel
+    if not path.is_file():
+        pytest.skip(f"retained fusion fixture unavailable: {path}")
     rows = [row for row in kernel_rows(path, rank_id="rank_0", rank_index=0)
             if row.kind == kind and row.input_shapes[0][0] == tokens]
     groups = [group for group in graph["subgraphs"] if group["role"] == "router_selection"]

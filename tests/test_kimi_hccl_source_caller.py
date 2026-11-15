@@ -21,8 +21,8 @@ def probe(label='p4k'):
     return dict(scope='body',phase='decode',tokens=1,context=4104 if label=='p4k' else 16392,sequences=32)
 
 
-def groups(raw):
-    ops=target_graphs(raw,**probe(),apply_body_defaults=True)[0]
+def groups(raw,label='p4k'):
+    ops=target_graphs(raw,**probe(label),apply_body_defaults=True)[0]
     entries={};exits={}
     for op in ops:
         meta=dict(op.metadata)
@@ -34,8 +34,8 @@ def groups(raw):
     return ops,entries,exits
 
 
-def spans(raw,result):
-    _,entries,exits=groups(raw)
+def spans(raw,result,label='p4k'):
+    _,entries,exits=groups(raw,label)
     timeline={row['op_id']:row for row in result['timeline']}
     return [(selection['collective'],
              (timeline[exits[key].op_id]['complete_ms']-timeline[entry.op_id]['ready_ms'])*1000)
@@ -45,7 +45,7 @@ def spans(raw,result):
 @pytest.mark.parametrize('label',['p4k','p16k'])
 def test_complete_93_layer_sp_has_373_single_native_collectives(label):
     raw=declared(label,93)
-    ops,entries,exits=groups(raw)
+    ops,entries,exits=groups(raw,label)
     assert Counter(s['collective'] for _,s in entries.values())=={'allgather':187,'reduce_scatter':186}
     assert not any(op.family in ('allgather','reduce_scatter') for op in ops)
     assert 'sp_output_gather.hccl' in entries

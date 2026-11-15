@@ -43,11 +43,13 @@ from mindie_sim.schema.common import ModelingError, dtype_bytes
 
 def _set_facts(model: ModelSpec, facts: Sequence[tuple[str, Any]]) -> None:
     # Frozen dataclass: build the final tuple once through object.__setattr__.
-    from mindie_sim.schema.serialization import immutable_sequences
+    from .hf_config import json_sequences
     merged = dict(facts)
     merged["state_bytes_per_request"] = model.state_bytes_per_request
     merged["body_layers"] = model.body_layers
-    object.__setattr__(model, "catalog_facts", tuple(sorted(immutable_sequences(merged).items())))
+    object.__setattr__(model, "catalog_facts",
+                       tuple(sorted((key, json_sequences(value))
+                                    for key, value in merged.items())))
 
 
 def build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
@@ -105,7 +107,10 @@ def build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
         engram = _engram(c)
     else:
         raise ModelingError(f"model_catalog_profile_unsupported:{family}")
-    from .hf_config import native_coverage, resolve_quant
+    from .hf_config import (
+        declared_context, declared_rope, declared_weight_dtype, native_coverage,
+        resolve_native_formats, resolve_quant,
+    )
     from .composable import shared_owners
     coverage_gaps = []
     declared_quant = c.get("quantization_config") or {}
@@ -113,6 +118,10 @@ def build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
     if declared_quant and (family == "qwen" or quant_method not in {"fp8", "compressed-tensors"}):
         quant, quant_gaps = resolve_quant(c)
         coverage_gaps.extend(quant_gaps)
+    # The declared native float dtype is the model stream; quantized matrix
+    # operands remain in QuantSpec.  Do not keep a BF16 proxy for FP16/FP32.
+    quant = resolve_native_formats(quant, c)
+    declared_weight = declared_weight_dtype(c)
     # Native adapters resolve structure once. Execution consumes only these
     # explicit mechanisms, and never dispatches on a checkpoint/family label.
     plans = [replace(
@@ -165,8 +174,14 @@ def build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
         p = mla_plans[0]
         if p.kv_lora_rank <= 0:
             raise ModelingError("model_catalog_mla_dims_incomplete")
-        mla = MlaSpec(p.q_lora_rank, p.kv_lora_rank, p.qk_nope_head_dim,
-                      p.qk_rope_head_dim, p.v_head_dim)
+        mla = MlaSpec(
+            p.q_lora_rank, p.kv_lora_rank, p.qk_nope_head_dim,
+            p.qk_rope_head_dim, p.v_head_dim,
+            o_lora_rank=p.o_lora_rank, o_groups=p.o_groups,
+            index_topk=p.index_topk, index_head_dim=p.index_dim,
+            index_n_heads=p.index_heads, compress_ratio=p.compress_ratio,
+            sliding_window=p.window,
+        )
     state_bytes = float(sum(plan.state_bytes_total for plan in plans))
     if engram is not None and quant is not None:
         storage_mode = str(c.get("engram_storage_mode", quant.engram_table_mode))
@@ -178,8 +193,12 @@ def build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
         name=key, layers=body_layers, hidden_size=h, num_heads=heads,
         head_dim=head_dim, intermediate_size=intermediate or (moe_i or 1),
         vocab_size=vocab, attention=attention, ffn=ffn, num_kv_heads=kv_heads,
-        activation_dtype="bf16", weight_dtype="bf16",
-        kv_dtype=quant.kv_dtype, compute_dtype="bf16",
+        activation_dtype=str(quant.native_format or "bf16"),
+        weight_dtype=(declared_weight
+                      if declared_weight in {"bf16", "fp16", "fp32"}
+                      and not declared_quant else str(quant.native_format or "bf16")),
+        kv_dtype=quant.kv_dtype,
+        compute_dtype=str(quant.native_format or "bf16"),
         norm_eps=float(c.get("rms_norm_eps", 1e-6) or 1e-6),
         quantization=quant.name, num_experts=experts, top_k=top_k,
         moe_intermediate_size=moe_i, num_shared_experts=shared,
@@ -246,6 +265,9 @@ def build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
         ("kv_source_layer_ids", tuple(int(v) for v in c.get("kv_source_layer_ids", ()) or ())),
         ("index_source_layer_ids", tuple(int(v) for v in c.get("index_source_layer_ids", ()) or ())),
         ("quantization", quant.to_dict()),
+        ("rope_parameters", declared_rope(c)),
+        ("max_position_embeddings",
+         int(declared_context(c).get("max_position_embeddings", 0))),
         ("mlp_layer_types", tuple(str(v) for v in c.get("mlp_layer_types", ()) or ())),
         ("layer_types", tuple(str(v) for v in c.get("layer_types", ()) or ())),
         ("indexer_types", tuple(str(v) for v in c.get("indexer_types", ()) or ())),

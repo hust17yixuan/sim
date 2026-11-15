@@ -27,12 +27,17 @@ import builtins
 from dataclasses import replace
 import ipaddress
 import json
+import os
 import re
+import sys
 from pathlib import Path
 
 import pytest
 
 try:  # Imported before the offline-root fixture scans installed distributions.
+    _dh = sys.modules.get("_distutils_hack")
+    if _dh is not None and hasattr(_dh, "DISTUTILS_FINDER"):
+        _dh.DISTUTILS_FINDER.__dict__.pop("spec_for_distutils", None)
     from setuptools.command.build_py import build_py as _build_py
     from setuptools.dist import Distribution as _Distribution
 except ModuleNotFoundError:  # pragma: no cover - minimal offline test envs
@@ -106,10 +111,18 @@ SPARSE_LAYERS = {
 }
 
 
-def _forbid(path: object) -> None:
-    text = str(path)
-    if text.startswith(("/Volumes/data", "/private/Volumes/data")):
-        raise AssertionError(f"offline_catalog_read_attempted:{text}")
+_RESOLVED_ROOT = ROOT.resolve()
+
+
+def _forbid(path: object, extra_roots: tuple[Path, ...] = ()) -> None:
+    if not isinstance(path, (str, os.PathLike)):
+        return
+    resolved = Path(path).resolve(strict=False)
+    if any(resolved.is_relative_to(root) for root in (_RESOLVED_ROOT, *extra_roots)):
+        return
+    for candidate in (str(path), str(resolved)):
+        if candidate.startswith(("/Volumes/data", "/private/Volumes/data")):
+            raise AssertionError(f"offline_catalog_read_attempted:{path}")
 
 
 @pytest.fixture(autouse=True)
@@ -117,18 +130,19 @@ def _isolated_offline_roots(monkeypatch, tmp_path):
     for name in ("MINDIE_CONFIG_HOME", "MINDIE_DATA_HOME",
                  "MINDIE_DIAGNOSTICS_ROOT", "HOME"):
         monkeypatch.setenv(name, str(tmp_path / name.lower()))
+    allowed = (tmp_path.resolve(strict=False),)
     real_read_text, real_open, real_path_open = Path.read_text, builtins.open, Path.open
 
     def guarded_read_text(self, *args, **kwargs):
-        _forbid(self)
+        _forbid(self, allowed)
         return real_read_text(self, *args, **kwargs)
 
     def guarded_open(file, *args, **kwargs):
-        _forbid(file)
+        _forbid(file, allowed)
         return real_open(file, *args, **kwargs)
 
     def guarded_path_open(self, *args, **kwargs):
-        _forbid(self)
+        _forbid(self, allowed)
         return real_path_open(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "read_text", guarded_read_text)
@@ -211,7 +225,7 @@ def test_fleet_layer_plans_use_supported_attention_cores():
     for gemma in (gemma26, gemma31):
         facts = dict(gemma.catalog_facts)
         assert facts["gemma4"] == 1 and facts["gemma4_ple"] == 0
-        assert facts["gemma4_ple_layers"] == ()
+        assert tuple(facts["gemma4_ple_layers"]) == ()
         assert facts["attention_schedule"].count("global") == len(
             [p for p in gemma.layer_plans if not p.window])
 
@@ -348,7 +362,7 @@ def test_setuptools_build_py_discovers_catalog_configs():
     command = _build_py(distribution)
     command.finalize_options()
     rows = command.get_data_files_without_manifest()
-    discovered = {f"mindie_sim/{name}" for _, _, _, names in rows for name in names}
+    discovered = {f"mindie_sim/{Path(name).as_posix()}" for _, _, _, names in rows for name in names}
     assert _catalog_config_names() <= discovered
 
 
@@ -403,11 +417,12 @@ def test_sparse_attention_orders_indexer_before_attention_and_bounds_kv():
             model, FeatureConfig.from_model(model, **FEATURES))
         layer = instantiated.layers[layer_index]
         kinds = [subgraph.kind for subgraph in layer.subgraphs]
-        assert kinds.index("I0") < kinds.index("A0"), key
-        assert kinds.index("I1") < kinds.index("A0"), key
-        a0 = layer.find("A0", role="attention")
+        attn_kind = next(k for k in kinds if k in {"gqa_attention", "mha_attention", "mqa_attention", "swa_attention"})
+        assert kinds.index("indexer_prolog") < kinds.index(attn_kind), key
+        assert kinds.index("lightning_indexer") < kinds.index(attn_kind), key
+        a0 = layer.find(attn_kind, role="attention")
         assert int(a0.operator("attention").theta.find("index_topk")) > 0, key
-        i1 = layer.find("I1", role="index_select")
+        i1 = layer.find("lightning_indexer", role="index_select")
         compiler = OperatorPiecewiseCompiler(SUPPLY, POLICY)
 
         def cost_at(instance, name, context):

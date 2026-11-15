@@ -66,12 +66,15 @@ class _Config:
     metadata_placement: str
     dtypes: _Dtypes
     has_initial_state: tuple[bool, ...] | None
-    cache_indices: tuple[int, ...] | None
+    cache_indices: tuple[int | None, ...] | None
     state_history_slots: int
-    state_rows: int
+    state_rows: int | None
     null_block_id: int | None
     pad_slot_id: int
     qsl: tuple[int, ...]
+    cache_index_present: bool = False
+    cache_index_bound: bool = False
+    state_rows_bound: bool = False
 
     @property
     def batch(self):
@@ -87,7 +90,8 @@ class _Config:
 
     @property
     def has_conv_states(self):
-        return self.state_rows > 0 and self.state_history_slots > 0
+        return ((self.state_rows is None or self.state_rows > 0)
+                and self.state_history_slots > 0)
 
     @property
     def has_init_flag(self):
@@ -274,30 +278,36 @@ def _parse_params(params) -> _Config:
     if raw_cache is not None:
         if isinstance(raw_cache, (str, bytes)):
             raise ValueError("cache_indices must be a sequence")
-        cache = tuple(_int_param(value, "cache_indices[]") for value in raw_cache)
+        cache = tuple(None if value is None else _int_param(value, "cache_indices[]")
+                      for value in raw_cache)
         if len(cache) != len(lengths):
             raise ValueError("cache_indices must have batch entries")
     else:
         cache = None
+    cache_index_present = cache is not None
+    cache_index_bound = cache is not None and all(value is not None for value in cache)
 
     null_raw = params.get("null_block_id", 0)
     null_block_id = None if null_raw is None else _int_param(null_raw, "null_block_id")
     pad_slot_id = _int_param(params.get("pad_slot_id", -1), "pad_slot_id")
 
-    if "state_rows" in params:
-        state_rows = _int_param(params["state_rows"], "state_rows")
-    elif "num_cache_lines" in params:
-        state_rows = _int_param(params["num_cache_lines"], "num_cache_lines")
+    if "state_rows" in params or "num_cache_lines" in params:
+        raw_rows = params.get("state_rows", params.get("num_cache_lines"))
+        state_rows = _int_param(raw_rows, "state_rows")
+        state_rows_bound = True
     elif history and cache is not None:
-        valid = [value for value in cache
-                 if value != pad_slot_id
-                 and not (null_block_id is not None and value == null_block_id)]
-        state_rows = max(1, max(valid) + 1) if valid else max(1, len(lengths))
+        # Index tensor present but allocation capacity not declared.  Keep it
+        # unbound; do not invent batch+1 or max(index)+1 as the allocation.
+        state_rows = None
+        state_rows_bound = False
     elif history:
+        # True absent-index identity ABI: at least one row per sequence.
         state_rows = len(lengths)
+        state_rows_bound = False
     else:
         state_rows = 0
-    if state_rows < 0:
+        state_rows_bound = True
+    if state_rows is not None and state_rows < 0:
         raise ValueError("state_rows must be non-negative")
     if history and state_rows == 0:
         raise ValueError("convStates rows must be positive when stateLen is positive")
@@ -307,13 +317,17 @@ def _parse_params(params) -> _Config:
 
     if cache is not None:
         for value in cache:
+            if value is None:
+                continue
             skipped = (value == pad_slot_id
                        or (null_block_id is not None and value == null_block_id))
             if skipped:
                 continue
-            if state_rows and not 0 <= value < state_rows:
+            if value < 0:
+                raise ValueError("cacheIndices must be non-negative")
+            if history and state_rows is not None and not 0 <= value < state_rows:
                 raise ValueError(f"cacheIndices value {value} out of range [0,{state_rows})")
-    if cache is None and state_rows and state_rows < len(lengths):
+    if history and cache is None and state_rows is not None and state_rows < len(lengths):
         raise ValueError("identity cache mapping requires num_cache_lines >= batch")
 
     raw_initial = params.get("has_initial_state")
@@ -343,6 +357,9 @@ def _parse_params(params) -> _Config:
         dtypes=dtypes, has_initial_state=initial, cache_indices=cache,
         state_history_slots=history, state_rows=state_rows,
         null_block_id=null_block_id, pad_slot_id=pad_slot_id, qsl=tuple(qsl),
+        cache_index_present=cache_index_present,
+        cache_index_bound=cache_index_bound,
+        state_rows_bound=state_rows_bound,
     )
 
 
@@ -455,14 +472,21 @@ def _config_from_op(op: OpSpec) -> _Config:
         metadata_placement=str(meta["metadata_placement"]), dtypes=dtypes,
         has_initial_state=(tuple(bool(v) for v in meta["has_initial_state"])
                            if meta.get("has_initial_state") is not None else None),
-        cache_indices=(tuple(int(v) for v in meta["cache_indices"])
+        cache_indices=(tuple(None if v is None else int(v)
+                             for v in meta["cache_indices"])
                        if meta.get("cache_indices") is not None else None),
         state_history_slots=int(meta["state_history_slots"]),
-        state_rows=int(meta["state_rows"]),
+        state_rows=(None if meta.get("state_rows") is None
+                    else int(meta["state_rows"])),
         null_block_id=(None if meta.get("null_block_id") is None
                        else int(meta["null_block_id"])),
         pad_slot_id=int(meta["pad_slot_id"]),
         qsl=tuple(qsl),
+        cache_index_present=bool(meta.get("cache_index_present",
+                                          meta.get("cache_indices") is not None)),
+        cache_index_bound=bool(meta.get("cache_index_bound", False)),
+        state_rows_bound=bool(meta.get("state_rows_bound",
+                                       meta.get("state_rows") is not None)),
     )
 
 
@@ -489,7 +513,8 @@ def make_op(params: dict) -> OpSpec:
         "width_key": width_key,
         "dtype": cfg.dtype,
         "metadata_placement": cfg.metadata_placement,
-        "has_cache_indices": cfg.cache_indices is not None,
+        "has_cache_indices": cfg.cache_index_present,
+        "cache_index_bound": cfg.cache_index_bound,
         "has_initial_state": bool(host["has_initial_state"]),
         "has_init_state_workspace": bool(host["has_init_state_workspace"]),
         "has_explicit_token_seq_ranges": bool(host["has_explicit_token_seq_ranges"]),
@@ -498,6 +523,7 @@ def make_op(params: dict) -> OpSpec:
         "has_conv_states": bool(cfg.has_conv_states),
         "state_history_slots": cfg.state_history_slots,
         "state_rows": cfg.state_rows,
+        "state_rows_bound": cfg.state_rows_bound,
         "rolling_fast_path": not cfg.bias,
         "generic_run_seq": cfg.bias,
         "rolling_math": "cann_default_ftz_true_intrinsic",
@@ -527,8 +553,12 @@ def make_op(params: dict) -> OpSpec:
         },
         "has_initial_state": cfg.has_initial_state,
         "cache_indices": cfg.cache_indices,
+        "cache_index_present": cfg.cache_index_present,
+        "cache_index_bound": cfg.cache_index_bound,
         "state_history_slots": cfg.state_history_slots,
         "state_rows": cfg.state_rows,
+        "state_rows_bound": cfg.state_rows_bound,
+        "query_start_loc": cfg.qsl,
         "null_block_id": cfg.null_block_id,
         "pad_slot_id": cfg.pad_slot_id,
         "dispatch": dispatch,
@@ -540,6 +570,8 @@ def make_op(params: dict) -> OpSpec:
         "source_kernel_launches": 1,
         "state_update": "sequence_tail",
         "workspace_enabled": bool(host["has_init_state_workspace"]),
+        "workspace_pool": "workspace",
+        "workspace_lifetime": "first_acquire_to_last_conv_block",
         "workspace_bytes": host["workspace_bytes"],
         "sync_workspace_bytes": host["sync_workspace_bytes"],
         "snapshot_workspace_bytes": host["snapshot_workspace_bytes"],

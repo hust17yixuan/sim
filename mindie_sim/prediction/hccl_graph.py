@@ -16,6 +16,7 @@ from .hccl_contracts import select
 from . import hccl_aicpu, hccl_aiv, hccl_aiv_gather, hccl_ccu, hccl_ccu_two_die, hccl_analytic_hierarchy
 from .collectives import PairwiseCollective
 from .mechanism import PlannedRecipe, Work
+from .topology import TransportOptions
 from .hccl_signals import RemoteNotify, RECIPE as SIGNAL
 
 NETWORK = 'hccl_source_peer_exchange'
@@ -25,13 +26,37 @@ class SourceMeshPeers(PairwiseCollective):
     algorithm = 'direct_peer'
 
     def plan_options(self, op):
-        return {'max_inflight_per_rank': dict(op.metadata)['hccl_selection']['ranks'] - 1}
+        selection = dict(op.metadata)['hccl_selection']
+        meta = dict(op.metadata)
+        result = {'max_inflight_per_rank': selection['ranks'] - 1}
+        # max_loop_bytes is a loop-capacity bound, not a per-peer message
+        # chunk.  Chunk/credit fields are only used when the native caller
+        # declares them explicitly; absent values stay unknowns.
+        for source, target in (
+            ('transport_chunk_bytes', 'chunk_bytes'),
+            ('transport_hop_startup_us', 'hop_startup_us'),
+            ('transport_receive_capacity_bytes_per_peer',
+             'receive_capacity_bytes_per_peer'),
+        ):
+            if meta.get(source) is not None:
+                result[target] = meta[source]
+        return result
+
+    def resolve_transport(self, op):
+        return TransportOptions.from_mapping(self.plan_options(op))
 
     def accounting_description(self, accounting):
         result = accounting.to_dict()
         serial = result.pop('setup_ms')
         return {**result, 'setup_ms': 0.0, 'unused_serial_round_estimate_ms': serial,
-                'latency_model': 'concurrent_source_peer_channels; per_hop_arrival'}
+                'latency_model': (
+                    'source_peer_channels; optional_declared_chunk_pipeline'),
+                'unknowns': {
+                    'receive_capacity_bytes_per_peer': (
+                        'declared_only_when_explicit_on_the_network_call'),
+                    'protocol_startup_us': (
+                        'declared_only_when_explicit_on_the_network_call'),
+                }}
 
 
 def recipes(kernels):
@@ -49,7 +74,8 @@ def recipes(kernels):
 def lower(ops, runtime, source_dtype):
     bindings = runtime.kernels.get('hccl',{})
     analytic = runtime.kernels.get('analytic_hierarchy', {})
-    if not bindings and not analytic:
+    observed_any = any(dict(op.metadata).get('hccl_observed_call') for op in ops)
+    if not bindings and not analytic and not observed_any:
         return ops
     if set(bindings)-{'allreduce','allgather','reduce_scatter'}:
         raise ModelingError('hccl_caller_supports_allreduce_allgather_reduce_scatter')
@@ -58,6 +84,15 @@ def lower(ops, runtime, source_dtype):
     result = []
     for original in ops:
         meta = dict(original.metadata)
+        # A signed observed HCCL packet supplies the API/tensor/raw identity and
+        # native observed name, but not a source-selected detailed variant.  It
+        # stays a boundary-only call: the detailed phase/template decomposition
+        # is left explicitly unpaired and no observed duration enters work.
+        observed = meta.get('hccl_observed_call')
+        if isinstance(observed, dict):
+            from .native_binding import declare_native_call
+            result.append(declare_native_call(original, **observed))
+            continue
         axis = meta.get('group_axis','tp')
         raw = bindings.get(original.family)
         analytic_raw = analytic.get(original.family)

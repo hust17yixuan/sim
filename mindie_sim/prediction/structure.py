@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import fields, replace
 from typing import Mapping
+import json
 
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.schema.model import LayerPlan, ModelSpec, SloSpec, WorkloadSpec
@@ -80,6 +81,44 @@ def parse_case(value: Case | Mapping) -> Case:
             runtime=Software.from_mapping(value.get("runtime", {})),
             slo=SloSpec.from_mapping(value.get("slo")),
         )
+    return _normalize_parsed_case(case)
+
+
+def parse_model(value: Case | Mapping) -> Case:
+    """Parse a pure-model declaration without fabricating a workload.
+
+    ``model`` + ``runtime`` + ``machine``/``hardware`` are sufficient.  The
+    returned Case carries an empty WorkloadSpec; callers pass explicit
+    RequestView geometry to the forward/assembly entry.  A complete Case still
+    parses through :func:`parse_case`.
+    """
+    if isinstance(value, Case):
+        case = value
+        if not isinstance(case.machine, Hardware):
+            case = Case(Hardware.from_mapping(case.machine.to_dict()), case.model,
+                        case.workload, Software.from_mapping(case.runtime.to_dict()),
+                        case.slo)
+    else:
+        _unknown(value, {"machine", "hardware", "model", "runtime", "slo",
+                         "schema", "structure_variant"}, "pure_model")
+        missing = {"model"} | ({"machine"} if "hardware" not in value else set())
+        missing = {key for key in missing if key not in value}
+        if missing:
+            raise ModelingError("pure_model_missing_fields:" + ",".join(sorted(missing)))
+        if value.get("structure_variant"):
+            raise ModelingError("structure_variant_retired:use_model_layer_plans_or_layer_overrides")
+        machine = value.get("machine", value.get("hardware"))
+        case = Case(
+            machine=Hardware.from_mapping(machine),
+            model=ModelSpec.from_mapping(value["model"]),
+            workload=WorkloadSpec._pure_model_sentinel(),
+            runtime=Software.from_mapping(value.get("runtime", {})),
+            slo=SloSpec.from_mapping(value.get("slo")),
+        )
+    return _normalize_parsed_case(replace(case, workload=WorkloadSpec._pure_model_sentinel()))
+
+
+def _normalize_parsed_case(case: Case) -> Case:
     model = normalize_model(case.model)
     from .implementations import select
     from .implementation_selection import prepared_selection
@@ -155,6 +194,11 @@ def parse_case(value: Case | Mapping) -> Case:
     case.machine.validate_placement(p)
     case.workload.validate_model(model, runtime)
     metadata = dict(runtime.metadata)
+    # Carry the unaltered case machine/model identity with the parsed runtime so
+    # every ordinary FeatureConfig/compiled feature record receives it.  This is
+    # the deployment identity, not a measured supply or model-label branch.
+    from .subgraphs.instantiate import _identity_metadata
+    metadata.update(_identity_metadata(case.machine, model))
     media = {request.request_id: request.media_tokens for request in case.workload.requests if request.media_tokens}
     if media:
         metadata["media_tokens_by_request"] = media
@@ -166,6 +210,25 @@ def parse_case(value: Case | Mapping) -> Case:
     if (deepep_enabled and "deepep_ranks_per_node" not in metadata
             and not (isinstance(moe_cfg, Mapping) and moe_cfg.get("ranks_per_node"))):
         metadata["deepep_ranks_per_node"] = int(case.machine.ranks_per_node)
+    binding = runtime.kernels.get("lowerings", {}).get("gdn_decode")
+    options = binding.get("options") if isinstance(binding, Mapping) else None
+    if isinstance(binding, Mapping):
+        assumptions = dict(case.machine.assumptions)
+        assumptions["gdn_decode_selected"] = "1"
+        if isinstance(options, Mapping) and options.get("recurrent_implementation"):
+            assumptions["gdn_recurrent_implementation"] = str(options["recurrent_implementation"])
+        case = replace(case, machine=replace(case.machine, assumptions=tuple(sorted(assumptions.items()))))
+    if isinstance(options, Mapping) and "gating_beta_store" in options:
+        store = options.get("gating_beta_store")
+        if store in ({}, None):
+            store = {"disabled": True}
+        elif isinstance(store, Mapping):
+            store = dict(store)
+            if not store.get("from_hardware"):
+                store.pop("bytes_per_element", None)
+        assumptions = dict(case.machine.assumptions)
+        assumptions["gdn_gating_beta_store"] = json.dumps(store, sort_keys=True)
+        case = replace(case, machine=replace(case.machine, assumptions=tuple(sorted(assumptions.items()))))
     return replace(case, model=model, runtime=replace(
         runtime, pp_layer_partition=counts, metadata=tuple(sorted(metadata.items()))))
 

@@ -68,9 +68,9 @@ def test_tail_tiles_duplicate_operands_only_on_the_tiled_axis():
 def test_packed_weights_and_activation_scales_remain_in_both_memory_boundaries():
     shared, _ = execute(2, 4, 3, tile=(1, 2, 3), quant="w8a8_int8")
     uncached, _ = execute(2, 4, 3, tile=(1, 2, 3), reuse=False, quant="w8a8_int8")
-    # INT8 A6B + two FP32 activation scales8B; B12B plus two FP32
-    # metadata entries per output channel32B; BF16 output16B.
-    activation, packed_weight, output = 14, 44, 16
+    # INT8 A 6B + two FP32 activation scales 8B; B 12B plus BF16 runtime
+    # weight scale per output channel 8B; BF16 output 16B.
+    activation, packed_weight, output = 14, 20, 16
     assert shared.serviced["hbm"] == activation + packed_weight + output
     assert shared.serviced["mte2"] == 2 * activation + 2 * packed_weight
     assert uncached.serviced["hbm"] == 2 * activation + 2 * packed_weight + output

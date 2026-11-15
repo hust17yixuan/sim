@@ -97,7 +97,7 @@ def _gemm(spec, aic):
     op = _bind("gemm", "gemm", "gemm", matrix=(("K", k), ("N", n)),
                quant=(("act_bytes", act), ("act_format", afmt), ("weight_format", wfmt), ("output_format", ofmt)),
                tiles=(("cores", aic),))
-    return ((op, "E1", "gemm", "AI_CORE"),)
+    return ((op, "mlp", "gemm", "AI_CORE"),)
 def _grouped(spec, aic):
     k, n = _int(spec, ("K", "in_features", "hidden_size", "hidden"), 4096), _int(spec, ("N", "out_features", "intermediate_size"), 2048)
     experts, ep = _int(spec, ("E", "experts", "num_experts"), 64), _int(spec, ("ep",), 1)
@@ -107,7 +107,7 @@ def _grouped(spec, aic):
                experts=(("E", experts), ("local", local), ("k", top_k)),
                quant=(("weight_format", _fmt(spec, ("weight_format", "w_dtype"), "bf16")),),
                tiles=(("cores", aic),))
-    return ((op, "F3", "moe_grouped", "MIX_AIC"),)
+    return ((op, "routed_experts", "moe_grouped", "MIX_AIC"),)
 def _moe(spec, aic):
     hidden = _int(spec, ("hidden", "hidden_size", "K"), 4096)
     inter = _int(spec, ("inter", "moe_intermediate_size", "intermediate_size", "N"), 1536)
@@ -119,26 +119,26 @@ def _moe(spec, aic):
     items = [
         (_bind("router_gemm", "gemm", "router_gemm", matrix=(("K", hidden), ("N", experts)),
                quant=(("act_bytes", act), ("weight_format", "bf16")), tiles=(("cores", aic),)),
-         "F1", "gemm", "AI_CORE"),
+         "moe_router", "gemm", "AI_CORE"),
         (_bind("router", "router", "router", experts=(("E", experts), ("k", top_k), ("elements", experts)),
-               tiles=(("cores", aic),)), "F1", "moe_router", "AI_VECTOR_CORE"),
+               tiles=(("cores", aic),)), "moe_router", "moe_router", "AI_VECTOR_CORE"),
     ]
     if ep > 1:
         for name in ("dispatch", "combine"):
             items.append((_bind(name, "transport", name, parallel=(("ep", ep), ("members", ep)),
                                 matrix=(("row_bytes", wire),), experts=(("top_k", top_k),),
-                                quant=(("wire_bytes", wire),)), "F2", "collective", "COMMUNICATION"))
+                                quant=(("wire_bytes", wire),)), "moe_token_dispatcher", "collective", "COMMUNICATION"))
     items.extend((
         (_bind("expert_gate_up", "grouped_gemm", "expert_gate_up", matrix=(("K", hidden), ("N", width)),
                experts=(("E", experts), ("local", local), ("k", top_k)),
-               quant=(("weight_format", wfmt),), tiles=(("cores", aic),)), "F3", "moe_grouped", "MIX_AIC"),
+               quant=(("weight_format", wfmt),), tiles=(("cores", aic),)), "routed_experts", "moe_grouped", "MIX_AIC"),
         (_bind("swiglu", "elementwise", "swiglu", matrix=(("elements", mid),),
                quant=(("act_bytes", act),), experts=(("E", experts), ("local", local), ("k", top_k)),
                extras=(("read_bytes", 2 * mid * act), ("write_bytes", mid * act), ("ops_per_element", 6))),
-         "F3", "activation", "AI_VECTOR_CORE"),
+         "routed_experts", "activation", "AI_VECTOR_CORE"),
         (_bind("expert_down", "grouped_gemm", "expert_down", matrix=(("K", mid), ("N", hidden)),
                experts=(("E", experts), ("local", local), ("k", top_k)),
-               quant=(("weight_format", wfmt),), tiles=(("cores", aic),)), "F3", "moe_grouped", "MIX_AIC"),
+               quant=(("weight_format", wfmt),), tiles=(("cores", aic),)), "routed_experts", "moe_grouped", "MIX_AIC"),
     ))
     if etp > 1:
         items.append((_bind("etp_allreduce", "collective", "etp_allreduce",
@@ -146,7 +146,7 @@ def _moe(spec, aic):
                             experts=(("E", experts), ("local", local), ("k", top_k)),
                             quant=(("wire_bytes", wire), ("bytes_per_token", wire)),
                             extras=_reduction_extras(spec)),
-                      "F3", "collective", "COMMUNICATION"))
+                      "routed_experts", "collective", "COMMUNICATION"))
     return tuple(items)
 def _attention(spec, aic, mla):
     q_heads = _int(spec, ("q_heads", "q", "heads", "num_attention_heads"), 32)
@@ -158,7 +158,7 @@ def _attention(spec, aic, mla):
                    heads=(("q", q_heads), ("kv", kv_heads), ("dn", dn), ("dr", dr), ("rkv", rkv), ("dv", val_w)),
                    quant=(("act_bytes", act),), tiles=(("mt", 128), ("nt", 128), ("cores", aic)),
                    extras=(("absorb", _zero(spec, ("absorb",), 1)), ("index_topk", _zero(spec, ("index_topk",), 0))))
-        return ((op, "A1", "attention", "MIX_AIC"),)
+        return ((op, "mla_attention", "attention", "MIX_AIC"),)
     tp = _int(spec, ("tp",), 1)
     kv_heads = _int(spec, ("kv_heads", "kv", "num_key_value_heads"), 8)
     global_q, global_kv = _pick(spec, ("global_q_heads",), None), _pick(spec, ("global_kv_heads",), None)
@@ -174,7 +174,7 @@ def _attention(spec, aic, mla):
                quant=(("act_bytes", act), ("kv_bytes", kv_heads * (key_w + val_w) * kv_elem)),
                tiles=(("mt", 128), ("nt", 128), ("cores", aic)),
                extras=(("window", _zero(spec, ("window",), 0)), ("causal", _zero(spec, ("causal",), 1))))
-    return ((op, "A0", "attention", "MIX_AIC"),)
+    return ((op, "gqa_attention", "attention", "MIX_AIC"),)
 def _ew(spec, name, family, role, kind, mechanism, *, read, write, ops, quantized=False):
     elements = _int(spec, ("elements", "intermediate_size", "hidden", "hidden_size", "width", "dim", "K"), 4096)
     act = _real(spec, ("act_bytes",), 2.0)
@@ -187,28 +187,28 @@ def _ew(spec, name, family, role, kind, mechanism, *, read, write, ops, quantize
     return ((op, kind, mechanism, "AI_VECTOR_CORE"),)
 def _norm(spec, aic):
     factor = 2 if _zero(spec, ("residual",), 0) else 1
-    return _ew(spec, "rmsnorm", "elementwise", "norm", "N0", "norm_residual", read=factor, write=factor, ops=6)
+    return _ew(spec, "rmsnorm", "elementwise", "norm", "layernorm", "norm_residual", read=factor, write=factor, ops=6)
 
 def _swiglu(spec, aic):
-    return _ew(spec, "swiglu", "elementwise", "activation", "F0", "activation", read=2, write=1, ops=6)
+    return _ew(spec, "swiglu", "elementwise", "activation", "mlp", "activation", read=2, write=1, ops=6)
 
 def _silu(spec, aic):
-    return _ew(spec, "silu", "elementwise", "activation", "F0", "activation", read=1, write=1, ops=5)
+    return _ew(spec, "silu", "elementwise", "activation", "mlp", "activation", read=1, write=1, ops=5)
 
 def _quant(spec, aic):
-    return _ew(spec, "dynamic_quant", "quantize", "quantize", "N0", "elementwise_quant", read=1, write=1, ops=5, quantized=True)
+    return _ew(spec, "dynamic_quant", "quantize", "quantize", "layernorm", "elementwise_quant", read=1, write=1, ops=5, quantized=True)
 
 def _rotary(spec, aic):
     heads = _pick(spec, ("q_heads", "heads"), None)
     if heads is None:
-        return _ew(spec, "rotary", "elementwise", "rope", "A0", "rope", read=1, write=1, ops=6)
+        return _ew(spec, "rotary", "elementwise", "rope", "gqa_attention", "rope", read=1, write=1, ops=6)
     key_w = _int(spec, ("key_width", "dk", "head_dim"), 128)
     elements = (max(1, _num(heads, "q_heads")) + _int(spec, ("kv_heads", "kv"), 8)) * key_w
     act = _real(spec, ("act_bytes",), 2.0)
     op = _bind("rotary", "elementwise", "rope", matrix=(("elements", elements),),
                quant=(("act_bytes", act),),
                extras=(("ops_per_element", _int(spec, ("ops_per_element",), 6)),))
-    return ((op, "A0", "rope", "AI_VECTOR_CORE"),)
+    return ((op, "gqa_attention", "rope", "AI_VECTOR_CORE"),)
 
 def _gdn(spec, aic):
     key_heads, val_heads = _int(spec, ("key_heads", "k_heads", "kv_heads"), 16), _int(spec, ("value_heads", "v_heads", "heads"), 32)
@@ -218,7 +218,7 @@ def _gdn(spec, aic):
                heads=(("key_heads", key_heads), ("value_heads", val_heads), ("dk", key_w), ("dv", val_w),
                       ("chunk", _int(spec, ("chunk", "chunk_size"), 64)), ("gate_rank", _zero(spec, ("gate_rank",), 0))),
                quant=(("act_bytes", _real(spec, ("act_bytes",), 2.0)),))
-    return ((op, "A3", "gdn_kda", ""),)
+    return ((op, "gdn_linear_attn", "gdn_kda", ""),)
 
 def _conv(spec, aic):
     channels = _int(spec, ("channels", "width", "dim", "hidden_size", "hidden", "qkv_width"), 4096)
@@ -228,16 +228,16 @@ def _conv(spec, aic):
                quant=(("act_bytes", act),),
                extras=(("kernel", kernel), ("rows", max(1, kernel - 1)), ("history_rows", kernel - 1),
                        ("qkv_width", channels)))
-    return ((op, "A3", "gdn_kda", "AI_VECTOR_CORE"),)
+    return ((op, "gdn_linear_attn", "gdn_kda", "AI_VECTOR_CORE"),)
 
 def _collective(spec, aic, key, devices):
     name = str(spec.get("name") or spec.get("collective") or key).strip().lower().replace("-", "_")
     compact = name.replace("_", "")
-    if "etp" in compact: canon_name, kind = "etp_allreduce", "F3"
-    elif "alltoall" in compact or "dispatch" in name or "combine" in name: canon_name, kind = "alltoall", "F2"
-    elif "reducescatter" in compact: canon_name, kind = "reduce_scatter", "R1"
-    elif "allgather" in compact: canon_name, kind = "all_gather", "R1"
-    else: canon_name, kind = "allreduce", "R1"
+    if "etp" in compact: canon_name, kind = "etp_allreduce", "routed_experts"
+    elif "alltoall" in compact or "dispatch" in name or "combine" in name: canon_name, kind = "alltoall", "moe_token_dispatcher"
+    elif "reducescatter" in compact: canon_name, kind = "reduce_scatter", "mlp"
+    elif "allgather" in compact: canon_name, kind = "all_gather", "mlp"
+    else: canon_name, kind = "allreduce", "mlp"
     ranks = max(1, _num(_pick(spec, ("members", "ranks", "tp", "ep", "world_size"), devices), "members"))
     rpn = max(1, min(ranks, _num(_pick(spec, ("ranks_per_node",), min(ranks, 8)), "ranks_per_node")))
     hidden = _int(spec, ("hidden", "elements", "hidden_size", "width"), 4096)

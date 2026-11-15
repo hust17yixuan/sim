@@ -24,8 +24,10 @@ def _row(capture, kind):
     import mindie_profiler
     from mindie_profiler.normalized import kernel_rows
 
-    path = Path(mindie_profiler.__file__).resolve().parents[1] / \
-        "tests/fixtures/fusion_contracts" / f"{capture}.csv"
+    rel = Path("tests/fixtures/fusion_contracts") / f"{capture}.csv"
+    path = Path(mindie_profiler.__file__).resolve().parents[1] / rel
+    if not path.exists():
+        path = Path(__file__).resolve().parents[2] / "profiler" / rel
     if not path.exists():
         pytest.skip("retained fusion fixture is unavailable")
     return next(row for row in kernel_rows(path) if row.kind == kind)

@@ -166,8 +166,13 @@ class KernelGroups:
         # A measured native response owns the whole call, including internal
         # source phases. It never becomes another per-phase startup or delay.
         regime_context = replace(invocation, native_work=native)
-        minimum_ms = max(minimum_ms, self.execution.regimes.select(
-            regime_context, self.execution.cost.record_regime))
+        # The declared group response is an inclusive completion floor for the
+        # whole native call. Invocation timing contributes the same kind of
+        # fixed constraint, so both raise ``minimum_ms`` once; neither replaces
+        # the other's physical program.
+        if self.execution.legacy_diagnostics or self.execution.regimes.rules:
+            minimum_ms = max(minimum_ms, self.execution.regimes.select(
+                regime_context, self.execution.cost.record_regime))
         engine = self.execution.engine
         stem = f"{self.prefix}:kernel:{info['id']}"
         allocations = tuple(entry.allocate(

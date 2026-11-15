@@ -27,7 +27,7 @@ from mindie_sim.prediction.piecewise import (
     OperatorPiecewiseCompiler, PipeDemand, PipeDominanceGuard, PipeEnvelope,
     PipeSupply, RequestGeometry, ServiceMode, SplitKGuard, SplitKPolicy,
     StepGuard, StructuralPartition, SubgraphCostFunction, Var, WorkloadGeometry,
-    boundary_distance, compose_sequence, lower_fusion, pipeline_makespan,
+    as_fraction, boundary_distance, compose_sequence, lower_fusion, pipeline_makespan,
     quant_ledger, run_engine_work,
 )
 from mindie_sim.prediction.piecewise.composition import ClosedForm
@@ -86,7 +86,7 @@ def attention_cost(compiled, geometry, state=None):
 
 def test_ragged_attention_matches_explicit_pair_enumeration():
     model = make_model()
-    compiled = compile_kind(model, "A0")
+    compiled = compile_kind(model, "gqa_attention")
     geometry = WorkloadGeometry((RequestGeometry(3, 5), RequestGeometry(1, 9)))
     cost = attention_cost(compiled, geometry)
     brute = 0
@@ -112,7 +112,7 @@ def test_tiling_tails_and_core_waves_do_not_borrow_idle_cores():
     model = make_model(plans=[dict(index=0, attention="gqa", ffn="dense",
                                    num_heads=4, num_kv_heads=2, head_dim=16,
                                    intermediate_size=128)])
-    compiled = compile_kind(model, "F0", feature_overrides={"kv_tile": 128})
+    compiled = compile_kind(model, "mlp", feature_overrides={"kv_tile": 128})
     gate_up = compiled.operator("gate_up")
     seen = []
     for tokens, expected_tiles, expected_tail in ((31, 2, 15), (32, 2, 16),
@@ -213,7 +213,7 @@ def test_pipeline_single_tile_sum_and_bounded_slots():
 
 def test_serial_composition_equals_engine_and_counts_late_input_gap():
     model = make_model()
-    compiled = compile_kind(model, "A0")
+    compiled = compile_kind(model, "gqa_attention")
     geometry = WorkloadGeometry.homogeneous(2, 4, 32)
     function = SubgraphCostFunction(compiled)
     serial = function.evaluate_serial(geometry)
@@ -244,7 +244,7 @@ def test_hbm_contention_total_bytes_not_isolated_max():
         PipeSupply((("hbm", 1000), ("cube", 1000))))
     assert disjoint.makespan_ms == 1
     model = make_model()
-    compiled = compile_kind(model, "A0")
+    compiled = compile_kind(model, "gqa_attention")
     function = SubgraphCostFunction(compiled)
     result = function.evaluate_fork_join_stages(
         {"A": [[("hbm", 1_000_000)]], "B": [[("hbm", 1_000_000)]]})
@@ -268,17 +268,17 @@ def test_hbm_contention_total_bytes_not_isolated_max():
 
 def test_native_fusion_keeps_external_outputs_and_removes_internal_materialisation():
     model = make_model()
-    compiled = compile_kind(model, "A0")
+    compiled = compile_kind(model, "gqa_attention")
     geometry = WorkloadGeometry.homogeneous(2, 4, 32)
     costs = compiled.evaluate(geometry).operators
     result = lower_fusion(compiled.instance, costs, "qkv_norm_rope",
                           supply=SUPPLY)
     assert result.startup_count == 1
     assert result.startup_count < len(result.semantic)
-    assert "qkv_activation" in dict(result.removed)
+    assert "qk_norm_output" in dict(result.removed)
     assert result.removed_bytes > 0
     kept = dict(result.kept)
-    assert "qkv_activation" not in kept
+    assert "qk_norm_output" not in kept
     contract = next(item for item in compiled.instance.template.fusions
                     if item.name == "qkv_norm_rope")
     assert set(contract.keeps) <= set(kept)
@@ -312,8 +312,8 @@ def test_shared_kv_owner_stores_once_and_consumer_reads_each_time():
     feature = features(model, pp=2)
     instantiated = instantiate_model(model, feature)
     compiler = OperatorPiecewiseCompiler(SUPPLY, POLICY)
-    store = compiler.compile(instantiated.find("K0", layer=0, role="kv"))
-    read = compiler.compile(instantiated.find("K0", layer=1, role="kv"))
+    store = compiler.compile(instantiated.find("kv_cache", layer=0, role="kv"))
+    read = compiler.compile(instantiated.find("kv_cache", layer=1, role="kv"))
     geometry = WorkloadGeometry.homogeneous(2, 4, 32)
     store_cost = next(cost for cost in store.evaluate(geometry).operators
                       if cost.name == "kv_store")
@@ -358,7 +358,7 @@ def test_k1_compression_telescopes_to_final_floor():
                   compress_ratio=4, compressor_kind="weighted_pool",
                   owns_long_kv=True)]
     model = make_model(plans=plans)
-    compiled = compile_kind(model, "K1")
+    compiled = compile_kind(model, "kv_compressor")
     current = StateView()
     total = 0
     context = 0
@@ -401,7 +401,7 @@ def test_moe_conservation_skew_waves_and_zero_expert_weight_reads():
                   num_shared_experts=1)]
     model = make_model(plans=plans, num_experts=4, top_k=2,
                        moe_intermediate_size=32, num_shared_experts=1)
-    compiled = compile_kind(model, "F3")
+    compiled = compile_kind(model, "routed_experts")
     geometry = WorkloadGeometry.homogeneous(4, 1, 16)
     values = []
     for counts in ((2, 2, 2, 2), (0, 0, 0, 8)):
@@ -454,13 +454,16 @@ def test_quantization_ledger_separates_payload_scales_zero_and_residency():
     quant_model = make_model(
         quant=dict(name="w4a8", weight_format="int4", activation_format="int8",
                    weight_block=(1, 32), scale_bytes=4))
-    bf16_gate = compile_kind(bf16_model, "F0").operator("gate_up").evaluate(
+    bf16_f0 = compile_kind(bf16_model, "mlp").evaluate(
         WorkloadGeometry.homogeneous(1, 8, 9))
-    quant_gate = compile_kind(quant_model, "F0").operator("gate_up").evaluate(
+    quant_f0 = compile_kind(quant_model, "mlp").evaluate(
         WorkloadGeometry.homogeneous(1, 8, 9))
+    bf16_gate = next(op for op in bf16_f0.operators if op.name == "gate_up")
+    quant_gate = next(op for op in quant_f0.operators if op.name == "gate_up")
     assert bf16_gate.get("flops") == quant_gate.get("flops")
     assert quant_gate.get("weight_total") < bf16_gate.get("weight_total")
-    assert quant_gate.pipe_work("vector") > bf16_gate.pipe_work("vector")
+    assert sum(op.pipe_work("vector") for op in quant_f0.operators) > sum(
+        op.pipe_work("vector") for op in bf16_f0.operators)
     assert quant_gate.residency_bytes == quant_gate.get("weight_total")
 # 13. MTP verify work is not discounted by acceptance; commit progress moves.
 
@@ -475,7 +478,7 @@ def test_mtp_verify_work_is_independent_of_acceptance():
                                 num_kv_heads=2, head_dim=16, q_width=64,
                                 kv_width=32)))
     model = ModelSpec.from_mapping(raw)
-    compiled = compile_kind(model, "D0", layer=None)
+    compiled = compile_kind(model, "spec_decode", layer=None)
     geometry = WorkloadGeometry.homogeneous(2, 4, 32)
     worked = []
     for accepted in (0, 4):
@@ -498,7 +501,7 @@ def test_mtp_verify_work_is_independent_of_acceptance():
 # 14. 0-shot structural generalisation, interning and model-label independence.
 
 def test_zero_shot_generalisation_template_interning_and_label_independence():
-    assert len(SUBGRAPH_KINDS) == 22 and len(set(SUBGRAPH_KINDS)) == 22
+    assert len(SUBGRAPH_KINDS) == 29 and len(set(SUBGRAPH_KINDS)) == 29
     assert set(KIND_BUILDERS) == set(SUBGRAPH_KINDS)
     assert {entry.kind for entry in VOCABULARY} == set(SUBGRAPH_KINDS)
     first = make_model(name="alpha")
@@ -508,30 +511,33 @@ def test_zero_shot_generalisation_template_interning_and_label_independence():
     second_inst = instantiate_model(second, features(second))
     assert first_inst.performance_keys() == second_inst.performance_keys()
     geometry = WorkloadGeometry.homogeneous(3, 2, 40)
-    first_cost = compile_kind(first, "A0").evaluate(geometry).total_ms
-    second_cost = compile_kind(second, "A0").evaluate(geometry).total_ms
+    first_cost = compile_kind(first, "gqa_attention").evaluate(geometry).total_ms
+    second_cost = compile_kind(second, "gqa_attention").evaluate(geometry).total_ms
     assert first_cost == second_cost
-    # Repeated identical layers intern one template object.
+    # Repeated identical interior layers intern one template object.  Layer 0
+    # is the decoder entry (its attention norm has no residual add), so the
+    # repeated pair starts at layer 1.
     layer = dict(attention="gqa", ffn="dense", num_heads=4, num_kv_heads=2,
                  head_dim=16, intermediate_size=128)
-    twin = make_model(plans=[dict(layer, index=0), dict(layer, index=1)])
+    twin = make_model(plans=[dict(layer, index=0), dict(layer, index=1),
+                             dict(layer, index=2)])
     registry = TemplateRegistry(256)
     instantiated = instantiate_model(twin, features(twin), registry=registry)
     assert len(registry) > 0 and registry.evictions == 0
-    for left, right in zip(instantiated.layers[0].subgraphs,
-                           instantiated.layers[1].subgraphs):
+    for left, right in zip(instantiated.layers[1].subgraphs,
+                           instantiated.layers[2].subgraphs):
         if left.kind == right.kind and left.variant == right.variant:
             assert left.template is right.template
             assert left.performance_key() == right.performance_key()
     changed = make_model(name="alpha", hidden_size=128)
     changed_inst = instantiate_model(changed, features(changed))
-    changed_cost = compile_kind(changed, "A0").evaluate(geometry).total_ms
+    changed_cost = compile_kind(changed, "gqa_attention").evaluate(geometry).total_ms
     assert changed_cost != first_cost
-    assert changed_inst.find("A0", layer=0).fingerprint() != \
-        first_inst.find("A0", layer=0).fingerprint()
-    validate_combination(("A0", "K0", "F0"))
+    assert changed_inst.find("gqa_attention", layer=0).fingerprint() != \
+        first_inst.find("gqa_attention", layer=0).fingerprint()
+    validate_combination(("gqa_attention", "kv_cache", "mlp"))
     with pytest.raises(ModelingError):
-        validate_combination(("I1",))
+        validate_combination(("lightning_indexer",))
 # 15. Bounded caches, lazy segment enumeration and bounded execution history.
 
 def test_bounded_caches_lazy_segments_and_completed_task_release():
@@ -543,7 +549,7 @@ def test_bounded_caches_lazy_segments_and_completed_task_release():
     instantiated = instantiate_model(model, features(model), registry=registry)
     assert len(registry) <= 3
     assert registry.evictions > 0
-    compiled = compile_kind(model, "A0")
+    compiled = compile_kind(model, "gqa_attention")
     qkv = compiled.operator("qkv_projection")
     table = qkv.piecewise(AnalysisDomain(max_tokens=64, max_query_tiles=8,
                                         max_kv_tiles=8, max_work=100000),
@@ -568,7 +574,7 @@ def test_bounded_caches_lazy_segments_and_completed_task_release():
     assert ResidualSlotState(2).full is False
     assert ClosedForm("x").certified
 
-def test_all_twenty_two_canonical_kinds_compile_from_one_model():
+def test_every_selected_canonical_kind_compiles_from_one_model():
     plans = [
         dict(index=0, attention="gqa", ffn="moe", num_heads=4, num_kv_heads=2,
              head_dim=16, intermediate_size=128, num_experts=4, top_k=2,
@@ -616,7 +622,21 @@ def test_all_twenty_two_canonical_kinds_compile_from_one_model():
     model = ModelSpec.from_mapping(raw)
     feature = features(model, pp=2)
     instantiated = instantiate_model(model, feature)
-    assert {instance.kind for instance in instantiated.subgraphs} == set(SUBGRAPH_KINDS)
+    # One model cannot select mutually exclusive attention mechanisms (MHA and
+    # MQA, or SWA and HCA, cannot coexist in one declared plan), so the
+    # contract is: every selected kind is canonical, and this fixture's exact
+    # selection is declared rather than assumed to cover the whole vocabulary.
+    selected = {instance.kind for instance in instantiated.subgraphs}
+    assert selected <= set(SUBGRAPH_KINDS)
+    assert selected == {
+        "vocab_parallel_embedding", "layernorm", "kv_cache", "kv_compressor",
+        "indexer_prolog", "lightning_indexer", "mlp", "moe_router",
+        "moe_token_dispatcher", "routed_experts", "shared_experts",
+        "hyper_connection", "attn_residual", "per_layer_embedding",
+        "lm_head_sampler", "spec_decode", "mm_encoder_projector",
+        "gqa_attention", "dsa_attention", "csa_attention", "gdn_linear_attn",
+        "kda_linear_attn",
+    }
     compiler = OperatorPiecewiseCompiler(SUPPLY, POLICY)
     state = StateView(
         kv_ready=tuple((index, "kv_cache") for index in range(len(plans))),
@@ -630,13 +650,13 @@ def test_all_twenty_two_canonical_kinds_compile_from_one_model():
         assert evaluation.total_ms >= 0
         totals.append(instance.kind)
     assert len(totals) == len(instantiated.subgraphs)
-    index_store = compiler.compile(instantiated.find("I0", layer=1)).evaluate(
+    index_store = compiler.compile(instantiated.find("indexer_prolog", layer=1)).evaluate(
         geometry, StateView())
     assert (1, "index") in index_store.state_out.index_ready
     with pytest.raises(ModelingError, match="analysis_domain_miss"):
         OperatorPiecewiseCompiler(
             SUPPLY, POLICY, domain=AnalysisDomain(max_index_rows=1)).compile(
-                instantiated.find("I1", layer=1)).evaluate(geometry)
+                instantiated.find("lightning_indexer", layer=1)).evaluate(geometry)
 def test_intervals_cover_unbounded_min_max_and_signed_floor_ceil():
     x = Var("x")
     lower = Min((x, Const(5))).interval({"x": Interval(None, 10)})
@@ -702,7 +722,7 @@ def test_bucket_selection_index_and_distinct_exact_crossover_roots():
 
 def test_compiler_domain_segments_limit_service_and_boundary_distance():
     model = make_model()
-    instance = instantiate_model(model, features(model)).find("F0", layer=0)
+    instance = instantiate_model(model, features(model)).find("mlp", layer=0)
     domain = AnalysisDomain(max_tokens=64)
     compiled = OperatorPiecewiseCompiler(SUPPLY, POLICY, domain=domain).compile(
         instance)
@@ -736,14 +756,17 @@ def test_compiler_domain_segments_limit_service_and_boundary_distance():
         OperatorPiecewiseCompiler(
             SUPPLY, POLICY, domain=AnalysisDomain(max_q=1)).compile(
                 instance).evaluate(geometry)
-    single = instantiate_model(model, features(model, max_splits=1)).find("F0", layer=0)
+    single = instantiate_model(model, features(model, max_splits=1)).find("mlp", layer=0)
     limited = OperatorPiecewiseCompiler(SUPPLY, POLICY).compile(
         single).piecewise(AnalysisDomain(max_tokens=16), limit=1)
     assert len(limited) == 1 and limited.truncated
     assert limited.total_cells == len(single.operators)
     assert cost.duration_ms == sum(cost.stage_times, Fraction(0))
     for pipe in ("cube", "hbm", "mte2"):
-        service = sum((dict(stage).get(pipe, 0) / SUPPLY.effective(pipe)
+        # The compiled cost publishes exact rational time.  Compare against
+        # the exact supply rate, not a binary float quotient.
+        rate = as_fraction(SUPPLY.effective(pipe))
+        service = sum((as_fraction(dict(stage).get(pipe, 0)) / rate
                        for stage in cost.stage_work), Fraction(0))
         assert cost.pipe_time(pipe) == service
     assert cost.pipe_time("cube") > max(
@@ -763,7 +786,7 @@ def test_default_domain_covers_long_sequences_and_enforces_derived_bounds():
         1_000_000_000_000, 1_048_576, 262_144, 65536)
     long = WorkloadGeometry((RequestGeometry(1, 131071),))
     long.validate(domain)
-    compiled = compile_kind(make_model(), "A0")
+    compiled = compile_kind(make_model(), "gqa_attention")
     assert attention_cost(compiled, long).get("causal_pairs") == 131072
     restricted = OperatorPiecewiseCompiler(
         SUPPLY, POLICY, domain=AnalysisDomain(max_kv_tiles=1))
@@ -787,7 +810,7 @@ def test_request_query_ranges_select_non_causal_physical_rows():
     assert reordered.query_ranges == ((0, 1), (3, 4))
     assert RequestGeometry(4, 0, query_ranges=((2, 4), (0, 1),
                                                (1, 2))).query_ranges == ((0, 4),)
-    compiled = compile_kind(make_model(), "A0")
+    compiled = compile_kind(make_model(), "gqa_attention")
     forward = attention_cost(compiled, WorkloadGeometry((RequestGeometry(
         4, 0, query_ranges=((0, 1), (3, 4))),)))
     backward = attention_cost(compiled, WorkloadGeometry((RequestGeometry(

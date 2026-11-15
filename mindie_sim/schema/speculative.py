@@ -41,10 +41,22 @@ class SpeculativeSpec:
 
     @classmethod
     def from_mapping(cls, raw):
-        unknown = raw.keys() - {f.name for f in fields(cls)}
+        names = {f.name for f in fields(cls)}
+        # ``num_speculative_tokens`` is the upstream vLLM spelling of the
+        # declared draft length.  A repeated declaration must agree.
+        aliases = {"num_speculative_tokens"}
+        unknown = raw.keys() - names - aliases
         if unknown:
             raise ModelingError("speculative_unknown_fields:" + ",".join(sorted(unknown)))
         data = dict(raw)
+        if "num_speculative_tokens" in data:
+            tokens = data.pop("num_speculative_tokens")
+            if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
+                raise ModelingError("speculative_num_speculative_tokens_invalid")
+            if "draft_len" in data and int(data["draft_len"]) != tokens:
+                raise ModelingError(
+                    f"speculative_draft_len_conflict:{data['draft_len']}!={tokens}")
+            data["draft_len"] = tokens
         for key in ("acceptance", "accepted_distribution"):
             if data.get(key) is not None:
                 data[key] = tuple(data[key])

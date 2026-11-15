@@ -8,6 +8,13 @@
 """
 from dataclasses import asdict, dataclass, replace
 from math import prod
+from typing import Any
+
+#: How a value obtains its execution-time binding.  ``static`` means the
+#: declaration is already complete; the other kinds name the symbol, event or
+#: external input that supplies the value.  A dynamic binding is never silently
+#: replaced by a default.
+TENSOR_BINDINGS = frozenset({"static", "symbolic", "event", "external"})
 
 
 @dataclass(frozen=True)
@@ -93,13 +100,90 @@ class TensorLayout:
 
 @dataclass(frozen=True)
 class TensorValue:
+    """One typed logical value with its own representation and binding.
+
+    ``dtype`` describes the payload.  A quantisation scheme, physical layout
+    family, storage identity, state version and execution binding are separate
+    fields: a model-level activation dtype must not stand in for all of them.
+    ``alias_of`` and ``storage`` are identities, not allocations; buffer
+    lifetime belongs to the program's allocation effects.
+    """
+
     producer: str
     dtype: str
     layout: TensorLayout
     output: str | int = 0
+    #: Payload quantisation scheme (e.g. ``w8a8``/``mxfp4``).  Scale and
+    #: zero-point are independent associated values, never folded in here.
+    quant: str = ""
+    #: Storage layout family (``strided``/``nz``/``fractal``), distinct from
+    #: the element strides carried by ``layout``.
+    layout_kind: str = "strided"
+    #: Physical buffer identity when the value is materialised; empty for an
+    #: abstract value that has no allocation at this layer.
+    storage: str = ""
+    #: Logical value identity this value aliases; empty means no alias.
+    alias_of: str = ""
+    #: State generation this value reads or writes, when it is state.
+    state_version: int | None = None
+    #: ``static``/``symbolic``/``event``/``external`` binding source.
+    binding: str = "static"
+    #: Symbol, event or external input that supplies a dynamic binding.
+    binding_name: str = ""
+
+    def __post_init__(self):
+        if not isinstance(self.producer, str):
+            raise TypeError("tensor_value_producer_requires_string")
+        if not isinstance(self.dtype, str) or not self.dtype:
+            raise ValueError("tensor_value_dtype_requires_nonempty_string")
+        if not isinstance(self.layout, TensorLayout):
+            raise TypeError("tensor_value_layout_requires_tensor_layout")
+        if not isinstance(self.output, (str, int)) or isinstance(self.output, bool):
+            raise TypeError("tensor_value_output_requires_string_or_int")
+        for name in ("quant", "layout_kind", "storage", "alias_of", "binding",
+                     "binding_name"):
+            if not isinstance(getattr(self, name), str):
+                raise TypeError(f"tensor_value_{name}_requires_string")
+        if not self.layout_kind:
+            raise ValueError("tensor_value_layout_kind_requires_nonempty_string")
+        if self.binding not in TENSOR_BINDINGS:
+            raise ValueError(f"tensor_value_binding_unknown:{self.binding}")
+        if self.binding != "static" and not self.binding_name:
+            raise ValueError(f"tensor_value_binding_name_required:{self.binding}")
+        if self.state_version is not None and (
+                not isinstance(self.state_version, int)
+                or isinstance(self.state_version, bool)
+                or self.state_version < 0):
+            raise ValueError("tensor_value_state_version_requires_nonnegative_int")
 
     def narrow(self, axis, start, length):
         return replace(self, layout=self.layout.narrow(axis, start, length))
 
     def permute(self, axes):
         return replace(self, layout=self.layout.permute(axes))
+
+    def with_binding(self, binding: str, name: str = "",
+                     *, state_version: int | None = None) -> "TensorValue":
+        """Return the same representation bound to another execution source."""
+        return replace(self, binding=binding, binding_name=name,
+                       state_version=(self.state_version if state_version is None
+                                      else state_version))
+
+    @property
+    def key(self) -> tuple:
+        return (self.producer, self.dtype, self.layout, self.output, self.quant,
+                self.layout_kind, self.storage, self.alias_of,
+                self.state_version, self.binding, self.binding_name)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "producer": self.producer, "dtype": self.dtype,
+            "layout": self.layout.to_dict(), "output": self.output,
+            "quant": self.quant, "layout_kind": self.layout_kind,
+            "storage": self.storage, "alias_of": self.alias_of,
+            "state_version": self.state_version, "binding": self.binding,
+            "binding_name": self.binding_name,
+        }
+
+
+__all__ = ["TENSOR_BINDINGS", "TensorLayout", "TensorValue"]

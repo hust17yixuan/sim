@@ -9,14 +9,17 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 
 from mindie_sim.catalog.attention_common import AttentionResult, _allreduce, _causal_pairs, dcp_partial_merge_ops
 from .mla import mla
 from .recurrent import linear
 from .partial_attention import projection_only, unmodeled, shared_kv_input
+from .cache_representation import store as representation_store
+from .attention_kv_access import paged_fia_plan
 from mindie_sim.catalog.cache import index_row_bytes, index_selection_cost, local_kv_heads
+from mindie_sim.catalog.cache_format import cache_format
 from mindie_sim.catalog.ops import gemm_op, vector_op, cache_store_op, comm_op, barrier_op
 from mindie_sim.catalog.context_parallel import split_causal_pairs, owned_positions
 from mindie_sim.schema.operators import OpSpec
@@ -123,8 +126,17 @@ class AttentionPolicy:
             raise ModelingError("attention_kv_storage_requires_auto_or_paged")
 
 
+def _gqa_formats(model):
+    """Resolve shared or independent K/V cache formats once."""
+    regions = dict(getattr(model, "metadata", ())).get("cache_representations", {})
+    if "gqa_kv_key" in regions or "gqa_kv_value" in regions:
+        return (cache_format(model, "gqa_kv_key"),
+                cache_format(model, "gqa_kv_value"), regions, False)
+    return cache_format(model, "gqa_kv"), cache_format(model, "gqa_kv"), regions, True
+
+
 def _attention_tensor_view(views, heads, kv_heads, width, model, quant,
-                           parallel, policy, runtime):
+                           parallel, policy, runtime, causal=True):
     """A paged ABI requires an explicit storage declaration, not a query length."""
     if policy.kv_storage != "paged":
         return _contiguous_tensor_view(
@@ -133,14 +145,39 @@ def _attention_tensor_view(views, heads, kv_heads, width, model, quant,
         return ()
     query = (sum(view.q_len for view in views), heads, width)
     tail = (runtime.kv_block_size, kv_heads * width)
+    key_fmt, value_fmt, regions, shared = _gqa_formats(model)
+    native = None
+    page_size = int(getattr(runtime, "kv_block_size", 0) or 0)
+    if page_size > 0 and all(view.q_len > 0 for view in views):
+        native = paged_fia_plan(
+            requests=tuple((view.q_len, view.context + view.q_len)
+                           for view in views),
+            query_lengths=tuple(view.q_len for view in views),
+            kv_lengths=tuple(view.context + view.q_len for view in views),
+            page_size=page_size,
+            query_heads=heads, kv_heads=kv_heads, head_dim=width,
+            query_dtype=model.activation_dtype,
+            output_dtype=model.activation_dtype,
+            key_format=key_fmt, value_format=value_fmt,
+            phase=getattr(views[0], "phase", "decode"),
+            mask="causal" if causal else "none",
+            return_lse=False, output_prepare=None,
+        )
     return (("attention_tensor_view", {
         "kind": "paged_gqa", "logical_layout": "TND", "kv_storage": "paged",
         "query_shape": query, "output_shape": query,
         "key_tail_shape": tail, "value_tail_shape": tail,
         "query_dtype": model.activation_dtype, "output_dtype": model.activation_dtype,
-        "key_dtype": quant.kv_dtype, "value_dtype": quant.kv_dtype,
+        "key_dtype": key_fmt.dtype, "value_dtype": value_fmt.dtype,
         "batch_count": len(views), "kv_block_size": runtime.kv_block_size,
         "local_kv_heads": kv_heads, "head_dim": width,
+        "cache_row_width": 2 * kv_heads * width,
+        "cache_head_width": width,
+        "cache_source_residency": str(
+            dict(getattr(model, "metadata", ())).get(
+                "cache_source_residency", "unresolved")),
+        **({"cache_representations": regions} if regions else {}),
+        **({"native_paged_fia": native} if native is not None else {}),
     }),)
 
 
@@ -161,18 +198,24 @@ def _contiguous_tensor_view(views, heads, kv_heads, width, model, quant, paralle
     }),)
 
 
-def _cache_tensor_view(views, kv_heads, width, model, quant, parallel):
+def _cache_tensor_view(views, kv_heads, width, key_fmt, value_fmt, shared,
+                       model, parallel):
     """Declare newly written tokens without inventing cache allocation or slots."""
-    if (parallel.cp != 1 or parallel.pcp != 1
-            or model.activation_dtype != quant.kv_dtype):
+    if parallel.cp != 1 or parallel.pcp != 1:
         return ()
     tokens = sum(view.q_len for view in views)
+    total = (key_fmt.row_bytes(2 * kv_heads * width) if shared
+             else key_fmt.row_bytes(kv_heads * width)
+             + value_fmt.row_bytes(kv_heads * width))
     return (("cache_tensor_view", {
         "key_shape": (tokens, kv_heads, width),
         "value_shape": (tokens, kv_heads, width),
-        "key_dtype": model.activation_dtype,
-        "value_dtype": model.activation_dtype,
+        "key_dtype": key_fmt.dtype,
+        "value_dtype": value_fmt.dtype,
         "slot_shape": (tokens,),
+        "cache_row_bytes": total,
+        "cache_group_size": key_fmt.group_size if shared else 0,
+        "cache_scale_dtype": key_fmt.scale_dtype if shared else "mixed",
     }),)
 
 
@@ -208,6 +251,43 @@ def _prefill_contract(views, heads, kv_heads, width, model, quant, parallel, pla
     }),)
 
 
+class _CacheProducer:
+    """Minimal existing-builder view for T07 cache representation producers."""
+
+    def __init__(self, ops, *, prefix, stage, layer, requests, phase, model):
+        self.ops = ops
+        self.prefix = prefix
+        self.model = model
+        self.common = {"stage": stage, "layer": layer,
+                       "requests": requests, "phase": phase}
+
+    def add(self, op):
+        self.ops.append(op)
+
+
+def _store_cache(ops, *, prefix, deps, rows, width, region, stage, layer,
+                 requests, phase, model, views, kv_heads, head_width, parallel,
+                 quant, key_fmt, value_fmt, shared_format, name="cache"):
+    """Use T07 store: BF16 source and packed output are separate ledgers."""
+    producer = _CacheProducer(
+        ops, prefix=prefix, stage=stage, layer=layer,
+        requests=requests, phase=phase, model=model)
+    store_id = representation_store(
+        producer, name, deps, rows, width, region)
+    view = _cache_tensor_view(
+        views, kv_heads, head_width, key_fmt, value_fmt, shared_format,
+        model, parallel)
+    if ops:
+        op = ops[-1]
+        metadata = dict(op.metadata)
+        metadata["cache_kind"] = "gqa"
+        if view:
+            for key, value in view:
+                metadata[key] = value
+        ops[-1] = replace(op, metadata=tuple(sorted(metadata.items())))
+    return store_id
+
+
 def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         padded_tokens, policy=AttentionPolicy(), cp_interleave_size=128,
         runtime=None, cache_ids=None, stage_of=None, topk_ids=None,
@@ -221,6 +301,7 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     heads = plan.num_heads // parallel.tp
     kv_heads = local_kv_heads(plan.num_kv_heads, parallel.tp)
     width = plan.head_dim
+    key_fmt, value_fmt, cache_regions, shared_format = _gqa_formats(model)
     shared = 0 <= plan.kv_owner_layer_id < plan.index
     kv_planes = 1 if plan.k_eq_v else 2
     projected_kv_heads = 0 if shared else kv_heads
@@ -285,32 +366,53 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             shape=(valid, kv_heads, width), metadata=(("group_axis", "pcp"),))
         ops.append(gather)
         store_ready = gather.op_id
-    store = cache_store_op(
-        op_id=prefix + ".cache",
-        deps=((store_ready, value_ready) if value_ready and not pcp_prefill
-              else (store_ready,)),
-        stage=stage, layer=plan.index,
-        requests=requests, phase=mode, recipe="kv_store",
-        rows=max(sum(owned_positions(v.context, v.context + (v.global_q_len or v.q_len) - 1,
-                                     parallel.cp, cp_interleave_size, rank) for v in views)
-                 for rank in range(parallel.cp)),
-        row_bytes=kv_planes * kv_heads * width * dtype_bytes(quant.kv_dtype),
-        dtype=quant.kv_dtype, kind="gqa",
-        metadata=_cache_tensor_view(views, kv_heads, width, model, quant, parallel),
-    )
+    # The gather consumes rotary output, so rotary must precede cache writes
+    # in the emitted graph order; it is also a dependency of the gather.
+    ops.insert(ops.index(gather) if pcp_prefill else len(ops), rope)
+    store_rows = max(
+        sum(owned_positions(v.context,
+                            v.context + (v.global_q_len or v.q_len) - 1,
+                            parallel.cp, cp_interleave_size, rank)
+            for v in views)
+        for rank in range(parallel.cp))
+    store_deps = ((store_ready, value_ready)
+                  if value_ready and not pcp_prefill else (store_ready,))
     if shared:
         extra, owner_ready = shared_kv_input(
             prefix=prefix, plan=plan, stage=stage, views=views,
             cache_ids=cache_ids or {}, stage_of=stage_of,
             parallel=parallel, quant=quant, mode=mode)
         ops.extend(extra)
-        store = barrier_op(
+        readiness = barrier_op(
             op_id=prefix + ".shared_cache_ready", deps=(rope.op_id, owner_ready),
             stage=stage, layer=plan.index, requests=requests, phase=mode,
             recipe="shared_cache_dependency", shape=())
-    # The gather consumes rotary output, so rotary must precede it in DAG order.
-    ops.insert(ops.index(gather) if pcp_prefill else len(ops), rope)
-    ops.append(store)
+        ops.append(readiness)
+        store_ids = (readiness.op_id,)
+    elif shared_format:
+        store_ids = (_store_cache(
+            ops, prefix=prefix, deps=store_deps, rows=store_rows,
+            width=2 * kv_heads * width, region="gqa_kv",
+            stage=stage, layer=plan.index, requests=requests, phase=mode,
+            model=model, views=views, kv_heads=kv_heads, head_width=width,
+            parallel=parallel, quant=quant, key_fmt=key_fmt,
+            value_fmt=value_fmt, shared_format=True),)
+    else:
+        key_store = _store_cache(
+            ops, prefix=prefix, deps=store_deps, rows=store_rows,
+            width=kv_heads * width, region="gqa_kv_key", name="cache_key",
+            stage=stage, layer=plan.index, requests=requests, phase=mode,
+            model=model, views=views, kv_heads=kv_heads, head_width=width,
+            parallel=parallel, quant=quant, key_fmt=key_fmt,
+            value_fmt=value_fmt, shared_format=False)
+        value_store = _store_cache(
+            ops, prefix=prefix, deps=store_deps, rows=store_rows,
+            width=kv_heads * width, region="gqa_kv_value", name="cache_value",
+            stage=stage, layer=plan.index, requests=requests, phase=mode,
+            model=model, views=views, kv_heads=kv_heads, head_width=width,
+            parallel=parallel, quant=quant, key_fmt=key_fmt,
+            value_fmt=value_fmt, shared_format=False)
+        store_ids = (key_store, value_store)
     plans = model.layer_plans
     idx_raw, sel_raw = int(plan.index_k_owner_layer_id), int(plan.topk_owner_layer_id)
     if plan.indexer:
@@ -366,7 +468,7 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         index_store_id = (index_cache_ids or {}).get(idx_owner)
     eff_window = ((min(plan.window, eff_topk) if plan.window else eff_topk)
                   if eff_topk > 0 else plan.window)
-    attention_deps = (store.op_id, topk_id) if topk_id else (store.op_id,)
+    attention_deps = (*store_ids, topk_id) if topk_id else store_ids
     attention, batches = [], []
     for index, view in enumerate(views):
         q, context = view.q_len, view.context
@@ -398,7 +500,10 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                 for rank in range(parallel.cp):
                     sweeps[rank] += owned_positions(lo, hi - 1, parallel.cp, cp_interleave_size, rank)
         streams = kv_heads if policy.reuse_kv_across_query_heads else heads
-        kv_bytes = max(sweeps) * kv_planes * streams * width * dtype_bytes(quant.kv_dtype)
+        kv_bytes = max(sweeps) * (
+            key_fmt.row_bytes(2 * streams * width) if shared_format
+            else key_fmt.row_bytes(streams * width)
+            + value_fmt.row_bytes(streams * width))
         input_bytes = q * heads * width * dtype_bytes(model.activation_dtype)
         shape = (q, view.kv_len, heads, width)
         op = OpSpec(
@@ -417,7 +522,8 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                          (view,), heads, kv_heads, width, model, quant, parallel, plan, mode)
                      + _attention_tensor_view(
                          (view,), heads, kv_heads, width, model, quant, parallel,
-                         policy, runtime),
+                         policy, runtime,
+                         causal=not plan.noncausal_attention),
         )
         if selected:
             op = selected.module.lower_op(
@@ -452,7 +558,8 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                                        parallel, plan, mode)
                                    + _attention_tensor_view(
                                        views, heads, kv_heads, width, model, quant, parallel,
-                                       policy, runtime),
+                                       policy, runtime,
+                                       causal=not plan.noncausal_attention),
                           **{key: sum(getattr(op, key) for op in batches) for key in fields})
         ops.append(batched)
         attention = [batched.op_id]
@@ -484,10 +591,14 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     if plan.qk_norm and not shared and not plan.k_eq_v:
         _declare_qkv_norm_rope(
             ops, qkv, normalized, rope, split_copies, split_views, model.activation_dtype)
-    return AttentionResult(ops=ops, last=last, cache_store_id=store.op_id,
+    return AttentionResult(ops=ops, last=last, cache_store_id=store_ids[0],
                            index_store_id=index_store_id, topk_id=topk_id,
                            candidate_id=candidate_id)
 
 
-ATTENTION_BUILDERS = {"gqa": gqa, "mla": mla, "gdn": linear, "kda": linear,
-                      "projection_only": projection_only, "unmodeled": unmodeled}
+ATTENTION_BUILDERS = {
+    "gqa": gqa, "mla": mla, "gdn": linear, "kda": linear,
+    "mamba": linear, "gla": linear, "deltanet": linear,
+    "lightning": linear, "retnet": linear,
+    "projection_only": projection_only, "unmodeled": unmodeled,
+}

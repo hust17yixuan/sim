@@ -227,6 +227,7 @@ def _glm_hybrid_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                 recurrent_state_dtype="fp32",
                 conv_state_elements=conv_width * (conv_k - 1),
                 conv_state_dtype="bf16",
+                kda_gate_lower_bound=-5.0,
                 state_bytes=float(
                     kda_heads * kda_dim * kda_dim * 4
                     + conv_width * (conv_k - 1) * 2
@@ -280,6 +281,9 @@ def _aux_glm(c: Mapping[str, Any]) -> AuxiliarySpec:
     top_k = _int(c, "num_experts_per_tok")
     moe_i = _int(c, "moe_intermediate_size")
     shared = _int(c, "n_shared_experts")
+    kv_rank = int(c["kv_lora_rank"])
+    rope_dim = int(c["qk_rope_head_dim"])
+    hyper = bool(c.get("mhc"))
     mtp = DraftSpec(
         kind="mtp", layers=nextn, hidden_size=h, intermediate_size=moe_i,
         num_heads=int(c["num_attention_heads"]),
@@ -287,16 +291,20 @@ def _aux_glm(c: Mapping[str, Any]) -> AuxiliarySpec:
         head_dim=int(c.get("qk_head_dim", 256) or 256),
         q_width=int(c["num_attention_heads"]) * int(c.get("qk_head_dim", 256) or 256),
         kv_width=int(c.get("qk_head_dim", 256) or 256), attention_kind="mla",
+        kv_cache_elements=kv_rank + rope_dim,
         weight_category="mtp",
-        q_lora_rank=int(c["q_lora_rank"]), kv_lora_rank=int(c["kv_lora_rank"]),
+        q_lora_rank=int(c["q_lora_rank"]), kv_lora_rank=kv_rank,
         qk_nope_head_dim=int(c["qk_nope_head_dim"]),
-        qk_rope_head_dim=int(c["qk_rope_head_dim"]),
+        qk_rope_head_dim=rope_dim,
         v_head_dim=int(c["v_head_dim"]), num_experts=experts, top_k=top_k,
         expert_intermediate_size=moe_i, num_shared_experts=shared,
+        index_share_for_mtp_iteration=bool(c.get("index_share_for_mtp_iteration", False)),
         block_size=1, markov_rank=0, confidence_enabled=False,
         target_shared_embedding=True, target_shared_lm_head=True,
         base_logits=True, pp_capability=(1, 2, 4, 8, 16),
         vocab_size=int(c["vocab_size"]),
+        mhc_mult=_int(c, "hc_mult") if hyper else 0,
+        mhc_sinkhorn_iters=_int(c, "hc_sinkhorn_iters") if hyper else 0,
         source=merge_source({"kind": "glm_mtp"}),
         notes=("GLM body is 78 layers; MTP is one optional layer",),
     )

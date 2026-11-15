@@ -47,7 +47,13 @@ def test_full_frontend_fuses_only_gate_up_activation_quant_and_keeps_down(sample
     ordinary_down=[op for op in semantic if op.op_id.endswith('.expert_down')]
     assert len(source_down)==len(ordinary_down)==42
     for source,original in zip(source_down,ordinary_down):
-        assert replace(source,deps=original.deps)==original
+        def core(op, original=original):
+            meta = dict(op.metadata)
+            meta.pop("fused_origin_scopes", None)
+            meta.pop("input_conversion_subgraphs", None)
+            return replace(op, deps=original.deps,
+                           metadata=tuple(meta.items())).to_dict()
+        assert core(source) == core(original)
         assert len(source.deps)==1 and source.deps[0] in {op.op_id for op in fused}
     ids={op.op_id for op in ops}
     for op in fused:
@@ -150,3 +156,44 @@ def test_extra_materialization_cannot_disappear_inside_selected_three_node_progr
     copy=replace(members[0],op_id='additional_copy',family='copy',metadata=(),flops=0)
     with pytest.raises(ModelingError,match='requires_gate_up_SwiGLU_quantizer'):
         bind(declaration,[*members,copy],[members[-1].op_id],selection,{'l1_k':512})
+
+
+def test_mxfp8_swiglu_capability_registry_and_option_gates():
+    from mindie_sim.prediction.family_mxfp8_swiglu import bind, capabilities
+    from mindie_sim.schema.common import ModelingError
+    from mindie_sim.schema.operators import OpSpec
+
+    caps = capabilities()
+    assert caps["program_profile"] == PROFILE
+    assert caps["role"] == ROLE
+    assert caps["members"] == ("matmul", "swiglu", "quantize")
+    assert caps["scale_group_size"] == 32
+    assert set(caps["options"]) == {"l1_k", "compact"}
+
+    view = {
+        "input_dtype": "fp8_e4m3", "weight_dtype": "fp8_e4m3",
+        "output_dtype": "fp8_e4m3", "input_scale_dtype": "fp8_e8m0",
+        "output_scale_dtype": "fp8_e8m0", "weight_scale_group_size": 32,
+        "input_scale_group_size": 32, "output_scale_group_size": 32,
+        "intermediate_width": 64, "input_width": 64, "local_experts": 3,
+    }
+    def member(name, family, shape, deps):
+        return OpSpec(op_id=name, family=family, phase="decode", stage=0, layer=0,
+                      requests=(), semantic_shape=shape, local_shape=shape,
+                      padded_shape=shape, launch_shape=shape, deps=deps,
+                      recipe=name, dtype="bf16")
+    matrix = member("m", "grouped_gemm", (4, 128, 64), ())
+    matrix = replace(matrix, metadata=(
+        ("program_kind", "matmul"), ("matrix_group_rows", (1, 2, 1)),
+        ("weight_representation", "fp8_block1x32_fp8_e8m0")))
+    activation = member("a", "swiglu", (4, 64), ("m",))
+    quant = member("q", "quantize", (4, 64), ("a",))
+    declaration = {"key": "f", "role": ROLE, "implementation": "declared_native_fusion",
+                   "tensor_view": view}
+    class _Selection:
+        name = "declared_native_fusion"
+    with pytest.raises(ModelingError, match="explicit_l1_k"):
+        bind(declaration, (matrix, activation, quant), {"q"}, _Selection(), {"l1_k": 100})
+    with pytest.raises(ModelingError, match="compact_must_be_boolean"):
+        bind(declaration, (matrix, activation, quant), {"q"}, _Selection(),
+             {"l1_k": 512, "compact": 1})

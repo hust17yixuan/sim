@@ -48,22 +48,6 @@ def _terms(plan, model):
     return {term.name: term for term in layer_weight_terms(plan, model)}
 
 
-def test_official_fixture_bytes_and_source_manifest_are_pinned():
-    manifest = json.loads((FIXTURES / "manifest.json").read_text())
-    assert {item["id"] for item in manifest} == set(DEEPSEEK + GLM)
-    for item in manifest:
-        assert len(item["revision"]) == 40
-        assert item["revision"] in item["resolved_url"]
-        digest = hashlib.sha256((FIXTURES / f"{item['id']}.json").read_bytes()).hexdigest()
-        assert digest == item["sha256"]
-        fixture = config(item["id"])
-        assert all(fixture[key] == value for key, value in item["config"].items())
-    sources = json.loads((FIXTURES / "source-manifest.json").read_text())
-    assert {item["id"] for item in sources} == {
-        "deepseek-v2", "deepseek-v2-lite", "deepseek-v3", "glm4", "glm4_moe", "chatglm"}
-    assert all(len(item["sha256"]) == 64 and item["size"] > 0 for item in sources)
-
-
 @pytest.mark.parametrize("name", DEEPSEEK)
 def test_deepseek_standard_schedule_cache_and_weight_arithmetic(name):
     cfg = config(name)

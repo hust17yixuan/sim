@@ -22,7 +22,7 @@ from .deepep import (deepep_exchange_factor, resolve_exchange_options,
                      split_deepep_dispatch_overlap, split_deepep_down_overlap,
                      split_deepep_up_overlap)
 from .moe_callers import RoutingPolicy, local_expert_reduce_recipe, tp_join_reduce
-from . import moe_transport, moe_token_partition
+from . import deepep, moe_transport, moe_token_partition
 
 
 def _latent_norm(prefix, source, stage, plan, requests, tokens, latent, model, mode):
@@ -85,7 +85,8 @@ def dense(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mode,
 def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mode,
         global_tokens=None, routing=RoutingPolicy(), routing_realization=None,
         overlap_shared=False, runtime=None, reduce_after_join=False, sequence_plan=None,
-        caller=None, sp_tokens=None, **_):
+        caller=None, sp_tokens=None, features=None,
+        source_rows_by_replica=None, destination_rows_by_rank=None, **_):
     pre_sp_tokens = tokens
     if sp_tokens is not None:
         tokens = sp_tokens
@@ -185,7 +186,7 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
             prefix=prefix, input_id=deps, logits_id=router.op_id, width=hidden,
             experts=plan.num_experts, stage=stage, layer=plan.index,
             requests=requests, phase=mode, dtype=model.activation_dtype,
-            logits_dtype=weight_dtype)
+            logits_dtype=token_partition.logits_dtype or weight_dtype)
         routed_input, logits_input = (op.op_id for op in partition_views[-2:])
         tokens = token_partition.local_rows
     exchange_options = resolve_exchange_options(runtime, transport, layer_scope=plan.scope)
@@ -195,10 +196,28 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         dtype_bytes_val=(transport.element_bytes(latent) if transport is not None
                          else dtype_bytes(model.activation_dtype)))
     source_traffic = (routing_realization if getattr(routing_realization, "basis", "")
-                      == "source_force_eplb_masked_integer_counts" else
+                      in {"source_force_eplb_masked_integer_counts",
+                          "explicit_token_routing_integer"} else
                       token_partition.expected_traffic(plan.top_k)
                       if token_partition and token_partition.allocated_rows != full_tokens else None)
-    payload_tokens = tokens if source_traffic is None else source_traffic.valid_local_tokens
+    if (sequence_plan is not None
+            and sum(sequence_plan.valid_per_tp) == 0):
+        # This representative owns physical TP/EP participants but no valid
+        # source row.  Keep their control/dummy participation; suppress only
+        # the payload cell in the ordinary source ledger.
+        issued_source_rows = 0
+    elif token_partition is not None:
+        # An explicit TP caller owns this slice's actual outgoing rows.
+        issued_source_rows = token_partition.valid_per_rank[0]
+    elif source_traffic is not None:
+        # A source-mask / exact token ledger owns its valid outgoing rows.
+        issued_source_rows = source_traffic.valid_local_tokens
+    else:
+        # Ordinary balanced and probability plans route the physical graph
+        # rows, including full-capture padding.  ``valid_local_tokens`` is a
+        # separate logical-valid statistic and must not shrink that plan.
+        issued_source_rows = tokens
+    payload_tokens = issued_source_rows
     hash_table = plan.router_mode == "hash"
     hash_native = plan.router_mode in {"hash", "sqrtsoftplus"}
     select = vector_op(
@@ -278,7 +297,12 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
     transport_rows = None
     transport_histogram_gather = None
     if transport is not None:
-        transport_rows = moe_transport.source_rows(tokens, plan.top_k, partitions)
+        # Count/quantize the same valid source rows the pack and explicit peer
+        # ledger use.  ``tokens`` may be a graph bucket while an exact route
+        # owns fewer valid source rows; reusing the bucket multiplies both
+        # histogram and FP32/INT8 scale work without any routed payload.
+        transport_rows = moe_transport.source_rows(
+            payload_tokens, plan.top_k, partitions)
         transport_ops, transport_histogram_gather = moe_transport.histogram(
             prefix=prefix, plan=plan, stage=stage, requests=requests,
             rows=transport_rows, ep=parallel.ep, deps=deps,
@@ -334,6 +358,8 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
     last = packing.op_id
     transport_scale = transport_payload = transport_quantized = None
     dispatch_overlap_id = None
+    dispatch_source = None
+    gate_row_cut = None
     if transport is not None:
         transport_quantized = moe_transport.quantize(
             prefix=prefix, plan=plan, stage=stage, requests=requests,
@@ -352,8 +378,10 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
                 exchange_op = scale_exchange_operator(
                     exchange_op, exchange_factor * exchange_options["eplb"],
                     exchange_options, ep=parallel.ep, top_k=plan.top_k)
+                transport_cut = deepep.overlap_row_cut(
+                    exchange_op.local_shape[0], exchange_options["overlap"])
                 split_ops, dispatch_overlap_id = split_deepep_dispatch_overlap(
-                    exchange_op, exchange_options)
+                    exchange_op, exchange_options, row_cut=transport_cut)
                 ops.extend(split_ops)
             else:
                 ops.append(exchange_op)
@@ -375,7 +403,13 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
     if pack_quant is not None:
         ops.append(pack_quant)
         last = pack_quant.op_id
-    ep_scale = tokens * plan.top_k * (parallel.ep - 1) / parallel.ep / source_partitions
+    # A declared source assignment is partitioned across its physical source
+    # ranks for every routing path.  The old implicit min(tp, ep) special case
+    # charged each replica the full assignment, multiplying the per-source
+    # egress by the partition count.  The partition is the exact participant
+    # count; no coefficient or operator special case.
+    exchange_partitions = source_partitions
+    ep_scale = tokens * plan.top_k * (parallel.ep - 1) / parallel.ep / exchange_partitions
     dispatch_exchange_bytes, combine_exchange_bytes = ep_scale * dispatch_row_bytes, ep_scale * combine_row_bytes
     collective_meta = (("group_axis", "ep"), ("steps", max(0, parallel.ep - 1)),
                        ("source_assignment_partitions", source_partitions),
@@ -389,6 +423,9 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
                     traffic_model=source_traffic.basis, source_token_mask=source_traffic.to_dict())
         return replace(op, family="alltoallv", link_bytes=sum(map(sum, matrix)) / parallel.ep,
                        metadata=tuple(meta.items()))
+    if local_rows and exchange_options["overlap"] > 0.0:
+        gate_row_cut = deepep.overlap_row_cut(
+            max(0, int(math.ceil(local_rows))), exchange_options["overlap"])
     if parallel.ep > 1 and transport is None and exchange:
         dispatch = comm_op(
             op_id=prefix + ".dispatch", deps=(last,), stage=stage, layer=plan.index,
@@ -400,8 +437,17 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         dispatch = scale_exchange_operator(
             dispatch, exchange_factor * exchange_options["eplb"],
             exchange_options, ep=parallel.ep, top_k=plan.top_k)
+        # The receive allocation is a concrete value of this collective: the
+        # row views below alias it instead of searching an ancestry for dtype.
+        dispatch = deepep.declare_received_value(
+            dispatch, dtype=model.activation_dtype,
+            shape=(int(dispatch.local_shape[0]), latent),
+            row_bytes=latent * dtype_bytes(model.activation_dtype),
+            storage=f"moe.rx:{prefix}.dispatch",
+            binding="static", binding_name=f"{prefix}.dispatch.rx")
+        dispatch_source = deepep.received_value_contract(dispatch)
         split_ops, dispatch_overlap_id = split_deepep_dispatch_overlap(
-            dispatch, exchange_options)
+            dispatch, exchange_options, row_cut=gate_row_cut)
         ops.extend(split_ops)
         last = split_ops[0].op_id
     if local_rows:
@@ -450,9 +496,21 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
                 epilogue["row_scale_bytes"] *= fraction
                 epilogue["operations_per_output"] *= fraction
                 metadata["matrix_epilogue"] = epilogue
+            capacity = dict(routing_metadata).get("matrix_capacity_rows")
+            if isinstance(capacity, int) and capacity > local_rows:
+                # The native eager allocation is larger than the activated
+                # group-list rows. Keep active matrix_m in local_shape and the
+                # allocation in padded/capacity geometry; the matrix work above
+                # is charged only on the activated rows.
+                metadata["matrix_input_capacity_shape"] = (capacity, k)
+                metadata["matrix_output_capacity_shape"] = (capacity, n)
+                padded_shape = (capacity, *op.padded_shape[1:])
+            else:
+                padded_shape = op.padded_shape
             return replace(op, flops=2 * local_rows * n * k, hbm_bytes=read + write,
                            vector_ops=op.vector_ops * fraction,
                            mte2_bytes=read, mte3_bytes=write,
+                           padded_shape=padded_shape,
                            recipe=("balanced_" + op.recipe) if balanced else op.recipe,
                            metadata=tuple(metadata.items()) + routing_metadata)
         gate = routed_work(gate, 2 * expert_width, latent, gate_weight)
@@ -506,15 +564,53 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
                 ("moe_transport_dispatch_dtype", transport.dispatch_dtype),
             ))
         allow_up_split = not bool((getattr(runtime, "kernels", None) or {}).get("lowerings"))
+        activation_rows = (
+            token_partition.activation_tensor_rows
+            if token_partition is not None and token_partition.activation_tensor_rows
+            else (local_rows if caller is None else caller.activation_rows()))
         gate_ops, gate_last = split_deepep_up_overlap(
             gate, exchange_options, dispatch_overlap_id=dispatch_overlap_id,
-            allow_split=allow_up_split)
-        activation_rows = local_rows if caller is None else caller.activation_rows()
+            allow_split=allow_up_split, active_rows=activation_rows,
+            source_contract=dispatch_source,
+            row_cut=gate_row_cut, activation_id=prefix + ".expert_act")
+        gate_segments = tuple(op for op in gate_ops if op.family == "grouped_gemm")
         activation = gated_activation(
             plan=plan, rows=activation_rows, width=expert_width,
-            op_id=prefix + ".expert_act", deps=(gate_last,), stage=stage,
-            requests=requests, dtype=model.activation_dtype, phase=mode, recipe="grouped_swiglu",
+            op_id=prefix + ".expert_act",
+            deps=tuple(op.op_id for op in gate_segments) or (gate_last,),
+            stage=stage, requests=requests, dtype=model.activation_dtype,
+            phase=mode, recipe="grouped_swiglu",
         )
+        if gate_segments:
+            activation = replace(activation, metadata=activation.metadata + (
+                ("memory_accesses", tuple({
+                    "producer": op.op_id,
+                    "output": dict(op.metadata).get("primary_output") or "output",
+                    "direction": "read", "position": "local",
+                    "storage": f"moe.act:{op.op_id}",
+                    "bytes": float(int(op.local_shape[0]) * int(op.local_shape[1])
+                                   * dtype_bytes(dict(op.metadata).get("output_format") or "bf16")),
+                    "span": ((0, int(op.local_shape[0])),),
+                    "last_use": prefix + ".expert_down",
+                    "purpose": "gate_output_rows",
+                } for op in gate_segments)),))
+            segment_meta = tuple(
+                (op.op_id, dict(op.metadata).get("deepep_physical_row_start"),
+                 dict(op.metadata).get("deepep_physical_row_stop"),
+                 int(op.local_shape[0]), int(op.local_shape[1]))
+                for op in gate_segments)
+            activation = replace(activation, metadata=activation.metadata + (
+                ("activation_input_segments", segment_meta),
+                ("activation_input_bytes", sum(
+                    int(op.local_shape[0]) * int(op.local_shape[1])
+                    * dtype_bytes(dict(op.metadata).get("output_format") or "bf16")
+                    for op in gate_segments)),
+            ))
+        if token_partition is not None and token_partition.activation_owners:
+            activation = replace(activation, metadata=activation.metadata + (
+                ("activation_owners", token_partition.activation_owners),
+                ("activation_tensor_rows", activation_rows),
+                ("activation_capacity_basis", "declared_unmasked_tensor_capacity")))
         if caller is not None:
             activation = caller.tag_activation(activation, local_rows)
         ops.extend((*gate_ops, activation, down))
@@ -623,7 +719,8 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
             dep for dep in (down_mid_id, dispatch_overlap_id) if dep
         ))
         combine_ops, last = split_deepep_combine_overlap(
-            combine, exchange_options, overlap_deps=overlap_deps, main_deps=(last,))
+            combine, exchange_options, overlap_deps=overlap_deps,
+            main_deps=(last,), dispatch_overlap_id=dispatch_overlap_id)
         ops.extend(combine_ops)
     unpack_inputs = tuple(dict.fromkeys(
         (last, packing.op_id) + ((weights_producer,) if weights_producer is not None else ())))
@@ -744,11 +841,19 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         ops.append(reduction)
         last = reduction.op_id
     from .mc2_graph import lower as lower_native_mc2
+    destination_rows = (
+        tuple(int(value) for value in routing_realization.rank_assignment_rows)
+        if routing_realization is not None
+        and getattr(routing_realization, "rank_assignment_rows", None) is not None
+        else None)
     ops = lower_native_mc2(
         ops, runtime=runtime, prefix=prefix, tokens=routed_tokens, top_k=plan.top_k,
         width=latent, experts=plan.num_experts, ep=parallel.ep,
         source_partitions=partitions, received_assignments=local_rows,
-        dtype=model.activation_dtype, source_routing=source_traffic)
+        dtype=model.activation_dtype, source_routing=source_traffic,
+        valid_tokens=payload_tokens, features=features,
+        source_rows_by_replica=source_rows_by_replica,
+        destination_rows_by_rank=destination_rows)
     return ops, last
 
 

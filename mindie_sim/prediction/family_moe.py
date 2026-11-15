@@ -32,6 +32,13 @@ _WEIGHT_DTYPES = {
     "fp16": "fp16", "float16": "fp16",
     "fp32": "fp32", "float32": "fp32",
 }
+# Basis is provenance for the same explicit id list. Declared histograms,
+# explicit performance controls and exact token routes all keep identities;
+# probability moments never enter this adapter.
+_EXPLICIT_ROUTING_BASES = frozenset({
+    "declared_integer_counts", "forced_balanced_integer_counts",
+    "explicit_token_routing_integer",
+})
 
 
 def recipes():
@@ -52,7 +59,7 @@ def _source(call, params):
 
 
 def _routing(metadata):
-    if metadata.get("routing_basis") != "declared_integer_counts":
+    if metadata.get("routing_basis") not in _EXPLICIT_ROUTING_BASES:
         return None
     raw = metadata.get("routing_realization")
     return dict(raw) if isinstance(raw, Mapping) else None
@@ -116,7 +123,8 @@ def _lower_align(op, *, block_size=None, pad_sorted_ids=False,
         deps=(producer,), semantic_shape=(tokens, top_k),
         dtype="int32", layout="flat",
         metadata=(
-            ("routing_basis", "declared_integer_counts"),
+            ("routing_basis", str(realization.get(
+                "basis", "declared_integer_counts"))),
             ("routing_realization", realization),
             ("topk_ids_producer", producer),
         ),
@@ -181,7 +189,8 @@ def _materialize_expert_grouped(op, metadata, realization, *, producer, weights)
     input_rows = metadata.get("input_rows")
     if type(input_rows) is not int or input_rows < 0:
         raise ModelingError("moe_combine_requires_declared_expert_grouped_input_rows")
-    expert_rows = tuple(realization.get("expert_rows", ()))
+    expert_rows = tuple(realization.get(
+        "local_expert_rows", realization.get("expert_rows", ())))
     if sum(expert_rows) != input_rows:
         raise ModelingError(
             "moe_combine_expert_rows_must_match_expert_grouped_input_rows")

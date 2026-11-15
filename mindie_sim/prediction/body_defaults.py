@@ -127,14 +127,13 @@ def effective_body_declaration(case, phase, *, tokens=1, scope="body", enabled=T
         # Compression must not enable the opt-in mapping search. Keep the
         # original 128x128 output-owner grid. K64 is a capacity alternative
         # when two FP32 K128 operand buffers do not fit a declared L0 pool.
-        programs["matmul"] = {"kind": "steady_matmul",
-                              "candidates": [[128, 128, 128], [128, 128, 64]]}
+        programs["matmul"] = _steady_matmul_default(candidates=True)
         # Grouped matrices already had a mapped Steady fallback before the
         # body default. Do not narrow their independent expert-bank domain.
         families = case.runtime.kernels.setdefault("families", {})
         grouped_explicit = "grouped_gemm" in families
         if not grouped_explicit:
-            families["grouped_gemm"] = {"kind": "steady_matmul"}
+            families["grouped_gemm"] = _steady_matmul_default()
         selection["selections"].append({
             "family": "grouped_gemm",
             "selection": "preserved" if grouped_explicit else "default_installed",
@@ -152,6 +151,42 @@ def effective_body_declaration(case, phase, *, tokens=1, scope="body", enabled=T
         "contention": "coupled_fluid_approximation_with_finite_owner_buffers",
     })
     return case, selection
+
+
+def _steady_matmul_default(*, candidates=False):
+    """The compact finite-K matrix program, including symmetric owner cohorts.
+
+    The grouped-matrix family keeps its own unconstrained candidate domain; only
+    the dense ``matmul`` program declares the two 128-output-grid candidates.
+    """
+    program = {"kind": "steady_matmul", "owner_cohorts": True}
+    if candidates:
+        program["candidates"] = [[128, 128, 128], [128, 128, 64]]
+    return program
+
+
+def service_program_defaults(case):
+    """Install the omitted physical programs of one serving step.
+
+    A serving step declares the same operators as the body entry; only the
+    request scheduler, cache and delivery boundaries differ.  This supplies the
+    same default matrix program/family so the step lowers each declared
+    operator through the compact finite-K pipeline instead of the detailed
+    per-tile reference.  It never selects attention, scheduling, cache,
+    submission or service-regime policy, and an explicit caller declaration is
+    preserved verbatim.  The case is returned unchanged (a new runtime dict is
+    built) when an install is required, so the caller's input is not mutated.
+    """
+    kernels = case.runtime.kernels
+    if "matmul" in (kernels.get("programs") or {}):
+        return case
+    programs = {**kernels.get("programs", {}),
+                "matmul": _steady_matmul_default(candidates=True)}
+    families = dict(kernels.get("families", {}))
+    families.setdefault("grouped_gemm", _steady_matmul_default())
+    return replace(case, runtime=replace(
+        case.runtime, kernels={**kernels, "programs": programs,
+                               "families": families}))
 
 
 def consume_target_declaration(case, target):
@@ -324,14 +359,18 @@ def _kda_default(case, phase, tokens, kernels):
                            and name[len("recurrent_scan"):].isdigit() for name in recipes)
     raw_bf16 = (case.model.quant.weight_format == "bf16"
                 and "moe_dispatch_quantization" not in dict(case.runtime.metadata))
+    # A5 Kimi K3 decode is an actual native KDA source call even when the
+    # frontend declaration is raw BF16.  Keep raw BF16 as an explicit-generic
+    # guard for non-A5 / foreign KDA domains only.
+    native_a5 = case.machine.arch_family == "A5"
+    raw_bf16_generic = raw_bf16 and not native_a5
     explicit = ("kda" in kernels.get("lowerings", {}) or
                 bool({"short_convolution", "recurrent_vector", "recurrent_scan"}
                      & kernels.get("families", {}).keys()) or
                 bool({"delta_gates", "short_convolution", "qk_l2norm", "recurrent_scan"}
                      & recipes.keys()) or per_request_scan or
                 "recurrent_vector" in kernels.get("programs", {}) or
-                bool(kernels.get("service_regimes")) or
-                bool(case.runtime.tensor_layouts) or raw_bf16)
+                bool(case.runtime.tensor_layouts) or raw_bf16_generic)
     pipes = {"hbm", "vector", "mte2_aiv", "mte3"}
     reason = ("explicit_implementation_preserved" if explicit else
               "partitioned_kda_caller_domain" if phase != "decode" and parallel.pcp != 1 else
@@ -354,7 +393,23 @@ def _kda_default(case, phase, tokens, kernels):
     if not reason:
         impl = ("vllm_ascend_recurrent_kda_arch35" if case.machine.arch_family == "A5"
                 else "vllm_ascend_recurrent_kda_arch22")
-        kernels.setdefault("lowerings", {})["kda"] = impl
+        options = {}
+        if case.machine.arch_family == "A5":
+            from .kda_source import resolve as resolve_kda_source
+            bounds = {getattr(p, "kda_gate_lower_bound", None) for p in layers}
+            if len(bounds) != 1:
+                reason = "kda_gate_lower_bound_not_uniform_across_layers"
+            elif phase != "decode":
+                reason = "kda_source_decode_only"
+            else:
+                options = resolve_kda_source(
+                    layers[0], arch=case.machine.arch_family, phase=phase,
+                    kernels=kernels, activation_dtype=case.model.activation_dtype)
+                if options is None:
+                    reason = "kda_source_explicit_override_or_gate_invalid"
+        if not reason:
+            kernels.setdefault("lowerings", {})["kda"] = {
+                "implementation": impl, "options": options}
     return {"family": "kda_decode", "selection": "preserved" if reason else "default_installed",
             "reason": reason or "supported_tensor_and_resource_geometry"}
 
@@ -364,26 +419,23 @@ def _attnres_default(case, phase, kernels):
                   if p.residual_block_size), 0)
     if block < 1:
         return None
-    raw_bf16 = (case.model.quant.weight_format == "bf16"
-                and "moe_dispatch_quantization" not in dict(case.runtime.metadata))
     # Fusing the block would delete these independently declared member
-    # programs, so any explicit member choice keeps the unfused boundary.
+    # programs, so an explicit residual recipe/family keeps the unfused
+    # boundary.  Generic matmul/service declarations are not residual choices.
+    from . import family_attnres
     recipes = {"attn_res_fwd", "residual_values_fp32", "rmsnorm",
                "attention_residual_scores", "attention_residual_softmax",
                "attention_residual_mix", "attention_residual_output_cast"}
     families = {"gemm", "rmsnorm", "softmax", "elementwise", "cast"}
     explicit = ("attention_residual" in kernels.get("lowerings", {}) or
                 bool(recipes & kernels.get("recipes", {}).keys()) or
-                bool(families & kernels.get("families", {}).keys()) or
-                "matmul" in kernels.get("programs", {}) or
-                bool(kernels.get("service_regimes")) or raw_bf16)
+                bool(families & kernels.get("families", {}).keys()))
+    source_domain = (family_attnres.source_eligible(
+        case.model, case.machine.arch_family, phase)
+        and family_attnres.source_image_match(case.runtime))
     pipes = {"hbm", "vector", "mte2_aiv", "mte3"}
     reason = ("explicit_implementation_preserved" if explicit else
-              "decode_profile_only" if phase != "decode" else
-              "attnres_requires_bf16_uniform_blocks" if (
-                  case.model.activation_dtype != "bf16"
-                  or any(p.residual_block_size != block or p.engram or p.hyper_connections
-                         for p in case.model.layer_plans)) else
+              "attnres_source_image_or_domain_unsupported" if not source_domain else
               "attnres_independent_copy_pipes_not_declared" if any(
                   not pipes <= dict(d.rates).keys() or dict(d.buffers).get("ub", 0) <= 32768
                   for d in case.machine.dies) else "")
@@ -402,6 +454,7 @@ def attention_defaults(case, phase, *, tokens=1):
                       for d in case.machine.dies)
     parallel = case.runtime.parallel
     floating = {"bf16", "fp16", "fp32", "bfloat16", "float16", "float32"}
+    quantized_kv = {"int8", "fp8", "fp8_e4m3", "fp4", "fp4_e2m1"}
     gqa = [p for p in case.model.layer_plans if p.attention == "gqa"]
     indexed = [p for p in case.model.layer_plans if p.attention == "mla" and p.index_topk]
     dense_mla = [p for p in case.model.layer_plans if p.attention == "mla" and not p.index_topk
@@ -422,9 +475,13 @@ def attention_defaults(case, phase, *, tokens=1):
                   "independent_copy_pipes_not_declared" if not pipes else
                   "partitioned_attention_domain" if parallel.cp != 1 else "")
         if not reason and family == "gqa_decode":
-            if (case.model.activation_dtype not in floating or case.model.quant.kv_dtype not in floating
-                    or any(p.window or p.noncausal_attention for p in layers)):
-                reason = "windowed_noncausal_or_quantized_kv_domain"
+            if case.model.activation_dtype not in floating:
+                reason = "gqa_activation_precision_outside_fattention_domain"
+            elif (case.model.quant.kv_dtype not in floating
+                  and case.model.quant.kv_dtype not in quantized_kv):
+                reason = "gqa_kv_storage_outside_fattention_domain"
+            elif any(p.window or p.noncausal_attention for p in layers):
+                reason = "windowed_noncausal_gqa_domain"
             else:
                 tiles = _gqa_tiles(case, layers, tokens)
                 if tiles is None:
@@ -461,12 +518,10 @@ def attention_defaults(case, phase, *, tokens=1):
                     programs["indexed_attention"]["rope0_analytic"] = True
         records.append({"family": family, "selection": "preserved" if reason else "default_installed",
                         "reason": reason or "supported_tensor_and_resource_geometry"})
-    has_attention_regime = bool(kernels.get("service_regimes"))
     if dense_mla:
         from . import paged_mla, paged_mla_arch22
         explicit = ("attention" in kernels.get("families", {}) or "mla_attention" in recipes
-                    or any(k in lowerings for k in ("paged_mla_attention", "mla_decode"))
-                    or has_attention_regime)
+                    or any(k in lowerings for k in ("paged_mla_attention", "mla_decode")))
         is_a5 = case.machine.arch_family == "A5"
         valid_heads = ((lambda h: h > 0 and (1 << (h - 1).bit_length()) in {16, 32, 64})
                        if is_a5 else (lambda h: h > 0 and (1 << (h - 1).bit_length()) in {8, 16}))

@@ -65,6 +65,11 @@ def _kimi_plans(config: Mapping[str, Any]) -> list[LayerPlan]:
     qk_nope = int(_require(c, "qk_nope_head_dim"))
     rope = int(_require(c, "qk_rope_head_dim"))
     v_dim = int(c.get("v_head_dim", 128) or 128)
+    gate_lower_bound = linear.get("gate_lower_bound")
+    if gate_lower_bound is not None:
+        if isinstance(gate_lower_bound, bool) or not isinstance(gate_lower_bound, (int, float)):
+            raise ModelingError("model_config_kimi_gate_lower_bound_must_be_numeric")
+        gate_lower_bound = float(gate_lower_bound)
     kda_heads = int(linear.get("num_heads", 0) or 0)
     kda_dim = int(linear.get("head_dim", 0) or 0)
     conv_k = int(linear.get("short_conv_kernel_size", 4) or 4)
@@ -108,6 +113,7 @@ def _kimi_plans(config: Mapping[str, Any]) -> list[LayerPlan]:
                 conv_kernel=conv_k, conv_width=conv_width,
                 recurrent_state_elements=kda_heads * kda_dim * kda_dim,
                 recurrent_state_dtype="fp32",
+                kda_gate_lower_bound=gate_lower_bound,
                 conv_state_elements=conv_width * (conv_k - 1),
                 conv_state_dtype="bf16",
                 state_bytes=float(kda_heads * kda_dim * kda_dim * 4 + conv_width * (conv_k - 1) * 2),
@@ -123,6 +129,7 @@ def _kimi_plans(config: Mapping[str, Any]) -> list[LayerPlan]:
                 q_lora_rank=q_rank, kv_lora_rank=kv_rank,
                 qk_nope_head_dim=qk_nope, qk_rope_head_dim=rope, v_head_dim=v_dim,
                 mla_variant="latent_mla", mla_output_gate=bool(c.get("mla_use_output_gate", True)),
+                mla_qkv_a_gate_fused=True,
                 kv_cache_elements=kv_rank + rope,
                 intermediate_size=dense_i if ffn == "dense" else 0,
                 num_experts=experts if ffn == "moe" else 0,

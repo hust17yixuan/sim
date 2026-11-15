@@ -3,11 +3,14 @@
 [Role] Carry explicit source notify edges through ordinary topology routes.
 [Invariants] A local wait has no independent network delay. Each remote signal
   traverses each hop once after both endpoints are ready. Unknown frame bytes
-  stay zero, without skipping propagation or inventing a one-byte payload.
+  stay zero, without skipping propagation or inventing a one-byte payload. A
+  declared per-hop protocol startup is one gate for that hop, never a total
+  call duration and never a second propagation delay.
 [Timeouts & Locks] O(explicit notification edges) virtual tasks; no I/O or locks.
 [Side-Effect Policy] Submits events to the caller's Engine only.
 """
 from dataclasses import dataclass
+import math
 
 from mindie_sim.schema.common import ModelingError
 from .collectives import _ready_by_rank, _joint_complete
@@ -23,6 +26,16 @@ class SignalGroup:
     topology: object
     endpoints: tuple[tuple[int, int], ...]
     signal_bytes: int = 0
+    # Already-normalized T06 protocol startup for one hop.  The call is
+    # explicit because a zero-byte notify frame can still pay link startup.
+    hop_startup_us: float = 0.0
+
+    def __post_init__(self):
+        value = self.hop_startup_us
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(float(value)) or float(value) < 0):
+            raise ModelingError(
+                f'hccl_signal_hop_startup_invalid:{self.hop_startup_us}')
 
     def start_participants(self, engine, name, ready_by_rank, *, owner=''):
         initial = _ready_by_rank(self.ranks, ready_by_rank)
@@ -36,7 +49,14 @@ class SignalGroup:
             route = self.topology.route_message(MessageFlow(src, dst, self.signal_bytes))
             for hop_index, hop in enumerate(route.hops):
                 # RoutedHop.demand can share Tx/Rx and a switch capacity while
-                # wire accounting remains a single physical message.
+                # wire accounting remains a single physical message.  Startup
+                # is paid once at its own hop before that hop's service.
+                if self.hop_startup_us:
+                    prior = engine.submit(
+                        f'{prefix}:hop{hop_index}:startup', after=(prior,),
+                        latency=float(self.hop_startup_us) / 1000.0, owner=owner,
+                        metadata={'source_rank': src, 'destination_rank': dst,
+                                  'startup_boundary': 'per_hop_protocol_once'})
                 service = engine.submit(f'{prefix}:hop{hop_index}:service', hop.demand,
                                         after=(prior,), owner=owner, coupled=True)
                 prior = engine.submit(f'{prefix}:hop{hop_index}:arrival',
@@ -78,8 +98,13 @@ class RemoteNotify:
             raise ModelingError('hccl_remote_notify_requires_bound_topology')
         if any(value for role, value in context.native_work.items() if role != 'link'):
             raise ModelingError('hccl_remote_notify_requires_transport_only_work')
-        spec = dict(context.op.metadata)['hccl_remote_signal']
+        meta = dict(context.op.metadata)
+        spec = meta['hccl_remote_signal']
+        startup = spec.get('hop_startup_us')
+        if startup is None:
+            startup = meta.get('transport_hop_startup_us', meta.get('hop_startup_us', 0.0))
         groups = context.collective_plan().groups
         plan = SignalPlan(tuple(SignalGroup(g.ranks, g.topology,
-            tuple(map(tuple, spec['endpoints'])), spec.get('bytes') or 0) for g in groups))
+            tuple(map(tuple, spec['endpoints'])), spec.get('bytes') or 0,
+            hop_startup_us=startup or 0.0) for g in groups))
         return KernelProgram((Stage('notify', program=plan),), minimum_ms=context.minimum_ms)

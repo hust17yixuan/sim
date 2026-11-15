@@ -184,6 +184,7 @@ def _aux_qwen(c: Mapping[str, Any]) -> AuxiliarySpec:
         num_heads=heads, num_kv_heads=kv_heads, head_dim=head_dim,
         q_width=(2 if gate else 1) * heads * head_dim,
         kv_width=kv_heads * head_dim, attention_kind="gqa",
+        kv_cache_elements=2 * kv_heads * head_dim,
         weight_category="mtp", qk_norm=True, q_output_gate=gate,
         num_experts=experts, top_k=_int(c, "num_experts_per_tok") if experts else 0,
         expert_intermediate_size=moe_i,
@@ -192,6 +193,7 @@ def _aux_qwen(c: Mapping[str, Any]) -> AuxiliarySpec:
         target_shared_embedding=True, target_shared_lm_head=True,
         base_logits=True, pp_capability=(1, 2, 4, 8, 16),
         vocab_size=int(c["vocab_size"]),
+        mhc_mult=_int(c, "hc_count"),
         source=merge_source({"kind": "qwen_mtp"}),
         notes=("Qwen body excludes the optional MTP layer",),
     )

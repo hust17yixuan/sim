@@ -161,7 +161,10 @@ def test_source_mla_call_charges_two_kernels_and_never_the_logical_join():
     assert isolated["operator_sum_ms"] == pytest.approx(before["operator_sum_ms"] + 2)
     assert graph["parameters"]["invocation_models"][0]["invocations"] == 2
     assert sum(row["task"].endswith(":startup") for row in graph["events"]) == 2
-    assert graph["execution"]["serviced"] == plain["execution"]["serviced"]
+    # Startup adds host time only; device service is structurally identical
+    # and differs at most by float accumulation order.
+    assert graph["execution"]["serviced"] == pytest.approx(
+        plain["execution"]["serviced"], rel=1e-9, abs=1e-9)
     assert graph["execution"]["live_tasks"] == graph["execution"]["live_programs"] == 0
 
 

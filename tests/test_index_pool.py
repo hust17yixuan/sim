@@ -1,6 +1,7 @@
 """Causal pool conservation and real GLM q6/131201 tensor geometry controls."""
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,7 +10,17 @@ from mindie_sim.catalog.cache import index_selection_cost, layer_cache_component
 from mindie_sim.catalog.index_pool import pool_selection
 from mindie_sim.catalog.weights import layer_weight_terms
 from mindie_sim.catalog.weight_terms import term_bytes
+from mindie_sim.prediction import index_pool
+from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.execution import Execution
+from mindie_sim.prediction.execution_state import bind_op_accesses
+from mindie_sim.prediction.index_pool import _tail_state_accesses
+from mindie_sim.prediction.lowering import Builder
+from mindie_sim.prediction.offload import (OffloadPolicy, _accesses_from_ops,
+                                           _as_accesses, project_state_tiers)
 from mindie_sim.prediction.structure import parse_case
+from mindie_sim.schema.operators import IterationWork
+from mindie_sim.schema.workload import IterationPlan, RequestView
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +38,50 @@ def case():
 def layer(raw, batch=1, query=6, context=131201):
     return [op for op in target_graphs(raw, scope='body', phase='decode', tokens=query,
                                      context=context, sequences=batch)[0] if op.layer == 3]
+
+
+def _producer_builder(views, *, versions=None, owners=None, readers=None,
+                      last_uses=None, raw=None):
+    parsed = parse_case(raw if raw is not None else case())
+    plan = parsed.model.layer_plans[3]
+    builder = Builder("s0.l3", plan, 0, tuple(views), parsed.model, "decode")
+    index_pool.producer(
+        builder, source="hidden", views=tuple(views), plan=plan,
+        model=parsed.model, quant=builder.quant,
+        padded_tokens=sum(view.q_len for view in views),
+        state_versions=versions, state_owners=owners,
+        state_readers=readers, state_last_uses=last_uses)
+    tail = next(op for op in builder.ops
+                if op.op_id.endswith("index_pool_tail_store"))
+    return builder, tail
+
+
+def _producer(views, *, versions=None, owners=None, readers=None, last_uses=None):
+    return _producer_builder(
+        views, versions=versions, owners=owners, readers=readers,
+        last_uses=last_uses)[1]
+
+
+def _packed_raw():
+    raw = case()
+    raw["model"].setdefault("quant", {}).update(
+        index_dtype="fp8_e4m3", index_scale_dtype="fp16")
+    raw["model"].setdefault("metadata", {})["cache_representations"] = {
+        "index_k": {"dtype": "fp8_e4m3", "group_size": 32,
+                     "scale_dtype": "fp16"}}
+    return raw
+
+
+def _work(views, op):
+    return SimpleNamespace(
+        plan=IterationPlan(tuple(views), iteration=0), ops=(op,))
+
+
+def _offload_case():
+    raw = case()
+    raw["runtime"].setdefault("metadata", {})["offload"] = {
+        "kvc_ddr_ratio": 0.5, "kvc_ssd_ratio": 0.25}
+    return parse_case(raw)
 
 
 def test_pool_scan_and_expansion_match_independent_causal_sets():
@@ -155,3 +210,269 @@ def test_compact_and_detailed_sparse_pipelines_conserve_pool_tail_work_and_readi
         assert all(row['start_ms'] >= 7 for row in result['events'] if row['demand'])
         reports.append(result)
     assert reports[0]['execution']['serviced'] == pytest.approx(reports[1]['execution']['serviced'])
+
+
+def test_pool_tail_exposes_actual_state_access_volume_and_span():
+    raw = case()
+    ops = target_graphs(raw, scope='body', phase='decode', tokens=1,
+                        context=4, sequences=1)[0]
+    tail = next(op for op in ops if op.op_id.endswith('index_pool_tail_store'))
+    assert dict(tail.metadata)['retained_rows'] == 1
+    assert dict(tail.metadata)['index_width'] == 128
+    assert dict(tail.metadata)['write_bytes'] == 1024
+    accesses = _accesses_from_ops(type('Work', (), {'ops': (tail,), 'plan': None})())
+    assert len(accesses) == 1
+    access = accesses[0]
+    assert access.bytes == 1024
+    assert access.direction == "write"
+    assert access.output == access.storage == "index_pool_tail"
+    assert access.span == ((0, 1),)
+    assert access.occurrence == tail.op_id
+
+
+def test_pool_tail_exposes_per_request_state_accesses():
+    raw = case()
+    ops = target_graphs(raw, scope='body', phase='decode', tokens=1,
+                        context=4, sequences=2)[0]
+    tail = next(op for op in ops if op.op_id.endswith('index_pool_tail_store'))
+    meta = dict(tail.metadata)
+    assert meta['state_access_total_bytes'] == 2048
+    assert len(meta['state_accesses']) == 2
+    assert [item['bytes'] for item in meta['state_accesses']] == [1024, 1024]
+    assert len({item['storage'] for item in meta['state_accesses']}) == 2
+    assert all(item['span'] == ((0, 1),) for item in meta['state_accesses'])
+    accesses = _as_accesses(meta['state_accesses'])
+    assert len(accesses) == 2
+    assert {access.bytes for access in accesses} == {1024}
+    assert {access.request for access in accesses} == {'analysis0:0', 'analysis0:1'}
+    assert all(access.direction == "write" and access.position == "tail"
+               for access in accesses)
+    assert {access.state_version for access in accesses} == {None}
+
+
+def test_tail_ring_spans_context_131201_and_consecutive_versions():
+    plan = SimpleNamespace(index_kpool=4)
+    view = SimpleNamespace(request_id="a", q_len=6, context=131201,
+                           query_ranges=(), state_version=7)
+    geometry = SimpleNamespace(retained_tail_rows=4)
+    accesses = _tail_state_accesses(
+        (view,), (geometry,), plan, 128, "s0.l3.index_pool_tail_store")
+    assert accesses[0]["bytes"] == 4096
+    assert accesses[0]["span"] == ((0, 4),)
+    assert accesses[0]["state_version"] == 7
+
+    views = (SimpleNamespace(request_id="a", q_len=1, context=4,
+                             query_ranges=(), state_version=7),
+             SimpleNamespace(request_id="b", q_len=1, context=5,
+                             query_ranges=(), state_version=8))
+    geometry = (SimpleNamespace(retained_tail_rows=1),
+                SimpleNamespace(retained_tail_rows=1))
+    accesses = _tail_state_accesses(views, geometry, plan, 128, "tail",
+                                    versions={"a": 7, "b": 8})
+    assert [item["bytes"] for item in accesses] == [1024, 1024]
+    assert [item["span"] for item in accesses] == [((0, 1),), ((1, 2),)]
+    assert [item["state_version"] for item in accesses] == [7, 8]
+
+    reversed_accesses = _tail_state_accesses(
+        tuple(reversed(views)), tuple(reversed(geometry)), plan, 128, "tail")
+    assert [item["request"] for item in reversed_accesses] == ["b", "a"]
+    assert [item["span"] for item in reversed_accesses] == [((1, 2),), ((0, 1),)]
+
+    uneven = (SimpleNamespace(request_id="a", q_len=1, context=4,
+                              query_ranges=(), state_version=7),
+              SimpleNamespace(request_id="b", q_len=2, context=4,
+                              query_ranges=(), state_version=8))
+    geometry = (SimpleNamespace(retained_tail_rows=1),
+                SimpleNamespace(retained_tail_rows=2))
+    accesses = _tail_state_accesses(uneven, geometry, plan, 128, "tail")
+    assert [item["bytes"] for item in accesses] == [1024, 2048]
+    assert [item["span"] for item in accesses] == [((0, 1),), ((0, 2),)]
+
+
+def test_pool_tail_actual_geometry_touches_only_four_ring_slots():
+    raw = case()
+    ops = target_graphs(raw, scope='body', phase='decode', tokens=6,
+                        context=131201, sequences=1)[0]
+    tail = next(op for op in ops if op.op_id.endswith('index_pool_tail_store'))
+    meta = dict(tail.metadata)
+    assert meta['state_access_total_bytes'] == 4096
+    assert meta['state_accesses'][0]['span'] == ((0, 4),)
+    assert meta['state_accesses'][0]['bytes'] == 4096
+
+
+def test_pool_tail_same_access_projects_tier_bytes_once():
+    raw = case()
+    ops = target_graphs(raw, scope='body', phase='decode', tokens=1,
+                        context=4, sequences=2)[0]
+    tail = next(op for op in ops if op.op_id.endswith('index_pool_tail_store'))
+    accesses = _as_accesses(dict(tail.metadata)['state_accesses'])
+    policy = OffloadPolicy(kvc_ddr_ratio=0.5, kvc_ssd_ratio=0.25)
+    records = project_state_tiers(accesses, policy, expected_bytes=2048)
+    assert len(records) == 2
+    assert sum(row["ddr_bytes"] for row in records) == 1024
+    assert sum(row["ssd_bytes"] for row in records) == 512
+    assert sum(row["hbm_bytes"] for row in records) == 1536
+    assert len({row["storage"] for row in records}) == 2
+
+
+def test_disjoint_query_ranges_union_physical_write_slots():
+    views = (RequestView("a", 2, 4, False, "decode",
+                         query_ranges=((0, 1), (2, 3))),)
+    tail = _producer(views, versions={"a": 7}, owners={"a": 3},
+                     readers={"a": "s0.l3.attention.read"},
+                     last_uses={"a": "s0.l3.attention.last_use"})
+    meta = dict(tail.metadata)
+    access = meta["state_accesses"][0]
+    assert access["span"] == ((0, 1), (2, 3))
+    assert access["bytes"] == 2048
+    assert access["storage"] == "index_pool_tail:s0.l3:a"
+    assert access["state_version"] == 7
+    assert access["rank"] == 3
+    assert access["grant"] == access["storage"]
+    assert access["reader"] == "s0.l3.attention.read"
+    assert access["last_use"] == "s0.l3.attention.last_use"
+    assert access["occurrence"].endswith(":a:v7")
+    assert meta["state_access_total_bytes"] == 2048
+    bound = bind_op_accesses(_work(views, tail), tail)
+    assert len(bound) == 1
+    projected, = project_state_tiers(
+        (bound[0].access,), OffloadPolicy(kvc_ddr_ratio=0.5,
+                                          kvc_ssd_ratio=0.25))
+    assert projected["span"] == ((0, 1), (2, 3))
+    assert (projected["ddr_bytes"], projected["ssd_bytes"],
+            projected["hbm_bytes"]) == (1024.0, 512.0, 1536.0)
+    # The same physical slot union is order-independent.
+    reversed_views = (RequestView("a", 2, 4, False, "decode",
+                                  query_ranges=((2, 3), (0, 1))),)
+    reversed_tail = _producer(reversed_views, versions={"a": 7})
+    assert dict(reversed_tail.metadata)["state_accesses"][0]["span"] == \
+        ((0, 1), (2, 3))
+
+
+def test_same_request_consecutive_materializations_keep_storage_and_versions():
+    views7 = (RequestView("a", 1, 4, False, "decode"),)
+    views8 = (RequestView("a", 1, 5, False, "decode"),)
+    tail7 = _producer(views7, versions={"a": 7})
+    tail8 = _producer(views8, versions={"a": 8})
+    first = dict(tail7.metadata)["state_accesses"][0]
+    second = dict(tail8.metadata)["state_accesses"][0]
+    assert first["storage"] == second["storage"] == "index_pool_tail:s0.l3:a"
+    assert first["producer"] == second["producer"] == tail7.op_id
+    assert first["span"] == ((0, 1),)
+    assert second["span"] == ((1, 2),)
+    assert first["state_version"] == 7 and second["state_version"] == 8
+    assert first["occurrence"] != second["occurrence"]
+    assert first["occurrence"].endswith(":a:v7")
+    assert second["occurrence"].endswith(":a:v8")
+    # Normal binding keeps both materializations on the same persistent
+    # storage as separate occurrences with their actual versions.
+    bound7 = bind_op_accesses(_work(views7, tail7), tail7)[0].access
+    bound8 = bind_op_accesses(_work(views8, tail8), tail8)[0].access
+    assert bound7.storage == bound8.storage
+    assert (bound7.span, bound7.state_version) == (((0, 1),), 7)
+    assert (bound8.span, bound8.state_version) == (((1, 2),), 8)
+    assert bound7.key != bound8.key
+
+
+def test_tail_ring_context3_wraps_to_disjoint_slot_union():
+    views = (RequestView("a", 2, 3, False, "decode"),)
+    tail = _producer(views)
+    access = dict(tail.metadata)["state_accesses"][0]
+    assert access["span"] == ((0, 1), (3, 4))
+    assert access["bytes"] == 2048
+
+
+def test_empty_tail_producer_has_zero_transfer():
+    assert _tail_state_accesses((), (), SimpleNamespace(index_kpool=4), 128,
+                                "s0.l3.index_pool_tail_store") == []
+    no_views = _producer(())
+    assert dict(no_views.metadata)["state_accesses"] == ()
+    assert dict(no_views.metadata)["state_access_total_bytes"] == 0
+
+
+def test_normal_execution_consumes_the_same_tail_access_once():
+    views = (RequestView("a", 1, 4, False, "decode"),
+             RequestView("b", 1, 4, False, "decode"))
+    tail = _producer(views, versions={"a": 7, "b": 8}, owners={"a": 0, "b": 1})
+    work = IterationWork(
+        ops=(tail,), plan=IterationPlan(views, iteration=0), stage_count=1,
+        valid_tokens=2, padded_tokens=2, graph_bucket=None, mode="decode",
+        recipe="test")
+    case_spec = _offload_case()
+    execution = Execution(case_spec, CostModel(case_spec),
+                          include_serving_io=False)
+    external = {dep: execution.engine.submit("ext:" + dep)
+                for dep in tail.deps}
+    step = execution.add(work, 0, 0.0, external_inputs=external)
+    execution.engine.advance(until=(step.completion,))
+    serviced = execution.engine.serviced
+    assert serviced["offload_ddr@r0:s0"] == pytest.approx(1024.0)
+    assert serviced["offload_ssd@r0:s0"] == pytest.approx(512.0)
+    # The fallback path shares the same issued-access registry; no second
+    # writeback is charged for the same occurrence/storage/version/span.
+    bound = bind_op_accesses(work, tail)
+    assert len(bound) == 2
+    projected = project_state_tiers(
+        tuple(item.access for item in bound),
+        OffloadPolicy(kvc_ddr_ratio=0.5, kvc_ssd_ratio=0.25),
+        expected_bytes=2048)
+    assert sum(row["ddr_bytes"] for row in projected) == 1024
+    assert sum(row["ssd_bytes"] for row in projected) == 512
+    assert sum(row["hbm_bytes"] for row in projected) == 1536
+    assert {row["storage"] for row in projected} == {
+        "index_pool_tail:s0.l3:a", "index_pool_tail:s0.l3:b"}
+    assert index_pool.state_accesses(tail) == tuple(dict(tail.metadata)["state_accesses"])
+
+
+def test_packed_parent_exposes_real_k_scale_and_fp32_tail_presence():
+    views = (RequestView("a", 1, 7, False, "decode"),)
+    builder, tail = _producer_builder(views, raw=_packed_raw())
+    store = next(op for op in builder.ops if op.op_id.endswith("index_store"))
+    parent = index_pool.packed_parent(store)
+    assert parent["parent_occurrence"] == store.op_id
+    assert parent["value"]["producer"] == "s0.l3.index_key_quantize"
+    assert parent["value"]["dtype"] == "fp8_e4m3"
+    assert parent["value"]["packed_elements"] == 1
+    assert parent["value"]["physical_row_bytes"] == 136
+    assert parent["value"]["data_row_bytes"] == 128
+    assert parent["value"]["presence"] is True
+    assert parent["value"]["materialization"] == "packed_cache_row"
+    assert parent["scale"]["producer"] == "s0.l3.index_key_quantize"
+    assert parent["scale"]["output"] == "index_scales"
+    assert parent["scale"]["dtype"] == "fp16"
+    assert parent["scale"]["shape"] == (1, 4)
+    assert parent["scale"]["count"] == 4
+    assert parent["scale"]["row_bytes"] == 8
+    assert parent["scale"]["row_offset"] == 128
+    assert parent["scale"]["presence"] is True
+    assert parent["scale"]["materialization"] == "native_scatter_scale_slot"
+    assert parent["row_materialization"] == "packed_k_plus_scale_suffix"
+    assert parent["tail"]["producer"] == tail.op_id
+    assert parent["tail"]["dtype"] == "fp32"
+    assert parent["tail"]["shape"] == (1, 2, 128)
+    assert parent["presence"] == {"value": True, "scale": True, "tail": True}
+    assert parent["native_scatter"]["parent"] == store.op_id
+    assert parent["native_scatter"]["scale"] == "s0.l3.index_key_quantize"
+    assert parent["alias"] == {"value": "s0.l3.index_key_quantize",
+                               "tail": tail.op_id,
+                               "scale": "s0.l3.index_key_quantize"}
+
+
+def test_bf16_packed_parent_states_absent_scale_without_fabricating_one():
+    views = (RequestView("a", 1, 4, False, "decode"),)
+    builder, tail = _producer_builder(views)
+    store = next(op for op in builder.ops if op.op_id.endswith("index_store"))
+    parent = index_pool.packed_parent(store)
+    assert parent["value"]["dtype"] == "bf16"
+    assert parent["value"]["packed_elements"] == 1
+    assert parent["value"]["materialization"] == "logical_value"
+    assert parent["scale"] == {
+        "producer": None, "output": None, "dtype": "none", "shape": (),
+        "count": 0, "row_bytes": 0, "row_offset": parent["value"]["data_row_bytes"],
+        "presence": False, "materialization": "absent"}
+    assert parent["row_materialization"] == "k_only"
+    assert parent["tail"]["presence"] is True
+    assert parent["presence"] == {"value": True, "scale": False, "tail": True}
+    assert parent["native_scatter"]["scale"] is None
+    assert "one packed K write otherwise" in \
+        parent["native_scatter"]["child_contract"]

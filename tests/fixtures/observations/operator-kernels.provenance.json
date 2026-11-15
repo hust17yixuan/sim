@@ -42,6 +42,6 @@
     4235,
     4237
   ],
-  "fixture_sha256": "7a7f1c7db8cc25cc454c9c6d881d2f8d6b359cc76442ef4fe1946e162118115e",
-  "selection": "Original header and selected native lines for shape, dtype, scale, recurrence, pipe-counter and layout checks. No fabricated rows."
+  "fixture_sha256": "5faa4d8f9ea4b00e6298c48872a1e854173c87b9fe0b05f9909c588d2c570e0b",
+  "selection": "Original header and selected native lines for shape, dtype, scale, recurrence, pipe-counter and layout checks; line endings normalized to LF. No fabricated rows."
 }

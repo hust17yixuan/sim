@@ -21,7 +21,19 @@ def _case(name):
 
 def _without_scope(value):
     if isinstance(value, dict):
-        return {key: _without_scope(item) for key, item in value.items() if key not in SCOPE_KEYS}
+        out = {}
+        for key, item in value.items():
+            if key in SCOPE_KEYS:
+                continue
+            if key == "fused_origin_scopes" and isinstance(item, (list, tuple)):
+                out[key] = [
+                    {k: _without_scope(v) for k, v in entry.items() if k not in {"block", "role"}}
+                    if isinstance(entry, dict) else _without_scope(entry)
+                    for entry in item
+                ]
+            else:
+                out[key] = _without_scope(item)
+        return out
     if isinstance(value, (list, tuple)):
         return [_without_scope(item) for item in value]
     return value

@@ -16,7 +16,7 @@ def test_one_successful_flag_check_prices_vector_and_exposes_unpriced_scalar(tok
     details = plan.metadata['source_service_details']
     assert details['scalar_instruction_counts']['scalar_sff_calls'] == tokens * (compared // 64)
     assert details['scalar_instruction_counts']['ub_uint64_mask_reads'] == tokens * (compared // 64)
-    assert details['additional_spin_polls'] == 'unmodeled'
+    assert details['additional_spin_polls'] == 'unknown; no universal count'
     # Independent low-rate serial initialize -> DMA -> compare oracle.
     assert elapsed == pytest.approx(((tokens + 63) // 64) * (2 * compared + top_k * 32) / 1000)
     own = [r for r in engine.trace if 'owner0:' in r['task']]
@@ -42,16 +42,18 @@ def test_width3584_successful_poll_and_payload_are_not_double_counted():
 def test_two_tokens_on_same_owner_keep_slot_and_accumulator_order():
     _, engine, _, _ = run_phase('weighted_reduce', kind='combine', tokens=3, top_k=3, units=2)
     def stage(suffix):
-        return next(r for r in engine.trace if r['task'].endswith(suffix))
+        alt = suffix.replace(":tokens:tile", ":tokens:program:tile")
+        return next(r for r in engine.trace
+                    if r['task'].endswith(suffix) or r['task'].endswith(alt))
     for token in (0,1):
         for slot in range(3):
-            read=stage(f'owner0:tokens:program:tile{token}:slot{slot}_read')
-            cast=stage(f'owner0:tokens:program:tile{token}:slot{slot}_cast')
-            acc=stage(f'owner0:tokens:program:tile{token}:slot{slot}_accumulate')
+            read=stage(f'owner0:tokens:tile{token}:slot{slot}_read')
+            cast=stage(f'owner0:tokens:tile{token}:slot{slot}_cast')
+            acc=stage(f'owner0:tokens:tile{token}:slot{slot}_accumulate')
             assert read['end_ms'] <= cast['start_ms'] <= acc['start_ms']
             if slot:
-                assert stage(f'owner0:tokens:program:tile{token}:slot{slot-1}_accumulate')['end_ms'] <= read['start_ms']
-    assert stage('owner0:tokens:program:tile0:slot2_accumulate')['end_ms'] <= stage('owner0:tokens:program:tile1:initialize_accumulator')['start_ms']
+                assert stage(f'owner0:tokens:tile{token}:slot{slot-1}_accumulate')['end_ms'] <= read['start_ms']
+    assert stage('owner0:tokens:tile0:slot2_accumulate')['end_ms'] <= stage('owner0:tokens:tile1:initialize_accumulator')['start_ms']
 
 
 def test_fractional_expected_output_retains_framed_work_and_no_extra_whole_token():

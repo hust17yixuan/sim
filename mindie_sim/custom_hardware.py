@@ -37,6 +37,7 @@ from typing import Any
 
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.compute_arch import ComputeArchSpec
 from mindie_sim.schema.hardware import Hardware
 
 
@@ -147,6 +148,12 @@ _FIELD_DOCS: dict[str, str] = {
     "inter_node_latency_us": "Per-hop inter-node fabric latency in microseconds.",
     "inter_pod_latency_us": "Per-hop inter-pod fabric latency in microseconds.",
     "launch_us": "Host submission service per ordinary kernel in microseconds.",
+    "capability": (
+        "Optional representation/native-compute/cast/path declaration, or a "
+        "mapping with an architecture preset. Omitted means the builder derives "
+        "only the native modes implied by the synthetic peaks; no data path is "
+        "invented."
+    ),
 }
 
 
@@ -241,6 +248,57 @@ def _rate_from(
     return fallback
 
 
+_FORMAT_BITS = {
+    "bf16": 16, "fp16": 16, "fp32": 32, "hf32": 32, "fp8": 8,
+    "fp8_e4m3": 8, "fp8_e5m2": 8, "int8": 8, "int4": 4,
+}
+
+
+def _neutral_capability(peaks: Mapping[str, Any]) -> dict[str, Any]:
+    """Declare exactly the synthetic native modes this template's peaks imply.
+
+    A neutral template is not a vendor SKU. It gets native modes for the
+    formats it already prices, plus payload representations; it gets no cast
+    rules, data paths or runtime implementations unless the caller declares
+    them explicitly.
+    """
+    representations: dict[str, Any] = {}
+    native_compute: dict[str, Any] = {}
+    def provenance() -> dict[str, Any]:
+        return {
+            "kind": "neutral_custom_template",
+            "basis": "synthetic rates declared by this template; no vendor SKU, "
+                     "measured capability or runtime implementation is implied",
+        }
+    needs_int_accumulator = False
+    for name in sorted(peaks):
+        bits = _FORMAT_BITS.get(name)
+        if bits is None:
+            raise ModelingError(f"custom_hardware_unknown_peak_format:{name}")
+        integer = name.startswith("int")
+        accumulator = "int32" if integer else "fp32"
+        needs_int_accumulator = needs_int_accumulator or integer
+        roles = ["storage", "transfer", "operand"]
+        if not integer:
+            roles.append("accumulator")
+        representations[name] = {
+            "bits": bits, "roles": roles,
+            "alignment_bytes": max(1, bits // 8),
+            "provenance": provenance(),
+        }
+        native_compute[f"{name}_x_{name}_acc_{accumulator}"] = {
+            "kind": "matrix", "operands": [name],
+            "accumulators": [accumulator], "unit": "cube",
+            "provenance": provenance(),
+        }
+    if needs_int_accumulator:
+        representations.setdefault("int32", {
+            "bits": 32, "roles": ["storage", "transfer", "accumulator"],
+            "alignment_bytes": 4, "provenance": provenance(),
+        })
+    return {"representations": representations, "native_compute": native_compute}
+
+
 def _validate_fields(merged: Mapping[str, Any], explicit: Mapping[str, Any]) -> None:
     for key in ("hbm_gb", "hbm_bw_gbps", "cube_fp16_tflops", "vector_fp32_tflops"):
         _positive_float(merged.get(key), key)
@@ -272,6 +330,12 @@ def _validate_fields(merged: Mapping[str, Any], explicit: Mapping[str, Any]) -> 
                                   or not math.isfinite(float(value))
                                   or float(value) < 0.0):
             raise ModelingError(f"custom_hardware_bandwidth_invalid:{key}:{value}")
+    capability = explicit.get("capability")
+    if capability is not None:
+        if not isinstance(capability, Mapping):
+            raise ModelingError("custom_hardware_capability_must_be_mapping")
+        ComputeArchSpec.from_mapping(dict(capability),
+                                     source="custom_hardware_capability")
 
 
 def _derived_device_fields(
@@ -424,6 +488,15 @@ def _device_mapping(
     merged: Mapping[str, Any], explicit: Mapping[str, Any],
 ) -> dict[str, Any]:
     derived = _derived_device_fields(merged, explicit)
+    capability = explicit.get("capability")
+    if capability is None:
+        capability = merged.get("capability")
+    if capability is None:
+        compute_arch = _neutral_capability(derived["compute_peaks"])
+    elif not isinstance(capability, Mapping):
+        raise ModelingError("custom_hardware_capability_must_be_mapping")
+    else:
+        compute_arch = dict(capability)
     aiv = int(merged["aiv_count"])
     aic = int(merged["aic_count"])
     buffers = {
@@ -446,6 +519,7 @@ def _device_mapping(
         "buffer_units": {"l2": 1, "l1": aic, "l0a": aic, "l0b": aic,
                          "l0c": aic, "ub": aiv},
         "launch_us": float(merged.get("launch_us", 0.0) or 0.0),
+        "compute_arch": compute_arch,
     }
 
 
@@ -507,6 +581,8 @@ def build_custom_hardware_machine(
                  "*_tflops is 10^12 FLOP/s; latencies are microseconds",
         "derived": "cube_fp8 defaults to twice cube_fp16; MTE supplies scale "
                    "with HBM when omitted",
+        "capability": "native modes cover exactly the synthetic peaks unless "
+                      "the caller supplies an explicit capability",
         "topology": "links are declared shared group capacities; equal-member "
                     "routing prefers intra-node before inter-node",
     }

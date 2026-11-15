@@ -179,26 +179,27 @@ def _assert_family(name: str, model, pipe) -> None:
     if name == "deepseek-v4.1-flash":
         assert plans[0].indexer and plans[0].cache_kind == "window_compressed"
         assert plans[1].kv_owner_layer_id == 0 and not plans[1].owns_long_kv
-        assert {"A2", "I0", "I1", "F3", "F4", "K1"} <= kinds
+        assert {"csa2_attention", "indexer_prolog", "lightning_indexer",
+                "routed_experts", "shared_experts", "kv_compressor"} <= kinds
     elif name == "glm-5.1":
         assert plans[0].attention == "mla" and plans[0].indexer and plans[0].ffn == "dense"
         assert plans[1].ffn == "moe" and plans[1].num_shared_experts >= 1 and plans[1].indexer
-        assert {"A1", "I0", "I1", "F3", "F4"} <= kinds
+        assert {"dsa_attention", "indexer_prolog", "lightning_indexer", "routed_experts", "shared_experts"} <= kinds
     elif name == "glm-5.3":
         assert plans[0].indexer and plans[1].indexer_type == "shared"
         assert plans[1].index_k_owner_layer_id == 0 and plans[1].ffn == "moe"
-        assert {"A1", "I0", "I1", "F3"} <= kinds
+        assert {"dsa_attention", "indexer_prolog", "lightning_indexer", "routed_experts"} <= kinds
     elif name == "kimi-k3":
         assert plans[0].attention == "kda" and plans[1].attention == "mla"
         assert all(plan.ffn == "moe" and plan.num_shared_experts >= 1 for plan in plans)
-        assert {"A1", "A4", "F3", "F4"} <= kinds
+        assert {"mla_attention", "kda_linear_attn", "routed_experts", "shared_experts"} <= kinds
     elif name.startswith("qwen3"):
         assert plans[0].attention == "gdn" and plans[1].attention == "gqa"
-        assert {"A0", "A3", "F0"} <= kinds
+        assert {"gqa_attention", "gdn_linear_attn", "mlp"} <= kinds
     else:
         assert plans[0].window == 128 and plans[1].window == 0
         assert plans[1].kv_owner_layer_id == 0 and plans[0].owns_long_kv
-        assert {"A0", "F3", "F4", "K0"} <= kinds
+        assert {"gqa_attention", "routed_experts", "shared_experts", "kv_cache"} <= kinds
 
 
 def _prefill(q_len: int, batch: int = 1, context: int = 16) -> WorkloadGeometry:
@@ -225,7 +226,24 @@ def test_l3_width_batch_and_context_are_monotonic():
             assert _ms(cache, build(512, 256, 32), supply, baseline) > body
         assert _ms(cache, small, supply, longer_q) > body
         assert _ms(cache, small, supply, wider_batch) > _ms(cache, small, supply, _prefill(32, context=0))
-        assert _ms(cache, small, supply, long_ctx) > _ms(cache, small, supply, short_ctx)
+        short_pred = pipe.forward(short_ctx)
+        long_pred = pipe.forward(long_ctx)
+        short_body = float(short_pred.total_ms)
+        long_body = float(long_pred.total_ms)
+
+        def attention_bytes(prediction) -> float:
+            return sum(
+                float(row.cost.pipe_work("hbm")) + float(row.cost.pipe_work("mte2"))
+                for row in prediction.rows
+                if row.cost.family in {"attention", "mla"}
+            )
+
+        # KV context is real work even when a sliding window/declared floor
+        # keeps elapsed time flat.  Assert the work identity separately.
+        assert attention_bytes(long_pred) > attention_bytes(short_pred)
+        # Elapsed time is monotonic; it may be flat when a declared floor or
+        # window masks the real work growth asserted above.
+        assert long_body >= short_body
 
 
 def test_l3_hbm_cores_and_pipes_speed_up_every_family():
@@ -280,13 +298,16 @@ def test_l4_cohort_batch_and_wave_conservation():
         phase="prefill", concurrency=4, dp=4, ep=1, layers=2, graph_buckets=(), prompt_tokens=9000,
     ) == 1.0
     assert service_ttft_overhead_ms(prompt_tokens=4096, tp=1, ep=1) == 0.0
-    assert service_ttft_overhead_ms(prompt_tokens=1024, tp=1, ep=1) == 35.0
-    assert service_ttft_overhead_ms(prompt_tokens=1024, tp=8, ep=2) == 145.0
-    assert service_ttft_overhead_ms(prompt_tokens=1024, tp=1, ep=2) == 95.0
-    assert service_ttft_overhead_ms(prompt_tokens=2048, tp=1, ep=1) == pytest.approx(35.0 * 0.45)
+    # Host time is declared, not synthesized from prompt/TP/EP.
     assert service_ttft_overhead_ms(
-        prompt_tokens=2048, tp=1, ep=2, short_ep_host_ms=80.0,
-    ) == pytest.approx(80.0 * 0.45)
+        prompt_tokens=1024, tp=1, ep=1, host_overhead_ms=35.0) == 35.0
+    assert service_ttft_overhead_ms(
+        prompt_tokens=1024, tp=8, ep=2, host_overhead_ms=145.0) == 145.0
+    assert service_ttft_overhead_ms(
+        prompt_tokens=2048, tp=1, ep=2, host_overhead_ms=95.0) == 95.0
+    assert service_ttft_overhead_ms(
+        prompt_tokens=4096, tp=8, ep=2, host_overhead_ms=35.0) == 35.0
+
     assert clamp_graph_bucket(0, 4, 2) == 0
     assert clamp_graph_bucket(3, 5, 1) == 0
     assert clamp_graph_bucket(32, 5, 1) == 32
@@ -302,24 +323,28 @@ def test_l4_cohort_batch_and_wave_conservation():
     prediction = pipe.forward(geometry)
     assert prediction.active.batch == local == 2
     assert prediction.active.cohort_batch == cohort == 8
-    expanded = geometry.for_subgraph("F3")
+    expanded = geometry.for_subgraph("routed_experts")
     assert expanded.batch == cohort and expanded.tokens == cohort
-    forwarded = next(item for item in prediction.layers[0].subgraphs if item.kind == "F3")
-    direct = pipe._subgraph(pipe.instantiated.find("F3", layer=0)).evaluate(geometry)
+    forwarded = next(item for item in prediction.layers[0].subgraphs if item.kind == "routed_experts")
+    direct = pipe._subgraph(pipe.instantiated.find("routed_experts", layer=0)).evaluate(geometry)
     assert forwarded.rows[0].cost.get("moe_rows") == direct.operators[0].get("moe_rows")
     body = float(prediction.total_ms)
     overhead = service_ttft_overhead_ms(prompt_tokens=1024, tp=1, ep=4)
-    waves = local
-    scale = chunked_prefill_mean_ttft_ms(
+    mean_ttft = chunked_prefill_mean_ttft_ms(
         [8192] * 8, dp=4, max_batched_tokens=8192, body_one=lambda tok: 1.0,
-    ) / waves
-    assert overhead == 95.0
-    assert scale * waves == pytest.approx((waves + 1) / 2.0)
-    assert body * scale + overhead > body
+    )
+    assert overhead == 0.0
+    # Four ranks each serve two one-chunk requests: finishes 1 and 2 bodies.
+    assert mean_ttft == pytest.approx(1.5)
+    assert body * mean_ttft + overhead > body
+    assert body * mean_ttft + service_ttft_overhead_ms(
+        prompt_tokens=1024, tp=1, ep=4, host_overhead_ms=12.5,
+    ) == pytest.approx(body * 1.5 + 12.5)
+
     ragged = WorkloadGeometry(
         (RequestGeometry(1, 15, phase="prefill"), RequestGeometry(3, 13, phase="prefill")),
         cohort_batch=4, phase="prefill",
     )
-    lifted = ragged.for_subgraph("F3")
+    lifted = ragged.for_subgraph("routed_experts")
     assert [request.q_len for request in lifted.requests] == [1, 3, 1, 3]
     assert lifted.cohort_batch == 4 and lifted.tokens == 8

@@ -3,11 +3,14 @@
 [Role]
   Read C7 summaries, Wave 5 benchmark records, and operator/kernel CSV exports
   into a compact observed-profile record without inventing missing values.
+  Replay declared response observations as diagnostics, never as predictions.
 
 [Invariants]
   * Unmeasured fields remain absent; zero is never substituted for ``None``.
   * CSV inputs are streamed in O(active steps) memory and capped at 2M rows.
   * Observed shares are normalized only over recognized canonical bound names.
+  * Observed records are marked diagnostic; replay returns measurements, not
+    fitted service parameters or residual corrections.
 
 [Timeouts & Locks]
   Bounded local reads; no network, subprocess, or locks.
@@ -191,7 +194,9 @@ def _extract_observed(data: Any, *, path: Path | None = None) -> dict[str, Any]:
         nested = dict(data.get("runtime", {}).get("metadata") or {})
         existing = nested.get("observed_profile")
         if isinstance(existing, Mapping) and existing:
-            return dict(existing)
+            return {**dict(existing),
+                    "observation_role": existing.get(
+                        "observation_role", "diagnostic_observed_replay")}
         view = {key: value for key, value in data.items()
                 if key not in {"machine", "model", "workload", "runtime", "slo"}
                 and not str(key).startswith("_")}
@@ -357,7 +362,86 @@ def _extract_observed(data: Any, *, path: Path | None = None) -> dict[str, Any]:
         }
         for key in observed
     )
-    return observed if (has_metric or shares or dominant) else {}
+    if has_metric or shares or dominant:
+        observed["observation_role"] = "diagnostic_observed_replay"
+        return observed
+    return {}
 
 
-__all__ = ["_extract_observed", "_observed_from_csv_files", "_shares_from_operator_rows"]
+REPLAY_SCHEMA = "mindie-sim.regime-observation-replay/1"
+_REPLAY_FIELDS = frozenset({"rule_id", "duration_us", "coordinates", "source",
+                            "run_id", "repeat_index", "split", "boundary", "hardware"})
+
+
+def replay_regime_observations(declarations, observations):
+    """Replay explicit measured durations under their declared rule identity.
+
+    Returned values are observations, not predictions or fitted service
+    parameters. A declared response is shown beside an observation only when
+    every coordinate it consumes is present; no residual price or correction is
+    produced. This entry point is not wired into ``Execution`` or ``CostModel``.
+    """
+    from .prediction.response_functions import nonnegative
+    from .prediction.service_regimes import RegimePolicy
+    policy = RegimePolicy(declarations)
+    by_id = {raw["id"]: (raw, key) for raw, key in policy.rules}
+    if not isinstance(observations, (list, tuple)):
+        raise ModelingError("observed_replay_requires_sequence")
+    records = []
+    for observation in observations:
+        if not isinstance(observation, Mapping):
+            raise ModelingError("observed_replay_record_requires_mapping")
+        unknown = set(observation) - _REPLAY_FIELDS
+        if unknown:
+            raise ModelingError("observed_replay_record_unknown_fields:"
+                                + ",".join(sorted(unknown)))
+        rule_id = observation.get("rule_id")
+        if rule_id not in by_id:
+            raise ModelingError("observed_replay_unknown_regime_rule:" + str(rule_id))
+        raw, key = by_id[rule_id]
+        duration = nonnegative(observation.get("duration_us"))
+        source = observation.get("source")
+        if not isinstance(source, str) or not source.strip():
+            raise ModelingError("observed_replay_requires_source:" + str(rule_id))
+        declared = set(raw.get("coordinates") or {})
+        values = observation.get("coordinates") or {}
+        if not isinstance(values, Mapping):
+            raise ModelingError("observed_replay_coordinates_require_mapping")
+        if not set(values) <= declared:
+            raise ModelingError("observed_replay_coordinates_not_declared:"
+                                + ",".join(sorted(set(values) - declared)))
+        values = {name: nonnegative(value) for name, value in values.items()}
+        function = policy.responses[key]
+        missing = sorted(set(function.varying_coordinates) - set(values))
+        declared_us = declared_basis = None
+        unavailable = None
+        if missing:
+            unavailable = "coordinates_missing:" + ",".join(missing)
+        else:
+            try:
+                result = function.evaluate(
+                    values, rate_for=lambda supply: supply["reference_rate"])
+                declared_us, declared_basis = result.duration_us, result.basis
+            except (ModelingError, KeyError, TypeError) as exc:
+                unavailable = "declared_supply_not_evaluable:" + str(exc)
+        record = {"rule_id": rule_id, "observed_us": duration,
+                  "coordinates": dict(sorted(values.items())), "source": source,
+                  "run_id": observation.get("run_id"),
+                  "repeat_index": observation.get("repeat_index"),
+                  "split": observation.get("split"),
+                  "boundary": observation.get("boundary"),
+                  "hardware": observation.get("hardware"),
+                  "role": "diagnostic_observed_replay",
+                  "production_prediction_input": False,
+                  "declared_response_us": declared_us,
+                  "declared_response_basis": declared_basis}
+        if unavailable:
+            record["declared_response_unavailable"] = unavailable
+        records.append(record)
+    return {"schema": REPLAY_SCHEMA, "role": "diagnostic_observation_replay",
+            "production_prediction": False, "records": records}
+
+
+__all__ = ["_extract_observed", "_observed_from_csv_files",
+           "_shares_from_operator_rows", "replay_regime_observations",
+           "REPLAY_SCHEMA"]

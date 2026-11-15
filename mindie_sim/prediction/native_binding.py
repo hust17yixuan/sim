@@ -19,7 +19,9 @@ import json
 
 from mindie_sim.schema.common import ModelingError
 from .native_coverage import (
-    coverage_from_records, join_profiler_rows, native_call_coverage,
+    NativeAbiRegion, _attach_selection, _bound_state, bind_abi_call,
+    bind_selected_native_call, coverage_from_records, join_profiler_rows,
+    native_call_coverage, selection_delivery_for_op,
 )
 
 SCHEMA = "mindie-sim/native-call-binding/1"
@@ -295,16 +297,22 @@ class NativeCallBinding:
                 "source": self.source, "physical": self.physical,
                 "timing_owner": self.timing_owner}
 
+    @property
+    def bound(self) -> bool:
+        return _bound_state(
+            self.evidence, (self.source or {}).get("sha256"), self.typed, self.kernels)[0]
+
 
 def _kernel_evidence(kernels):
-    """Positive evidence count controls partial: zero resolved never binds."""
-    resolved = [row.get("evidence") for row in kernels
-                if row.get("evidence") in _POSITIVE_EVIDENCE]
-    if not resolved:
+    """Zero evidenced kernels stay unresolved; mixed or binary-only is partial."""
+    if not kernels:
         return "unresolved"
-    if len(resolved) < len(kernels):
-        return "partial"
-    return "established" if all(ev == "established" for ev in resolved) else "source_declared"
+    evidences = [row.get("evidence") for row in kernels]
+    if all(ev in (None, "", "unresolved") for ev in evidences):
+        return "unresolved"
+    if all(ev in _POSITIVE_EVIDENCE for ev in evidences):
+        return "established" if all(ev == "established" for ev in evidences) else "source_declared"
+    return "partial"
 
 
 def _evidence(api, source, kernels, core):
@@ -424,7 +432,7 @@ def bind_native_call(op, *, contract=None, implementation=None, children=(),
     owner = explicit.get("timing_owner")
     if not (isinstance(owner, dict) and owner.get("op_id")):
         owner = {"op_id": op.op_id, "scope": "call"}
-    return NativeCallBinding(
+    binding = NativeCallBinding(
         call_id=call_id, op_id=op.op_id, family=op.family, recipe=op.recipe,
         source_boundary=op.source_boundary, api=api, source=source, typed=typed,
         occurrence=occurrence, observed_aliases=observed_aliases, kernels=kernels,
@@ -432,6 +440,8 @@ def bind_native_call(op, *, contract=None, implementation=None, children=(),
         evidence=_evidence(api, source, kernels, core), unresolved=unresolved,
         physical=physical,
         non_claims=tuple(_jsonable(merged.get("non_claims") or self_non_claims())))
+    selection = selection_delivery_for_op(op)
+    return _attach_selection(binding, selection) if selection else binding
 
 
 def self_non_claims():
@@ -551,7 +561,9 @@ def member_physical_view(binding, plan, prepared=None):
     return replace(binding, physical=physical)
 
 
-__all__ = ("SCHEMA", "PROVED_CORES", "NativeCallBinding", "declare_native_call",
+__all__ = ("SCHEMA", "PROVED_CORES", "NativeCallBinding", "NativeAbiRegion",
+           "declare_native_call", "bind_abi_call", "bind_selected_native_call",
+           "selection_delivery_for_op",
            "bind_native_call", "bind_expanded_call", "validate_invocation",
            "native_call_coverage", "coverage_from_records", "join_profiler_rows",
            "member_physical_view", "family_is_hccl", "self_non_claims")

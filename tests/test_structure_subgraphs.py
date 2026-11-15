@@ -34,8 +34,10 @@ def _export(raw, *, phase="prefill", tokens=4096, context=0):
 def _fixture(name, profiler_api, group="attention_cache_contracts"):
     import mindie_profiler
 
-    path = (Path(mindie_profiler.__file__).resolve().parents[1] /
-            "tests/fixtures" / group / name)
+    rel = Path("tests/fixtures") / group / name
+    path = Path(mindie_profiler.__file__).resolve().parents[1] / rel
+    if not path.is_file():
+        path = Path(__file__).resolve().parents[2] / "profiler" / rel
     if not path.is_file():
         pytest.skip(f"retained profiler source fixture is unavailable: {path}")
     return tuple(kernel_rows(path))

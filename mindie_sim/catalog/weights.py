@@ -299,7 +299,7 @@ def _attention_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
         if 0 <= plan.kv_owner_layer_id < plan.index:
             terms = [term for term in terms if term.name not in {"k_proj", "v_proj"}]
         return terms
-    if plan.attention == "kda":
+    if plan.attention in {"kda", "mamba", "gla", "deltanet", "lightning", "retnet"}:
         d = (plan.linear_value_heads or plan.linear_heads) * plan.linear_head_dim
         dk = plan.linear_key_head_dim or plan.linear_head_dim
         k_dim = (plan.linear_key_heads or plan.linear_heads) * dk
@@ -342,7 +342,7 @@ def _attention_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
     if plan.attention == "gdn":
         key_w = plan.linear_key_heads * plan.linear_key_head_dim
         value_w = plan.linear_value_heads * plan.linear_head_dim
-        conv_w = plan.conv_width
+        conv_w = plan.conv_width or (2 * key_w + value_w)
         terms.extend([
             _t("gdn_qkvz", conv_w + value_w, h, "gdn.qkvz", "out_tp"),
             _t("gdn_ba", 2 * plan.linear_value_heads, h, "gdn.beta_alpha", "out_tp"),

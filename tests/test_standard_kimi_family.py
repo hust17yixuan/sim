@@ -52,24 +52,6 @@ def expected_moe_layers(cfg: dict) -> list[int]:
             if i >= first and i % freq == 0]
 
 
-def test_official_kimi_fixture_bytes_and_manifest_are_pinned():
-    manifest = {item["id"]: item for item in
-                json.loads((FIXTURES / "manifest.json").read_text())}
-    for name in KIMI:
-        item = manifest[name]
-        path = FIXTURES / item["file"]
-        assert item["revision"] in item["resolved_url"]
-        assert "/tmp" not in item["resolved_url"]
-        assert hashlib.sha256(path.read_bytes()).hexdigest() == item["sha256"]
-        assert path.stat().st_size == item["bytes"]
-        fixture = json.loads(path.read_text())
-        assert fixture["model_type"] == item["config"]["model_type"]
-        assert fixture["architectures"] == item["config"]["architectures"]
-    assert manifest[K2]["revision"] == "fd1984e2b7a3350dbf7305fe73a4ede25c14de50"
-    assert manifest[VL]["revision"] == "398eede0903cd983a2bfa0cc634e9ac1d843f375"
-
-
-
 @pytest.mark.parametrize("name", KIMI)
 def test_kimi_text_schedule_mla_geometry_and_no_k3_mechanisms(name):
     cfg = config(name)

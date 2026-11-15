@@ -25,6 +25,8 @@ from collections.abc import Mapping
 from typing import Any
 
 from .advise_util import (
+    capacity_metrics,
+    memory_stage_facts,
     CANONICAL_BOTTLENECKS,
     _SLA_SOLVER_MAX_CONTEXT,
     _canonical_bottleneck,
@@ -39,6 +41,8 @@ from .prediction.cohort_traffic import bind_cohort_traffic
 from .prediction.efficiency import (
     _STRIP_METADATA_KEYS,
     _vram_max_sequences_per_dp,
+    select_jointly_feasible_candidate,
+    stage_hbm_bytes,
     analyze_network_efficiency,
     analyze_operator_row,
     solve_hardware_sla_throughput,
@@ -112,7 +116,7 @@ def _config_for(case: CaseSpec, phase: str, scope: str, context: int | None,
     return _Config(phase, scope, ctx, seqs, tok, max(1, output), prefix, tpot_sla, ttft_sla)
 
 
-def _analyze(case: Any, cfg: _Config, *, run_graph: bool = True, tokens: int | None = None,
+def _analyze_with_plan(case: Any, cfg: _Config, *, run_graph: bool = True, tokens: int | None = None,
              sequences: int | None = None, context: int | None = None,
              phase: str | None = None) -> dict[str, Any]:
     phase_name = cfg.phase if phase is None else phase
@@ -205,10 +209,18 @@ def _analyze(case: Any, cfg: _Config, *, run_graph: bool = True, tokens: int | N
                                 else float(report["duration_ms"]) + draft_dur),
                 "timeline": (*report.get("timeline", ()), *d_graph.get("timeline", ())),
             }
-    return analyze_network_efficiency(
+    analysis = analyze_network_efficiency(
         parsed, phase=phase_name, tokens=tok, context=ctx, sequences=seqs,
         scope=cfg.scope, _precomputed_graph=(graphs, eff_case, report),
     )
+    return analysis, graphs
+
+
+def _analyze(case: Any, cfg: _Config, *, run_graph: bool = True, tokens: int | None = None,
+             sequences: int | None = None, context: int | None = None,
+             phase: str | None = None) -> dict[str, Any]:
+    return _analyze_with_plan(case, cfg, run_graph=run_graph, tokens=tokens,
+                              sequences=sequences, context=context, phase=phase)[0]
 
 
 def _canonical_shares(analysis: Mapping[str, Any], case: CaseSpec | None = None) -> dict[str, float]:
@@ -280,6 +292,8 @@ def _stage_and_family_shares(analysis: Mapping[str, Any], case: CaseSpec) -> tup
         "link_util": round(float(analysis.get("network_link_util", 0.0) or 0.0), 9),
         "cv_overlap": analysis.get("network_cv_overlap"),
         "roofline_efficiency": round(float(analysis.get("network_roofline_efficiency", 0.0) or 0.0), 9),
+        "nominal": analysis.get("nominal", {}),
+        "effective_service_utilization": analysis.get("effective_service_utilization", {}),
         "breakdown_by_bound": analysis.get("breakdown_by_bound", {}),
         "breakdown_by_kind": analysis.get("breakdown_by_kind", {}),
         "dominant_bound": max(shares, key=shares.__getitem__) if any(shares.values()) else "compute_bound",
@@ -312,10 +326,16 @@ def _emitted_tokens(case: CaseSpec, cfg: _Config) -> float:
     return 1.0
 
 
+def _decode_context(cfg: _Config) -> int:
+    """The program a prefill actually hands to decode, never the bare prefix."""
+    return cfg.prefix_tokens + cfg.tokens if cfg.phase == "prefill" else cfg.context
+
+
 def _decode_step(case: Any, cfg: _Config, *, sequences: int | None = None) -> float:
     parsed = case if isinstance(case, CaseSpec) else parse_case(case)
     tok = 1 + _proposal_tokens(parsed, cfg.output_tokens)
     analysis = _analyze(parsed, cfg, run_graph=True, phase="decode", tokens=tok,
+                        context=_decode_context(cfg),
                         sequences=cfg.sequences if sequences is None else sequences)
     return float(analysis["graph_duration_ms"])
 
@@ -324,30 +344,61 @@ def _sla_metrics(case: CaseSpec, cfg: _Config, *, step_ms: float,
                  ttft_ms: float | None = None, use_solver: bool = False) -> dict[str, Any]:
     p = case.runtime.parallel
     emitted = _emitted_tokens(case, cfg)
-    kv_ctx = (cfg.prefix_tokens + cfg.tokens) if cfg.phase == "prefill" else cfg.context
-    kv_tok = 1 if cfg.phase == "prefill" else cfg.tokens
+    kv_ctx = cfg.prefix_tokens if cfg.phase == "prefill" else cfg.context
+    kv_tok = cfg.tokens
     b_sync = _vram_max_sequences_per_dp(case, context=kv_ctx, tokens_per_seq=kv_tok,
                                         output_budget=cfg.output_tokens, emitted_tokens_per_seq=emitted,
-                                        async_scheduling=False)
+                                        async_scheduling=False, phase=cfg.phase)
     b_async = _vram_max_sequences_per_dp(case, context=kv_ctx, tokens_per_seq=kv_tok,
                                          output_budget=cfg.output_tokens, emitted_tokens_per_seq=emitted,
-                                         async_scheduling=True)
+                                         async_scheduling=True, phase=cfg.phase)
     b_cfg = _vram_max_sequences_per_dp(case, context=kv_ctx, tokens_per_seq=kv_tok,
                                        output_budget=cfg.output_tokens, emitted_tokens_per_seq=emitted,
-                                       async_scheduling=None)
+                                       async_scheduling=None, phase=cfg.phase)
     if case.runtime.memory:
         b_sync = min(b_sync, b_cfg)
         b_async = min(b_async, b_cfg)
-    configured = b_async if case.runtime.async_scheduling else b_sync
-    if configured <= 0 or (ttft_ms is not None and ttft_ms > cfg.sla_ttft_ms):
+    current_configured = b_async if case.runtime.async_scheduling else b_sync
+    # Prefill admission describes the current prompt-only step.  Service goodput
+    # needs the complete output lifecycle; keep the two capacity limits separate.
+    if cfg.phase == "prefill":
+        life_ctx = cfg.prefix_tokens + cfg.tokens
+        verify_tokens = 1 + _proposal_tokens(case, cfg.output_tokens)
+        life_sync = _vram_max_sequences_per_dp(
+            case, context=life_ctx, tokens_per_seq=verify_tokens, output_budget=cfg.output_tokens,
+            emitted_tokens_per_seq=emitted, async_scheduling=False, phase="decode")
+        life_async = _vram_max_sequences_per_dp(
+            case, context=life_ctx, tokens_per_seq=verify_tokens, output_budget=cfg.output_tokens,
+            emitted_tokens_per_seq=emitted, async_scheduling=True, phase="decode")
+        life_cfg = _vram_max_sequences_per_dp(
+            case, context=life_ctx, tokens_per_seq=verify_tokens, output_budget=cfg.output_tokens,
+            emitted_tokens_per_seq=emitted, async_scheduling=None, phase="decode")
+        if case.runtime.memory:
+            life_sync, life_async = min(life_sync, life_cfg), min(life_async, life_cfg)
+        life_cycle_configured = life_async if case.runtime.async_scheduling else life_sync
+    else:
+        life_sync, life_async, life_cycle_configured = b_sync, b_async, current_configured
+    search_cap = min(current_configured, life_cycle_configured)
+
+    def _empty_return() -> dict[str, Any]:
         return {"sla_goodput_tok_s": 0.0, "b_vram_max_sync": int(b_sync),
-                "b_vram_max_async": int(b_async), "b_sla": 0}
+                "b_vram_max_async": int(b_async), "b_sla": 0,
+                "b_vram_max_lifecycle_sync": int(life_sync),
+                "b_vram_max_lifecycle_async": int(life_async),
+                "b_vram_max_joint_sync": int(min(b_sync, life_sync)),
+                "b_vram_max_joint_async": int(min(b_async, life_async))}
+
+    if search_cap <= 0 or (ttft_ms is not None and ttft_ms > cfg.sla_ttft_ms):
+        return _empty_return()
     step_budget_ms = cfg.sla_tpot_ms * emitted
     tpot_step = step_ms if cfg.phase == "decode" else _decode_step(case, cfg, sequences=cfg.sequences)
     prefill_tokens = cfg.tokens if cfg.phase == "prefill" else max(1, cfg.context - cfg.prefix_tokens)
     ttft_cache: dict[int, float] = {cfg.sequences: float(ttft_ms)} if ttft_ms is not None else {}
+    step_cache: dict[int, float] = {cfg.sequences: tpot_step}
+    evaluated_b: set[int] = set()
 
     def _ttft_at(b: int) -> float:
+        evaluated_b.add(int(b))
         if b not in ttft_cache:
             try:
                 p_res = _analyze(case, cfg, run_graph=True, phase="prefill",
@@ -357,16 +408,22 @@ def _sla_metrics(case: CaseSpec, cfg: _Config, *, step_ms: float,
                 ttft_cache[b] = float("inf")
         return ttft_cache[b]
 
+    def _step_at(b: int) -> float:
+        evaluated_b.add(int(b))
+        if b not in step_cache:
+            try:
+                step_cache[b] = _decode_step(case, cfg, sequences=b)
+            except (ValueError, ModelingError):
+                step_cache[b] = float("inf")
+        return step_cache[b]
+
     if tpot_step <= 0.0:
         b_sla = 0
     elif cfg.context > _SLA_SOLVER_MAX_CONTEXT:
         if tpot_step <= step_budget_ms:
-            b_sla = min(configured, cfg.sequences)
+            b_sla = min(search_cap, cfg.sequences)
         elif cfg.sequences > 1:
-            try:
-                one_step = _decode_step(case, cfg, sequences=1)
-            except (ValueError, ModelingError):
-                one_step = float("inf")
+            one_step = _step_at(1)
             if 0.0 < one_step <= step_budget_ms and (ttft_ms is None or 0.0 < _ttft_at(1) <= cfg.sla_ttft_ms):
                 b_sla, tpot_step = 1, one_step
             else:
@@ -374,20 +431,10 @@ def _sla_metrics(case: CaseSpec, cfg: _Config, *, step_ms: float,
         else:
             b_sla = 0
     else:
-        cache: dict[int, float] = {cfg.sequences: tpot_step}
-
-        def _step_at(b: int) -> float:
-            if b not in cache:
-                try:
-                    cache[b] = _decode_step(case, cfg, sequences=b)
-                except (ValueError, ModelingError):
-                    cache[b] = float("inf")
-            return cache[b]
-
         if tpot_step <= step_budget_ms:
-            lo, hi = min(configured, cfg.sequences), configured
+            lo, hi = min(search_cap, cfg.sequences), search_cap
         else:
-            lo, hi = 0, min(configured, cfg.sequences - 1)
+            lo, hi = 0, min(search_cap, cfg.sequences - 1)
             if hi >= 1 and 0.0 < _step_at(1) <= step_budget_ms and (ttft_ms is None or 0.0 < _ttft_at(1) <= cfg.sla_ttft_ms):
                 lo = 1
             else:
@@ -413,7 +460,7 @@ def _sla_metrics(case: CaseSpec, cfg: _Config, *, step_ms: float,
                     lo = mid
                 else:
                     hi = mid - 1
-        if lo > cfg.sequences and ttft_ms is not None and ttft_ms * (lo / max(1, cfg.sequences)) > cfg.sla_ttft_ms * 0.9:
+        if lo > cfg.sequences and ttft_ms is not None:
             if not (0.0 < _ttft_at(lo) <= cfg.sla_ttft_ms):
                 t_lo, t_hi = cfg.sequences, lo - 1
                 while t_lo < t_hi:
@@ -426,37 +473,31 @@ def _sla_metrics(case: CaseSpec, cfg: _Config, *, step_ms: float,
         b_sla = lo
         if b_sla > 0:
             tpot_step = _step_at(b_sla)
+
+    # Project evaluated B candidates in descending order through one joint check.
+    # Once the highest-B jointly feasible candidate is verified, smaller probes
+    # cannot win max-B selection and need not run redundant prefill graphs.
+    candidates: list[dict[str, Any]] = []
+    for b in sorted(evaluated_b | {1, b_sla, min(search_cap, cfg.sequences)}, reverse=True):
+        if b <= 0:
+            continue
+        step = _step_at(b)
+        step_ok = bool(b <= search_cap and 0.0 < step <= step_budget_ms)
+        ttft_ok = step_ok and (ttft_ms is None or (0.0 < _ttft_at(b) <= cfg.sla_ttft_ms))
+        feasible = bool(step_ok and ttft_ok)
+        candidates.append({"b": int(b), "step_ms": step, "feasible": feasible})
+        if feasible:
+            break
+    selected = select_jointly_feasible_candidate(candidates)
+    b_sla = int(selected["b"]) if selected is not None else 0
+    tpot_step = float(selected["step_ms"]) if selected is not None else 0.0
     goodput = (b_sla * int(p.dp) * emitted * 1000.0 / tpot_step) if b_sla > 0 and tpot_step > 0.0 else 0.0
     return {"sla_goodput_tok_s": round(goodput, 6), "b_vram_max_sync": int(b_sync),
-            "b_vram_max_async": int(b_async), "b_sla": int(b_sla)}
-
-
-def _memory_facts(case: CaseSpec, cfg: _Config) -> tuple[Memory, float, float, float, float]:
-    memory = Memory(case, workspace_tokens=max(1, cfg.sequences * cfg.tokens))
-    available = min(min(row) for row in memory.capacity)
-    hbm = min(die.hbm_bytes for die in case.machine.dies)
-    kv_tokens = (cfg.prefix_tokens + cfg.tokens + max(1, cfg.output_tokens)) if cfg.phase == "prefill" else (
-        cfg.context + max(cfg.tokens, cfg.output_tokens))
-    kv = max(memory.cache_bytes(kv_tokens, padded=True))
-    workspace = max(memory.workspace)
-    return memory, float(available), float(hbm), float(kv), float(workspace)
-
-
-def _capacity_metrics(case: CaseSpec, cfg: _Config, b_sync: int, b_async: int) -> dict[str, Any]:
-    memory, available, hbm, kv, workspace = _memory_facts(case, cfg)
-    headroom = available - kv * cfg.sequences
-    used = max(memory.weights) + workspace + kv * cfg.sequences + memory.policy.reserved
-    b_eff = b_async if case.runtime.async_scheduling else b_sync
-    return {
-        "vram_max_sequences_per_dp_sync": int(b_sync),
-        "vram_max_sequences_per_dp_async": int(b_async),
-        "weight_bytes_per_die": round(float(max(memory.weights)), 3),
-        "kv_bytes_per_seq": round(kv, 3),
-        "available_kv_capacity_bytes_per_die": round(available, 3),
-        "hbm_utilization_ratio": round(max(0.0, min(1.0, used / max(hbm, 1e-12))), 9),
-        "capacity_headroom_bytes": round(headroom, 3),
-        "is_vram_feasible": bool(b_eff >= cfg.sequences and headroom >= -1e-6),
-    }
+            "b_vram_max_async": int(b_async), "b_sla": int(b_sla),
+            "b_vram_max_lifecycle_sync": int(life_sync),
+            "b_vram_max_lifecycle_async": int(life_async),
+            "b_vram_max_joint_sync": int(min(b_sync, life_sync)),
+            "b_vram_max_joint_async": int(min(b_async, life_async))}
 
 
 def _skew_metrics(case: CaseSpec, cfg: _Config) -> dict[str, Any]:
@@ -495,8 +536,8 @@ def _skew_metrics(case: CaseSpec, cfg: _Config) -> dict[str, Any]:
     }
 
 
-def _baseline(case: CaseSpec, cfg: _Config) -> dict[str, Any]:
-    analysis = _analyze(case, cfg, run_graph=True)
+def _baseline_with_plan(case: CaseSpec, cfg: _Config, *, include_plan: bool = False) -> Any:
+    analysis, graphs = _analyze_with_plan(case, cfg, run_graph=True)
     step = float(analysis["graph_duration_ms"])
     emitted = _emitted_tokens(case, cfg)
     tpot = step / emitted if cfg.phase == "decode" else _decode_step(case, cfg, sequences=cfg.sequences) / emitted
@@ -513,10 +554,12 @@ def _baseline(case: CaseSpec, cfg: _Config) -> dict[str, Any]:
     attribution = {
         "efficiency": efficiency,
         "skew": _skew_metrics(case, cfg),
-        "capacity": _capacity_metrics(case, cfg, sla["b_vram_max_sync"], sla["b_vram_max_async"]),
+        "capacity": capacity_metrics(case, cfg, sla["b_vram_max_sync"], sla["b_vram_max_async"],
+                                     sla.get("b_vram_max_lifecycle_sync"), sla.get("b_vram_max_lifecycle_async"),
+                                     sla.get("b_vram_max_joint_sync"), sla.get("b_vram_max_joint_async")),
         "stage": stage,
     }
-    return {
+    baseline = {
         "analysis": analysis,
         "step_duration_ms": step,
         "operator_sum_ms": float(analysis["operator_sum_ms"]),
@@ -530,6 +573,16 @@ def _baseline(case: CaseSpec, cfg: _Config) -> dict[str, Any]:
         "attribution": attribution,
         "canonical_shares": shares,
     }
+    if not include_plan:
+        return baseline
+    context = cfg.prefix_tokens if cfg.phase == "prefill" else cfg.context
+    return baseline, {"graphs": graphs, "selection": "advise_baseline",
+                      "geometry": {"phase": cfg.phase, "tokens": cfg.tokens, "context": context,
+                                   "sequences": cfg.sequences, "scope": cfg.scope}}
+
+
+def _baseline(case: CaseSpec, cfg: _Config) -> dict[str, Any]:
+    return _baseline_with_plan(case, cfg)
 
 
 def _hw_family(text: str) -> str:

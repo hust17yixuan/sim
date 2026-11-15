@@ -114,7 +114,10 @@ def _deepseek_plans(c: Mapping[str, Any], *, v41: bool) -> list[LayerPlan]:
             indexer_type = (
                 "full" if owns_kv and owns_topk else ("shared" if indexer else "none")
             )
-            architecture = {0: "swa_only", 1: "dsa_shared_compressed_1", 2: "dsa_shared_compressed_2"}[ratio]
+            # Paper-aligned schedule names: ratio 0 is the SWA window branch,
+            # ratios 1/2 are the cross-layer shared Compressed Sparse
+            # Attention v2 (candidate-block filtering) schedule.
+            architecture = {0: "swa", 1: "csa2", 2: "csa2"}[ratio]
             index_status = "exact_config_source_ids"
         else:
             kv_source = index if ratio > 0 else -1
@@ -127,7 +130,9 @@ def _deepseek_plans(c: Mapping[str, Any], *, v41: bool) -> list[LayerPlan]:
             candidate_source = -1
             indexer = ratio == 4
             indexer_type = "c4" if ratio == 4 else "none"
-            architecture = {0: "swa_only", 4: "dsa_compressed_4", 128: "dsa_compressed_128"}[ratio]
+            # Paper-aligned schedule names: 4 is single-stage Compressed
+            # Sparse Attention, 128 is Hierarchically Compressed Attention.
+            architecture = {0: "swa", 4: "csa", 128: "hca"}[ratio]
             index_status = "exact_native_compression_schedule"
         plans.append(LayerPlan(
             index=index, attention="mla", ffn="moe",
@@ -175,6 +180,12 @@ def _aux_deepseek(c: Mapping[str, Any], *, v41: bool, d: Mapping[str, Any]) -> A
     layers = len(targets) if targets else nextn
     if layers <= 0:
         return AuxiliarySpec()
+    body_layers = int(_require(c, "num_hidden_layers"))
+    ratios = [int(v) for v in (c.get("compress_ratios") or ())]
+    draft_ratios = (
+        tuple(ratios[body_layers : body_layers + layers])
+        if len(ratios) >= body_layers + layers else ()
+    )
     # The native V4.1 MTP module is the DSpark module: it uses
     # dspark_n_routed_experts, not an additional ordinary E384 branch.
     draft_experts = _int(c, "dspark_n_routed_experts", experts) if v41 else experts
@@ -191,6 +202,8 @@ def _aux_deepseek(c: Mapping[str, Any], *, v41: bool, d: Mapping[str, Any]) -> A
         expert_intermediate_size=moe_i,
         num_shared_experts=shared if draft_experts else 0,
         target_layer_ids=targets or tuple(range(max(0, layers))),
+        draft_compress_ratios=draft_ratios,
+        sliding_window=_int(c, "sliding_window", 0),
         block_size=max(1, block), markov_rank=markov,
         confidence_enabled=bool(markov),
         confidence_executes=False,

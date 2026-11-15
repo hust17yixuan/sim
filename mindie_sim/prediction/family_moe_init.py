@@ -13,6 +13,35 @@ from .implementations import select
 from .mechanism import PlannedRecipe
 from .moe_init_mxfp8 import RECIPE, SOURCE, build
 
+CAPABILITIES = frozenset({
+    "moe_init_routing", "local_experts", "bf16_input", "fp8_e4m3_output",
+    "mx32_scales", "full_local_expert_range", "no_transport_quantization",
+})
+
+
+def capabilities():
+    """Machine-readable producer boundary and dynamic attributes."""
+    return {
+        "selector": "moe_init_routing",
+        "implementation": RECIPE,
+        "native_kind": "MoeInitRoutingV3",
+        "source_boundary": "kernel",
+        "input_dtypes": ("bf16",),
+        "output_dtypes": ("fp8_e4m3",),
+        "scale_format": "fp8_e8m0",
+        "scale_group_size": 32,
+        "dynamic_attributes": (
+            "tokens", "topk", "width", "experts", "local_rows",
+            "activation_scale_shape", "output_contracts",
+        ),
+        "requires": (
+            "parallel.ep == 1", "no_moe_transport_quantization",
+            "direct_unique_grouped_gate_up_consumer",
+            "complete_mxfp8_activation_assignment",
+        ),
+        "source": SOURCE,
+    }
+
 
 def recipes():
     return {RECIPE: PlannedRecipe(build)}
@@ -35,21 +64,47 @@ def apply(ops, bindings, runtime):
     if runtime.parallel.ep != 1 or runtime.kernels.get("moe_transport"):
         raise ModelingError("moe_init_mxfp8_requires_local_experts_without_transport_quantization")
     replacements = {}
+    absorbed = set()
     for pack in ops:
         if pack.recipe != "route_pack":
             continue
         if pack.plan_required or "implementation_binding" in dict(pack.metadata):
             raise ModelingError("moe_init_mxfp8_conflicts_with_explicit_route_pack_implementation")
         tokens, topk = pack.local_shape
+        if type(topk) is not int or topk < 1:
+            raise ModelingError("moe_init_mxfp8_requires_positive_topk")
         if not tokens:
             continue
         matrices = [op for op in ops if op.recipe in {"grouped_gate_up", "balanced_grouped_gate_up"}
                     and pack.op_id in op.deps]
+        if not matrices:
+            # A preactivated frontend has already materialized the gate-input
+            # quantizer between the route pack and the grouped gate-up matrix
+            # (``pack -> dynamic_quantize -> expert_up``).  That quantizer is
+            # exactly the ``fp8_e4m3``/MX32 producer this kernel replaces, so
+            # the unique intervening producer is resolved and retired together
+            # with the pack instead of being counted as a second consumer.
+            quantizers = [op for op in ops
+                          if pack.op_id in op.deps
+                          and op.recipe in {"dynamic_quantize", "quantize"}]
+            if len(quantizers) == 1:
+                producer = quantizers[0]
+                matrices = [op for op in ops
+                            if op.recipe in {"grouped_gate_up",
+                                             "balanced_grouped_gate_up"}
+                            and producer.op_id in op.deps]
+                if len(matrices) == 1 and tuple(matrices[0].deps) != (
+                        producer.op_id,):
+                    matrices = []
+                elif len(matrices) == 1:
+                    absorbed.add(producer.op_id)
         if len(matrices) != 1:
             raise ModelingError("moe_init_mxfp8_requires_direct_unique_grouped_gate_up_consumer")
         matrix = matrices[0]
         meta = dict(matrix.metadata)
         width, rows = matrix.local_shape[2], matrix.local_shape[0]
+        if type(width) is not int or width < 256 or width % 256:
+            raise ModelingError("moe_init_mxfp8_requires_width_multiple_of_256")
         if (pack.dtype != "bf16" or meta.get("activation_format") != "fp8_e4m3"
                 or meta.get("activation_scale_format") != "fp8_e8m0"
                 or meta.get("activation_group_size") != 32
@@ -61,6 +116,8 @@ def apply(ops, bindings, runtime):
             if producer not in pack.deps:
                 raise ModelingError("moe_init_mxfp8_requires_actual_ids_and_payload_producer")
         experts = pm["num_experts"]
+        if type(experts) is not int or experts < 1:
+            raise ModelingError("moe_init_mxfp8_requires_positive_local_experts")
         pm.update({
             "implementation": RECIPE, "implementation_binding": {"selector": "moe_init_routing",
                                                                    "implementation": RECIPE},
@@ -84,5 +141,13 @@ def apply(ops, bindings, runtime):
                     activation_payload_producer=pack.op_id, activation_scale_producer=pack.op_id,
                     activation_scale_producer_shape=(rows, width // 32),
                     activation_scale_consumer_view="contiguous_reshape_same_E8M0_payload")
-        replacements[matrix.op_id] = replace(matrix, metadata=tuple(meta.items()))
-    return tuple(replacements.get(op.op_id, op) for op in ops)
+        deps = (pack.op_id,) if any(
+            dep in absorbed for dep in matrix.deps) else matrix.deps
+        replacements[matrix.op_id] = replace(
+            matrix, deps=deps, metadata=tuple(meta.items()))
+    return tuple(op for op in (replacements.get(op.op_id, op) for op in ops)
+                 if op.op_id not in absorbed)
+
+
+__all__ = ["CAPABILITIES", "RECIPE", "SOURCE", "apply", "capabilities",
+           "recipes", "tensor_contract"]

@@ -8,10 +8,15 @@
 [Side-Effect Policy] Pure report construction; no fitting, simulation or I/O.
 """
 from collections import Counter, defaultdict
+from collections.abc import Mapping
 from copy import deepcopy
 import json
 import math
 from statistics import median
+
+from ..cohort_accuracy import (
+    NATIVE_COMPARISON_SCHEMA, native_acceptance, native_acceptance_policy,
+)
 
 
 IDENTITY_FIELDS = (
@@ -155,8 +160,130 @@ def _relation(specification, points, tolerance):
     return result
 
 
+NATIVE_ACCURACY_SCHEMA = "mindie-sim.native-accuracy-report/1"
+
+
+def native_accuracy_report(comparison):
+    """Project the profiler's independent native comparison into accuracy rows.
+
+    Every point keeps the source prediction, observation range, per-sample
+    verdicts and failure status.  A mean or a median cannot replace a sample.
+    """
+    acceptance = native_acceptance(comparison)
+    counts = acceptance["counts"]
+    points = []
+    for item in acceptance["items"]:
+        if item["status"] == "work_only":
+            points.append({
+                "point_id": item["item_id"],
+                "identity": item["identity"],
+                "boundary": item["boundary"],
+                "predicted_ms": None,
+                "observed_ms": item["observed_ms"],
+                "observation_range_ms": item["observation_range_ms"],
+                "observation_samples": item["observation_samples"],
+                "statistic": item.get("statistic"),
+                "status": "work_only",
+                "duration_available": False,
+                "within_tolerance": None,
+                "relative_error": None,
+                "absolute_residual_ms": None,
+                "formal_allowed_error_ms": None,
+                "condition_gaps": item["condition_gaps"],
+                "samples": [],
+                "work": deepcopy(item.get("work")),
+                "unresolved_reason": item.get("comparison", {}).get("reason"),
+                "interpretation": "work_only_retained_not_scored_no_duration_or_error",
+            })
+            continue
+        points.append({
+            "point_id": item["item_id"],
+            "identity": item["identity"],
+            "boundary": item["boundary"],
+            "predicted_ms": item["predicted_ms"],
+            "observed_ms": item["observed_ms"],
+            "observation_range_ms": item["observation_range_ms"],
+            "observation_samples": item["observation_samples"],
+            "statistic": item.get("statistic"),
+            "status": "paired",
+            "duration_available": True,
+            "within_tolerance": item["within_tolerance"],
+            "relative_error": item["relative_error"],
+            "absolute_residual_ms": item["absolute_residual_ms"],
+            "formal_allowed_error_ms": item["formal_allowed_error_ms"],
+            "condition_gaps": item["condition_gaps"],
+            "samples": item["samples"],
+            "interpretation": "per_item_native_acceptance_not_heldout_generalization",
+        })
+    return {
+        "schema": NATIVE_ACCURACY_SCHEMA,
+        "source_schema": acceptance["source_schema"],
+        "source_status": acceptance["source_status"],
+        "status": acceptance["status"],
+        "policy": native_acceptance_policy(),
+        "tolerances": acceptance["tolerance"],
+        "coverage": {
+            "paired_items": counts["paired_items"],
+            "duration_denominator_items": counts["duration_denominator_items"],
+            "work_only_items": counts["work_only"],
+            "observation_samples": counts["observation_samples"],
+            "condition_gap_items_in_denominator": counts[
+                "condition_gap_items_in_denominator"],
+            "unpaired_observations": counts["unpaired_observations"],
+            "unpaired_predictions": counts["unpaired_predictions"],
+            "ambiguous": counts["ambiguous"],
+            "source_status": acceptance["source_status"],
+            "partial_coverage": acceptance["partial_coverage"],
+            "truncated": acceptance["truncated"],
+            "coverage_reconciled": acceptance["coverage_reconciled"],
+            "subset_scope": deepcopy(acceptance["subset_scope"]),
+            "parent_capture": acceptance["parent_capture"],
+            "window_count": len(acceptance.get("windows") or ()),
+            "source_identity": acceptance["source_identity"],
+            "structure_accuracy": "not_computed",
+        },
+        "source_coverage": deepcopy(acceptance["coverage"]),
+        "tolerance_outcomes": {
+            "within": counts["within"],
+            "outside": counts["outside"],
+            "work_only": counts["work_only"],
+            "duration_denominator_items": counts["duration_denominator_items"],
+            "condition_gap_items_in_denominator": counts[
+                "condition_gap_items_in_denominator"],
+            "unpaired_observations": counts["unpaired_observations"],
+            "unpaired_predictions": counts["unpaired_predictions"],
+            "ambiguous": counts["ambiguous"],
+            "source_status": acceptance["source_status"],
+            "partial_coverage": acceptance["partial_coverage"],
+            "truncated": acceptance["truncated"],
+        },
+        "points": points,
+        "unpaired_observations": acceptance["unpaired_observations"],
+        "unpaired_predictions": acceptance["unpaired_predictions"],
+        "ambiguous": acceptance["ambiguous"],
+        "failure_matrix": acceptance["failure_matrix"],
+        "non_claims": list(acceptance["non_claims"]) + [
+            "this_report_is_not_a_7337_record_or_heldout_generalization_result",
+            "work_only_items_have_no_predicted_duration_or_numerical_error",
+        ],
+        "limits": [
+            "ABI/boundary pairs are retained for all items; only items with a real "
+            "predicted duration enter the tolerance denominator.",
+            "Work-only items retain observation and work facts with no duration error; "
+            "they are not counted as within or outside.",
+            "Unpaired and ambiguous sides are retained outside the tolerance denominator.",
+            "Source partial/truncated/inconclusive coverage remains incomplete; local "
+            "all-within item verdicts do not make the slice passed.",
+            "Diagnostic tolerance is retained separately and never changes formal status.",
+            "Historical absolute_15us, in-sample and mean reproductions are excluded.",
+        ],
+    }
+
+
 def accuracy_report(campaign):
     """Compare independent records; input acceptance flags are never consumed."""
+    if isinstance(campaign, Mapping) and campaign.get("schema") == NATIVE_COMPARISON_SCHEMA:
+        return native_accuracy_report(campaign)
     tolerance = _tolerance(campaign.get("tolerances", {}))
     trained = set(campaign.get("training_sample_ids", ()))
     observations, excluded, seen = defaultdict(list), Counter(), {}

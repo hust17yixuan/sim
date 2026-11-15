@@ -52,10 +52,19 @@ def call_costs(case, ops, *, recipes=None, invocations=1, mode="eager",
         raise ModelingError("call_duplicate_operator_id")
     if any(set(op.deps) - identifiers for op in single):
         raise ModelingError("call_requires_complete_callback_dependencies")
-    repeated = tuple(replace(
-        op, op_id=f"call{index}/{op.op_id}",
-        deps=tuple(f"call{index}/{dep}" for dep in op.deps),
-    ) for index in range(invocations) for op in single)
+    repeated_list = []
+    stream_tail: dict[tuple[int, str], str] = {}
+    for index in range(invocations):
+        for op in single:
+            new_id = f"call{index}/{op.op_id}"
+            new_deps = [f"call{index}/{dep}" for dep in op.deps]
+            stream_key = (op.stage, op.stream or "main")
+            prev_on_stream = stream_tail.get(stream_key)
+            if prev_on_stream is not None and prev_on_stream not in new_deps:
+                new_deps.append(prev_on_stream)
+            stream_tail[stream_key] = new_id
+            repeated_list.append(replace(op, op_id=new_id, deps=tuple(new_deps)))
+    repeated = tuple(repeated_list)
     report = graph_costs(
         case, repeated, recipes=book, input_ready_ms=input_ready_ms,
         include_submission=include_submission,

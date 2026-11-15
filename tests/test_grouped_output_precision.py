@@ -122,9 +122,13 @@ def test_retained_prefill_output_abi_preserves_other_quantized_roles(name, token
     base_raw = {**raw, 'model': {key: value for key, value in raw['model'].items() if key != 'quant'}}
     base_quant = parse_case(base_raw).model.quant.to_dict()
     actual_quant = c.model.quant.to_dict()
-    for metadata in ('source', 'notes', 'category_overrides'):
-        base_quant.pop(metadata)
-        actual_quant.pop(metadata)
+    for metadata in (
+        'source', 'notes', 'category_overrides',
+        'runtime_weight_scale_format', 'runtime_weight_scale_bytes',
+        'runtime_activation_scale_format', 'runtime_int8_weight_metadata',
+    ):
+        base_quant.pop(metadata, None)
+        actual_quant.pop(metadata, None)
     assert actual_quant == base_quant
 
 
@@ -145,6 +149,10 @@ def test_prepared_mx_validation_uses_the_same_child_as_runtime_and_capacity(role
     raw = json.loads((ROOT/'examples/cases/high-concurrency-20261030/'
         'v41-dynamic-rotary-conditional/a5_v41_fp8_tp1_dp8_ep8_c128_p2k-dynamic-rotary-source.json').read_text())
     raw['model']['layers']=1
+    # The retained case carries a complete 40-plan table; keep the fixture's
+    # declared layer count and plan table in one consistent object so the
+    # prepared-MX validation is actually reached.
+    raw['model']['layer_plans']=raw['model'].get('layer_plans', [])[:1]
     raw['model']['quant']['category_overrides']={category:BF16}
     raw['runtime']['kernels']['lowerings']['mx_matrix']={
         'implementation':'ascend_prepared_mx32_matrix', 'options':{

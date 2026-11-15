@@ -2,8 +2,8 @@
 
 [Role]
   Attribute compiled per-operator piecewise costs (``OperatorRow`` / ``OperatorCost``)
-  across fused ``R1`` residual-attention, ``A1`` MLA-prolog and ``I0`` K-norm
-  boundaries while strictly conserving per-layer and per-step operator time.
+  across a declared fused ``R1`` residual-attention boundary while strictly
+  conserving per-layer and per-step operator time.
 
 [Invariants]
   * Pure function of structural topology (``tp``, ``layers``) and compiled
@@ -12,6 +12,9 @@
   * Preserves all caller-supplied mechanism and subgraph keys and strictly conserves
     total per-layer operator time (``|sum(adj_per_layer.values()) - sum(per_layer.values())| <= 1e-12``),
     leaving ``body_ms``, ``decode_body_ms``, and ``prefill_body_ms`` invariant.
+  * A standalone ``I0`` indexer row is its own compiled boundary.  No fraction of
+    its duration is reassigned to a norm or projection clock because the
+    compiler did not emit that fused launch.
 
 [Timeouts & Locks]
   Pure in-memory arithmetic; no I/O, timers, subprocesses, or locks.
@@ -21,8 +24,9 @@
 """
 from __future__ import annotations
 
-import math
 from typing import Any, Mapping, Sequence
+
+from mindie_sim.schema.subgraphs import ALL_ATTENTION_KINDS
 
 MECHANISM_ORDER: tuple[str, ...] = (
     "gemm",
@@ -71,18 +75,18 @@ def lower_layer_predictions(
         for k, v in (subgraphs.items() if isinstance(subgraphs, Mapping) else (subgraphs or ()))
     }
     has_r1 = any(
-        getattr(r, "kind", "") == "R1" and getattr(r, "mechanism", "") == "norm_residual"
+        getattr(r, "kind", "") == "attn_residual" and getattr(r, "mechanism", "") == "norm_residual"
         for r in rows
     )
     has_attn = any(
-        getattr(r, "kind", "") in {"A0", "A1", "A2", "A3", "A4"}
+        getattr(r, "kind", "") in ALL_ATTENTION_KINDS
         or getattr(r, "mechanism", "") == "attention"
         for r in rows
     )
     i0_rows = [
         r
         for r in rows
-        if getattr(r, "kind", "") == "I0" and getattr(r, "mechanism", "") == "indexer"
+        if getattr(r, "kind", "") == "indexer_prolog" and getattr(r, "mechanism", "") == "indexer"
     ]
     has_i0_norm = (
         bool(i0_rows)
@@ -101,7 +105,7 @@ def lower_layer_predictions(
         sum(
             float(r.total_ms)
             for r in rows
-            if getattr(r, "kind", "") == "R1" and getattr(r, "mechanism", "") == "norm_residual"
+            if getattr(r, "kind", "") == "attn_residual" and getattr(r, "mechanism", "") == "norm_residual"
         )
         / layer_count
     )
@@ -111,27 +115,11 @@ def lower_layer_predictions(
     if r1_ms > 0.0 and "norm_residual" in adj_per_layer:
         adj_per_layer["norm_residual"] = max(0.0, adj_per_layer["norm_residual"] - r1_ms)
         adj_per_layer["attention"] = adj_per_layer.get("attention", 0.0) + r1_ms
-    i0_norm_ms = 0.0
-    i0_source = ""
-    if has_i0_norm:
-        i0_indexer = max(0.0, adj_per_layer.get("indexer", 0.0))
-        i0_norm = max(0.0, adj_per_layer.get("norm_residual", 0.0))
-        if phase == "decode":
-            i0_norm_ms = min(i0_indexer * 0.35, 0.0022)
-        else:
-            # A short-context prefill still carries the K-projection LayerNorm
-            # inside the norm envelope; at long context the indexer scoring
-            # envelope already dominates and the residual launch amortises.
-            q_chunks = max(1.0, float(max(1, int(prompt_tokens))) / 1024.0)
-            i0_cap = 0.12 * i0_norm / math.sqrt(q_chunks)
-            i0_norm_ms = min(i0_indexer * 0.35, i0_cap) if i0_indexer < i0_norm else 0.0
-        if i0_norm_ms > 0.0:
-            # The emitted K-projection launch is carried by the projection
-            # GEMM bucket when that bucket exists; the indexer bucket is the
-            # fallback for a standalone indexer envelope.
-            i0_source = "gemm" if adj_per_layer.get("gemm", 0.0) >= i0_norm_ms else "indexer"
-            adj_per_layer[i0_source] = max(0.0, adj_per_layer.get(i0_source, 0.0) - i0_norm_ms)
-            adj_per_layer["norm_residual"] = adj_per_layer.get("norm_residual", 0.0) + i0_norm_ms
+    # A standalone I0 row is its own compiled boundary.  Moving an assumed
+    # fraction of the indexer or projection clock into the norm bucket would
+    # invent a fused launch that the compiler did not emit, so no transfer is
+    # applied here.  A genuinely fused K-projection norm must be represented by
+    # the operator/compiler program itself.
     if subgraphs_in:
         adj_subgraphs = dict(subgraphs_in)
         nr_in = adj_subgraphs.get("norm_residual", 0.0)
@@ -140,12 +128,9 @@ def lower_layer_predictions(
         if r1_sg > 0.0 and "norm_residual" in adj_subgraphs:
             adj_subgraphs["norm_residual"] = max(0.0, nr_in - r1_sg)
             adj_subgraphs["attention"] = adj_subgraphs.get("attention", 0.0) + r1_sg
-        if i0_norm_ms > 0.0:
-            adj_subgraphs["norm_residual"] = adj_subgraphs.get("norm_residual", 0.0) + i0_norm_ms
-            adj_subgraphs["attention"] = max(0.0, adj_subgraphs.get("attention", 0.0) - i0_norm_ms)
     else:
         has_f2_coll = any(
-            getattr(r, "kind", "") == "F2" and getattr(r, "mechanism", "") == "collective"
+            getattr(r, "kind", "") == "moe_token_dispatcher" and getattr(r, "mechanism", "") == "collective"
             for r in rows
         )
         moe_keys = (

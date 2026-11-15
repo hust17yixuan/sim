@@ -28,6 +28,10 @@ _SELECTOR = "moe_transport"
 _KIND = "separate_quantized_payload"
 _MXFP8 = frozenset({"mxfp8", "mx_fp8", "mxfp8_e4m3"})
 _FP8 = frozenset({"fp8", "fp8_e4m3", "fp8_e5m2"})
+# Packed FP4 payloads.  ``dtype_bytes('mxfp4')`` already folds the one E8M0
+# block byte per 32 elements into the row width; a typed exchange must keep
+# the 0.5 B payload and the separate scale byte as distinct ledgers.
+_FP4 = frozenset({"fp4", "fp4_e2m1", "mxfp4", "mx_fp4", "mxfp4_e2m1"})
 _DISPATCH_DTYPES = frozenset({"bf16", "fp16", "int8"}) | _FP8 | _MXFP8
 _OPTION_KEYS = frozenset({
     "layer_scopes", "mode", "deepep_overlap_ratio", "eplb_peak_to_avg",
@@ -310,13 +314,30 @@ def default_dispatch_spec(model, plan=None, width=None):
         }
     quant = model.quant.for_category("routed_expert")
     _, act = compute_dtype_for(quant, "routed_expert")
-    group, scale_format, _, scale_bytes_per_row = activation_scales(quant, act, 1, latent)
+    if act in _FP4:
+        # MXFP4 is a 0.5 B E2M1 payload plus one E8M0 byte per 32-element
+        # block.  dtype_bytes('mxfp4') already includes that scale byte, so
+        # the typed exchange must split it back out instead of publishing one
+        # mixed payload row with no separate scale ledger.
+        group = int(getattr(quant, "activation_group_size", 0)
+                    or getattr(quant, "expert_block", 0) or 32)
+        scale_format = str(getattr(quant, "activation_scale_format", "")
+                           or getattr(quant, "scale_format", ""))
+        pack = int(getattr(quant, "activation_scale_pack", 0) or 1)
+        groups = (latent + group - 1) // group
+        scale_bytes_per_row = (
+            float(((groups + pack - 1) // pack) * pack * dtype_bytes(scale_format))
+            if scale_format else 0.0)
+        payload_bytes_per_row = float(latent * dtype_bytes("fp4_e2m1"))
+    else:
+        group, scale_format, _, scale_bytes_per_row = activation_scales(
+            quant, act, 1, latent)
+        payload_bytes_per_row = float(latent * dtype_bytes(act))
     quantized = act not in {"bf16", "bfloat16", "fp16", "float16", "fp32", "float32"}
     if act in _FP8 and group == 32 and scale_format in {"fp8_e8m0", "e8m0"}:
         dispatch_dtype = "mxfp8"
     else:
         dispatch_dtype = act
-    payload_bytes_per_row = float(latent * dtype_bytes(act))
     dispatch_row_bytes = payload_bytes_per_row + (float(scale_bytes_per_row) if quantized else 0.0)
     return {
         "dispatch_dtype": dispatch_dtype,
@@ -522,6 +543,85 @@ def _count_basis(realization):
     return getattr(realization, "basis", "declared_integer_counts")
 
 
+def _routing_peer_counts(op):
+    """Compact integer source->destination assignment matrix from one op.
+
+    The peer matrix is deliberately kept separate from the full routing
+    realization (which may carry every token identity).  Only a route with an
+    explicit source/destination ledger publishes it; expected moments keep
+    their existing uniform declaration.
+    """
+    metadata = dict(getattr(op, "metadata", ()) or ())
+    cells = metadata.get("moe_peer_counts")
+    rank = metadata.get("moe_peer_rank")
+    basis = metadata.get("moe_peer_basis", metadata.get("routing_basis", ""))
+    if cells is None:
+        raw = metadata.get("routing_realization")
+        if not isinstance(raw, Mapping):
+            return None
+        cells = raw.get("peer_assignments", raw.get("peer_assignment_rows"))
+        rank = raw.get("representative_rank")
+        basis = raw.get("basis", metadata.get("routing_basis", ""))
+        if cells is None:
+            return None
+    try:
+        matrix = tuple(tuple(int(value) for value in row) for row in cells)
+    except (TypeError, ValueError) as exc:
+        raise ModelingError("moe_transport_peer_counts_must_be_integer_matrix") from exc
+    size = len(matrix)
+    if (size < 1 or any(len(row) != size for row in matrix)
+            or any(type(value) is bool or value < 0 for row in matrix for value in row)):
+        raise ModelingError("moe_transport_peer_counts_must_be_nonnegative_square_matrix")
+    if type(rank) is not int or not 0 <= rank < size:
+        raise ModelingError("moe_transport_peer_counts_require_valid_representative_rank")
+    return matrix, rank, str(basis)
+
+
+def _peer_payload(cells, row_bytes):
+    """Directed bytes for one representative source and its group mean."""
+    size = len(cells)
+    matrix = tuple(tuple(0 if source == destination else
+                         float(row_bytes) * cells[source][destination]
+                         for destination in range(size))
+                   for source in range(size))
+    total = math.fsum(value for row in matrix for value in row)
+    return matrix, total / size
+
+
+def _peer_metadata(op, row_bytes):
+    routing = _routing_peer_counts(op)
+    if routing is None:
+        return (), None
+    cells, rank, basis = routing
+    matrix, link_bytes = _peer_payload(cells, row_bytes)
+    return (
+        ("peer_volume_basis", "group_mean"),
+        ("peer_traffic", {"kind": "matrix", "payload_bytes": matrix}),
+        ("routing_basis", basis),
+        ("traffic_model", basis),
+        ("peer_source_rank", rank),
+    ), link_bytes
+
+
+class _PeerRouteId(str):
+    """Payload id carrying the compact route ledger to its inverse operator.
+
+    The ordinary builder passes only op ids across the dispatch/combine
+    boundary.  An explicit source route already owns the exact integer matrix,
+    so that pairing carries it as an immutable attribute of the same string
+    identity.  No global registry, history or module-level mutable state is
+    involved; a caller that constructs combine directly still receives the
+    old id-only contract.
+    """
+
+    def __new__(cls, op_id, cells, rank, basis):
+        value = super().__new__(cls, op_id)
+        value.cells = cells
+        value.rank = rank
+        value.basis = basis
+        return value
+
+
 def histogram(*, prefix, plan, stage, requests, rows, ep, deps,
               ids_producer, realization, mode, transport):
     """Typed local expert histogram, then one count allgather per source."""
@@ -532,7 +632,8 @@ def histogram(*, prefix, plan, stage, requests, rows, ep, deps,
     # supported EP1 explicit realization the source owns the complete count
     # vector; balanced cross-rank destination counts are separate provenance.
     counts = (tuple(realization.expert_rows)
-              if basis == "declared_integer_counts" and ep == 1 else None)
+              if basis in {"declared_integer_counts",
+                           "explicit_token_routing_integer"} and ep == 1 else None)
     if counts is not None:
         if len(counts) != plan.num_experts or sum(counts) != rows:
             raise ModelingError(
@@ -555,7 +656,8 @@ def histogram(*, prefix, plan, stage, requests, rows, ep, deps,
                   ("count_values", "declared_source" if counts is not None
                    else "not_declared"),
                   ("global_expert_counts", tuple(realization.expert_rows)
-                   if basis == "forced_balanced_integer_counts" else None),
+                   if basis in {"forced_balanced_integer_counts",
+                                "explicit_token_routing_integer"} else None),
                   ("count_work", "one_increment_per_source_assignment"),
                   ("includes_zero_count_experts", True)),
     )
@@ -599,6 +701,12 @@ def quantize(*, prefix, plan, stage, requests, pack, transport, rows, width,
         group_size = width
         groups = 0
         write = rows * width * transport.payload_bytes
+    routing = _routing_peer_counts(pack)
+    routing_metadata = (() if routing is None else (
+        ("moe_peer_counts", routing[0]),
+        ("moe_peer_rank", routing[1]),
+        ("moe_peer_basis", routing[2]),
+    ))
     op = vector_op(
         op_id=prefix + ".moe_transport_quantize", deps=(pack.op_id,), stage=stage,
         layer=plan.index, requests=requests, elements=rows_int * width,
@@ -625,6 +733,7 @@ def quantize(*, prefix, plan, stage, requests, pack, transport, rows, width,
                   ("quantization_scope", "moe_transport_expert_input"),
                   ("quantizer_count", 1),
                   ("eplb_peak_to_avg", transport.eplb_peak_to_avg),
+                  *routing_metadata,
                   ("formula", ("dynamic_per_row_symmetric_int8_fp32"
                                if not transport.inline_scales
                                else "dynamic_block32_e4m3_e8m0"))),
@@ -638,6 +747,7 @@ def dispatch(*, prefix, plan, stage, requests, quantized, transport, rows, width
     ops = []
     if ep <= 1:
         return ops, None, None
+    routing = _routing_peer_counts(quantized)
     common = (("group_axis", "ep"), ("steps", ep - 1),
               ("source_assignment_partitions", partitions),
               ("remote_fraction", (ep - 1) / ep),
@@ -648,17 +758,21 @@ def dispatch(*, prefix, plan, stage, requests, quantized, transport, rows, width
               ("dispatch_dtype", transport.dispatch_dtype))
     scale = None
     if transport.quantized and not transport.inline_scales:
+        scale_row_bytes = dtype_bytes(transport.scale_dtype)
+        scale_peer, scale_link = _peer_metadata(quantized, scale_row_bytes)
         scale = comm_op(
             op_id=prefix + ".moe_scale_dispatch",
             deps=tuple(dict.fromkeys((quantized.op_id,) + ((hist_gather,) if hist_gather else ()))),
             stage=stage, layer=plan.index, requests=requests,
             family="alltoall", phase=mode, recipe="expert_scale_dispatch",
-            link_bytes=rows * dtype_bytes(transport.scale_dtype) * (ep - 1) / ep,
+            link_bytes=(scale_link if scale_link is not None
+                        else rows * scale_row_bytes * (ep - 1) / ep),
             shape=(_ceil_rows(rows),),
             metadata=common + (("collective_id", prefix + ".moe_scale_dispatch"),
                                ("payload_kind", "row_scale"),
                                ("payload_dtype", transport.scale_dtype),
-                               ("row_bytes", dtype_bytes(transport.scale_dtype))),
+                               ("row_bytes", scale_row_bytes),
+                               *scale_peer),
         )
         ops.append(scale)
     payload_row_bytes = transport.row_bytes(width)
@@ -669,6 +783,7 @@ def dispatch(*, prefix, plan, stage, requests, quantized, transport, rows, width
         row_format = {"elements": width,
                       "forward_dtype": transport.payload_dtype,
                       "reverse_dtype": "bf16"}
+    payload_peer, payload_link = _peer_metadata(quantized, payload_row_bytes)
     payload = comm_op(
         op_id=prefix + ".moe_payload_dispatch",
         deps=tuple(dict.fromkeys((quantized.op_id,)
@@ -676,7 +791,8 @@ def dispatch(*, prefix, plan, stage, requests, quantized, transport, rows, width
                                  + ((hist_gather,) if hist_gather else ()))),
         stage=stage, layer=plan.index, requests=requests,
         family="alltoall", phase=mode, recipe="expert_quantized_dispatch",
-        link_bytes=rows * payload_row_bytes * (ep - 1) / ep,
+        link_bytes=(payload_link if payload_link is not None
+                    else rows * payload_row_bytes * (ep - 1) / ep),
         shape=(_ceil_rows(rows), width),
         metadata=common + (("collective_id", prefix + ".moe_payload_dispatch"),
                            ("payload_kind", "quantized_rows"),
@@ -687,10 +803,32 @@ def dispatch(*, prefix, plan, stage, requests, quantized, transport, rows, width
                            ("inline_scale_bytes",
                             transport.scale_bytes(width) if transport.inline_scales else 0.0),
                            ("scale_group", transport.scale_group),
-                           (_EXPERT_ROW_FORMAT, row_format)),
+                           (_EXPERT_ROW_FORMAT, row_format),
+                           *payload_peer),
     )
     ops.append(payload)
-    return ops, (scale.op_id if scale else None), payload.op_id
+    # The received quantities are real output slots of this collective.  The
+    # gate consumes these values; no consumer may infer dtype from the
+    # quantized producer's ancestry.
+    from .deepep import declare_received_value
+    if scale is not None:
+        replaced = declare_received_value(
+            scale, dtype=transport.scale_dtype, shape=(_ceil_rows(rows),),
+            row_bytes=dtype_bytes(transport.scale_dtype),
+            storage=f"moe.rx:{prefix}.moe_scale_dispatch",
+            binding="static", binding_name=f"{prefix}.moe_scale_dispatch.rx")
+        ops = [replaced if op.op_id == scale.op_id else op for op in ops]
+        scale = replaced
+    replaced = declare_received_value(
+        payload, dtype=transport.payload_dtype, shape=(_ceil_rows(rows), width),
+        row_bytes=payload_row_bytes,
+        storage=f"moe.rx:{prefix}.moe_payload_dispatch",
+        binding="static", binding_name=f"{prefix}.moe_payload_dispatch.rx")
+    ops = [replaced if op.op_id == payload.op_id else op for op in ops]
+    payload = replaced
+    payload_id = (_PeerRouteId(payload.op_id, *routing)
+                  if routing is not None else payload.op_id)
+    return ops, (scale.op_id if scale else None), payload_id
 
 
 def combine(*, prefix, plan, stage, requests, deps, transport, rows, width, ep,
@@ -698,17 +836,43 @@ def combine(*, prefix, plan, stage, requests, deps, transport, rows, width, ep,
     """BF16 return with dispatch source rows transposed before dtype conversion."""
     if ep <= 1:
         return None
+    return_bytes = width * transport.return_bytes
+    cells = getattr(payload_dispatch, "cells", None)
+    if cells is None:
+        link_bytes = rows * return_bytes * (ep - 1) / ep
+        reverse = (("reverse_of_collective", payload_dispatch),)
+        peer_metadata = ()
+    else:
+        # The dispatch id carried the exact assignment matrix.  Transpose it at
+        # the return row width here, so the inverse op keeps real per-source
+        # traffic instead of a group-mean scalar.  Its counterpart is already
+        # an explicit forward declaration, so a second inverse binding would
+        # only re-check numbers derivable from this same ledger.
+        size = len(cells)
+        matrix = tuple(tuple(0 if source == destination else
+                             float(return_bytes) * cells[destination][source]
+                             for destination in range(size))
+                       for source in range(size))
+        link_bytes = math.fsum(value for row in matrix for value in row) / size
+        reverse = ()
+        peer_metadata = (
+            ("peer_volume_basis", "group_mean"),
+            ("peer_traffic", {"kind": "matrix", "payload_bytes": matrix}),
+            ("routing_basis", getattr(payload_dispatch, "basis", "")),
+            ("traffic_model", getattr(payload_dispatch, "basis", "")),
+            ("peer_source_rank", getattr(payload_dispatch, "rank", 0)),
+        )
     return comm_op(
         op_id=prefix + ".expert_combine", deps=(deps,), stage=stage,
         layer=plan.index, requests=requests, family="alltoall", phase=mode,
         recipe="expert_combine",
-        link_bytes=rows * width * transport.return_bytes * (ep - 1) / ep,
+        link_bytes=link_bytes,
         shape=(_ceil_rows(rows), width),
         metadata=(("group_axis", "ep"), ("steps", ep - 1),
                   ("source_assignment_partitions", partitions),
                   ("traffic_model", "transpose_dispatch_peer_rows"),
                   ("collective_id", prefix + ".expert_combine"),
-                  ("reverse_of_collective", payload_dispatch),
+                  *reverse,
                   ("payload_kind", "bf16_return_rows"),
                   ("payload_dtype", "bf16"),
                   ("combine_dtype", "bf16"),
@@ -722,7 +886,8 @@ def combine(*, prefix, plan, stage, requests, deps, transport, rows, width, ep,
                       if transport.inline_scales else
                       {"elements": width,
                        "forward_dtype": transport.payload_dtype,
-                       "reverse_dtype": "bf16"}))),
+                       "reverse_dtype": "bf16"})),
+                  *peer_metadata),
     )
 
 

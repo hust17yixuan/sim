@@ -45,7 +45,8 @@ def test_body_matrix_default_is_shared_by_predict_graph_operators_and_structure(
     assert all(row["program"] == "SteadyMatmul" for row in isolated["operators"]
                if row["operator"]["family"] in MATRIX_FAMILIES)
     assert structure["execution"]["software"]["kernels"]["programs"]["matmul"] == {
-        "kind": "steady_matmul", "candidates": [[128, 128, 128], [128, 128, 64]]}
+        "kind": "steady_matmul", "owner_cohorts": True,
+        "candidates": [[128, 128, 128], [128, 128, 64]]}
     assert structure["execution"]["default_mechanisms"] == body["default_mechanisms"]
     assert body["execution"]["live_tasks"] == body["execution"]["live_programs"] == 0
     assert raw == before
@@ -107,11 +108,22 @@ def test_model_scope_and_body_optout_retain_detailed_control_and_semantic_work()
 def test_serving_default_remains_the_explicit_tiled_control():
     raw = physical_case()
     automatic = predict(raw)
+    steady = deepcopy(raw)
+    steady["runtime"]["kernels"] = {
+        "programs": {"matmul": {"kind": "steady_matmul", "owner_cohorts": True,
+                                "candidates": [[128, 128, 128], [128, 128, 64]]}},
+        "families": {"grouped_gemm": {"kind": "steady_matmul", "owner_cohorts": True}},
+    }
+    steady_report = predict(steady)
+    assert automatic["metrics"] == steady_report["metrics"]
+    assert {k: v for k, v in automatic["execution"].items() if k != "runtime_uid"} == {
+        k: v for k, v in steady_report["execution"].items() if k != "runtime_uid"
+    }
     explicit = deepcopy(raw)
     explicit["runtime"]["kernels"] = {"programs": {"matmul": {"kind": "tiled_matmul"}}}
     control = predict(explicit)
-    assert automatic["metrics"] == control["metrics"]
-    assert automatic["execution"] == control["execution"]
+    assert control["execution"]["work"] == automatic["execution"]["work"]
+    assert control["execution"]["allocation_events"] > automatic["execution"]["allocation_events"]
 
 
 def test_default_keeps_fp32_router_owner_grid_and_grouped_mapping_domain():

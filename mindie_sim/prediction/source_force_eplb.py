@@ -87,10 +87,70 @@ class SourceForceEplb:
             "source_local_rows": self.allocated_tokens_per_rank,
             "valid_tokens_per_rank": self.valid_tokens_per_rank,
             "allocated_tokens_per_rank": self.allocated_tokens_per_rank,
+            "top_k": self.top_k,
+            "ep": self.ep,
             "source_partitions": self.source_partitions,
             "communication_assumption": "source_cursor_and_active_mask_exact_integer_matrix",
             "cursor": "(allocated_local_rows*top_k+1)*source_rank + local_assignment",
             "mask": "contiguous_global_valid_prefix; global_bs=0",
+        }
+
+    def token_order(self):
+        """Expand the declared cursor/mask into concrete local top-k rows.
+
+        The expansion is derived from the same source cursor and valid-prefix
+        mask as :func:`ledger`; it is not a captured token identity.  It gives
+        T12 a concrete occurrence while the source scenario label remains.
+        """
+        banks = len(self.expert_rows) // self.ep
+        rows = []
+        for source, count in enumerate(self.valid_tokens_per_rank):
+            for token in range(count):
+                ids = []
+                for slot in range(self.top_k):
+                    cursor = ((self.allocated_tokens_per_rank * self.top_k + 1)
+                              * source + token * self.top_k + slot)
+                    destination = cursor % self.ep
+                    bank = (cursor // self.ep) % banks
+                    ids.append(destination * banks + bank)
+                rows.append((source, tuple(ids)))
+        counts = [0] * len(self.expert_rows)
+        peer = [[0] * self.ep for _ in range(self.ep)]
+        for source, ids in rows:
+            for expert in ids:
+                counts[expert] += 1
+                peer[source][expert // banks] += 1
+        if tuple(counts) != self.expert_rows:
+            raise ModelingError("source_force_eplb_token_order_expert_rows_mismatch")
+        if tuple(tuple(row) for row in peer) != self.peer_assignments:
+            raise ModelingError("source_force_eplb_token_order_peer_mismatch")
+        return tuple(rows)
+
+    def typed_occurrence(self, *, payload_scale_producer, native_top_k=1):
+        """One concrete source occurrence for a T12 typed-call binding."""
+        if type(native_top_k) is not int or native_top_k < 1:
+            raise ModelingError("source_force_eplb_native_top_k_invalid")
+        order = self.token_order()
+        banks = len(self.expert_rows) // self.ep
+        return {
+            "basis": self.basis,
+            "source": SOURCE,
+            "capture_identity": SOURCE["capture_binary_identity"],
+            "source_owners": tuple(source for source, _ids in order),
+            "token_order": tuple(ids for _source, ids in order),
+            "token_order_basis": "derived_from_source_cursor",
+            "expert_placement": tuple(
+                (expert // banks, expert % banks)
+                for expert in range(len(self.expert_rows))),
+            "source_destination_rows": self.peer_assignments,
+            "destination_bank_rows": self.rank_expert_rows,
+            "expert_rows": self.expert_rows,
+            "valid_tokens_per_rank": self.valid_tokens_per_rank,
+            "allocated_tokens_per_rank": self.allocated_tokens_per_rank,
+            "representative_rank": self.representative_rank,
+            "model_top_k": self.top_k,
+            "native_top_k": native_top_k,
+            "payload_scale_producer": dict(payload_scale_producer),
         }
 
 

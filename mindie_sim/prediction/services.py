@@ -32,8 +32,67 @@ _COMMUNICATION_KEYS = (
     "stack", "cann")
 
 
+def _zero_resource_node(op) -> bool:
+    """A pure sync/join has no physical work and no native precision."""
+    return not (
+        float(getattr(op, "flops", 0.0) or 0.0)
+        or tuple(getattr(op, "matrix_flops", ()) or ())
+        or float(getattr(op, "hbm_bytes", 0.0) or 0.0)
+        or float(getattr(op, "mte2_bytes", 0.0) or 0.0)
+        or float(getattr(op, "mte3_bytes", 0.0) or 0.0)
+        or float(getattr(op, "vector_ops", 0.0) or 0.0)
+        or float(getattr(op, "link_bytes", 0.0) or 0.0)
+    )
+
+
+def _zero_resource_identity(case, op, metadata, scope, device):
+    """Identity for a barrier/join: no model or dtype lookup is attempted."""
+    runtime = getattr(case, "runtime", None) if case is not None else None
+    machine = getattr(case, "machine", None) if case is not None else None
+    hardware = {}
+    if machine is not None:
+        hardware = {"key": getattr(machine, "hardware_key", "") or
+                    getattr(machine, "sku", ""),
+                    "architecture": getattr(machine, "arch_family", "")}
+        dies = tuple(getattr(machine, "dies", ()) or ())
+        selected = device
+        if selected is None and dies:
+            try:
+                selected = dies[op.stage]
+            except (AttributeError, IndexError, TypeError):
+                selected = None
+        if selected is not None:
+            hardware.update({
+                "compute_units": getattr(selected, "compute_units", 0),
+                "resource_units": dict(getattr(selected, "resource_units", {}) or {}),
+            })
+    return {
+        "hardware": hardware,
+        "runtime": getattr(runtime, "vllm_impl", "") if runtime is not None else "",
+        "revision": getattr(runtime, "vllm_version", "") if runtime is not None else "",
+        "format": getattr(runtime, "kernel_format", "") if runtime is not None else "",
+        "kernel": metadata.get("kernel", metadata.get("kernel_name", op.recipe)),
+        "implementation": metadata.get("implementation", {}),
+        "dtype": "",
+        "layout": op.layout,
+        "replay_scope": scope or "none",
+        "deps": list(getattr(op, "deps", ()) or ()),
+        "stream": getattr(op, "stream", ""),
+        "axes": metadata.get("service_axes", {}),
+    }
+
+
 def service_identity(case, op, scope="none", *, device=None):
     metadata = dict(op.metadata)
+    zero = (_zero_resource_node(op)
+            and not getattr(op, "dtype", "")
+            and op.family not in _COMMUNICATION_FAMILIES
+            and not metadata.get("hccl_selection")
+            and not any(key in metadata for key in _COMMUNICATION_KEYS))
+    if zero:
+        return json.loads(json.dumps(
+            _zero_resource_identity(case, op, metadata, scope, device),
+            sort_keys=True, allow_nan=False))
     device = device or case.machine.dies[
         op.stage * case.runtime.parallel.tp * case.runtime.parallel.pcp]
     identity = {
@@ -160,6 +219,32 @@ class ServiceCurve:
         return ServiceEstimate(work, self.startup_ms, duration - self.startup_ms, basis)
 
 
+def resolved_phase_work(context, work):
+    """Resolve one native phase demand onto physical pipes exactly once.
+
+    ``RecipeContext.for_phase`` already binds its declared phase work.  Reusing
+    that normalized demand prevents a service curve from multiplying a mode's
+    physical-rate conversion twice.  A context without a prepared phase keeps
+    the ordinary one-time bind for standalone use.
+    """
+    native = {**work.resources, "cube": sum(work.matrix.values())}
+    native = {key: value for key, value in native.items() if value}
+    if context.work and native and native == dict(context.native_work):
+        # The phase context already carries the normalized result of exactly
+        # this native demand. Reuse it instead of applying the mode conversion
+        # a second time.
+        return dict(context.work)
+    expected = context.bind(work)
+    if not context.work:
+        return expected
+    if (set(expected) != set(context.work)
+            or any(not math.isclose(expected[key], context.work[key],
+                                    rel_tol=1e-12, abs_tol=1e-12)
+                   for key in expected)):
+        raise ModelingError("service_work_does_not_match_phase_context")
+    return dict(context.work)
+
+
 @dataclass(frozen=True)
 class ResourceService:
     """One isolated resource invocation; phase composition stays in its caller."""
@@ -228,7 +313,7 @@ class ResourceService:
             ), minimum_ms=context.minimum_ms)
         else:
             work = Work(resources={role: amount})
-        expected = context.bind(work)
+        expected = resolved_phase_work(context, work)
         # One measured response cannot identify the occupancy of several pipes,
         # or several instruction modes sharing a pipe. The caller must split it.
         if len(expected) != 1 or expected != context.work:
@@ -242,7 +327,7 @@ class ResourceService:
         estimate = curve.estimate(amount)
         if estimate is None and self.outside_domain == "error":
             raise ModelingError(f"service_work_outside_domain:{amount}")
-        supply = context.work[resource] / estimate.service_ms if estimate else math.inf
+        supply = expected[resource] / estimate.service_ms if estimate else math.inf
         physical_supply = context.rates[resource] * active_units / owner_count
         if context.record_service is not None:
             context.record_service(

@@ -2,8 +2,11 @@
 
 [Role] Bind update convolution, gating, Q/K normalization and state recurrence.
 [Invariants] Caller copies replace generic work. Query rows do not shrink with
-  speculative acceptance; full capture retains physical buffers while dummy
-  zero-length sequences perform no convolution or recurrent state work.
+  speculative acceptance; full capture retains physical buffers while padding
+  slots own no state and dummy zero-length slots perform no convolution or
+  recurrent state work. Conv history is activation-dtype; recurrent state is
+  FP32. Each active query produces a candidate checkpoint; only the accepted
+  offset commits at token commit, and unaccepted candidates are rejected.
   Each named copy/fill is a declared vector invocation, not an extra host gap.
 [Timeouts & Locks] O(sequence descriptors), lazily executed physical kernels.
 [Side-Effect Policy] Builds operators only; no measurements or device contexts.
@@ -13,6 +16,7 @@ import math
 
 from mindie_sim.catalog.attention_common import AttentionResult
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.tensors import TensorLayout, TensorValue
 from .call_gdn import GATING_SOURCE
 from . import gdn_recurrent
 from .gdn_decode_programs import CONV, GATING, CONV_SOURCE, conv_plan, gating_plan
@@ -20,6 +24,10 @@ from .gdn_prefill import decode_core, rearrange_qkv
 from .graph import GraphPolicy
 from .lowering import Builder
 from .mechanism import PlannedRecipe
+from .recover_ssm_work import (
+    GDN_ARCH35_RECOVER_SSM_RECIPE, build_gdn_arch35_recover_ssm,
+    emit_commit_op, recover_ssm_enabled, rewrite_gdn_analytical_scan,
+)
 from .tensors import TensorLowering
 
 SOURCE = {"path": "data/observations/sources/gdn-image-c3d00a196905/gdn.py.txt",
@@ -29,7 +37,8 @@ SOURCE = {"path": "data/observations/sources/gdn-image-c3d00a196905/gdn.py.txt",
 
 def recipes():
     return {CONV: PlannedRecipe(conv_plan), GATING: PlannedRecipe(gating_plan),
-            gdn_recurrent.IMPLEMENTATION: PlannedRecipe(gdn_recurrent.build)}
+            gdn_recurrent.IMPLEMENTATION: PlannedRecipe(gdn_recurrent.build),
+            GDN_ARCH35_RECOVER_SSM_RECIPE: PlannedRecipe(build_gdn_arch35_recover_ssm)}
 
 
 def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
@@ -42,17 +51,77 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
     if (not isinstance(cache_index_row_stride, int) or isinstance(cache_index_row_stride, bool)
             or cache_index_row_stride < 1):
         raise ModelingError("gdn_decode_cache_index_row_stride_requires_positive_integer")
+    conv_dtype = plan.conv_state_dtype
+    if conv_dtype != model.activation_dtype:
+        raise ModelingError("gdn_decode_conv_state_dtype_must_match_activation")
     b = Builder(prefix, plan, stage, views, model, mode)
     tensors = TensorLowering(b, runtime.tensor_layouts)
-    tp, tokens, actual = parallel.tp, padded_tokens, sum(view.q_len for view in views)
+    tp, tokens = parallel.tp, padded_tokens
+    physical = sum(view.q_len for view in views)
+    active = tuple(view for view in views if not view.padding)
+    active_rows = sum(view.q_len for view in active)
     _, capture_scope = GraphPolicy().select(views, runtime)
-    core_tokens = tokens if capture_scope == "full" else actual
-    lengths = tuple(view.q_len for view in views)
-    # The captured Python slices retain their capture-time extent. The source
-    # metadata builder pads query_start_loc with its last offset, so these
-    # physical request slots have zero logical length during replay.
-    slots = max(len(views), math.ceil(core_tokens / lengths[0])) if capture_scope == "full" else len(views)
-    physical_lengths = lengths + (0,) * (slots - len(views))
+    core_tokens = tokens if capture_scope == "full" else physical
+    if core_tokens < physical:
+        raise ModelingError(f"gdn_decode_capture_rows_below_physical:{core_tokens}:{physical}")
+    extra = core_tokens - physical
+    zero_slots = 0
+    if extra:
+        # A captured graph owns physical request slots, not a fluid share of
+        # leftover tokens.  The caller must declare the real partition (padding
+        # views or an exact uniform slot width); a remainder is not rounded into
+        # a guessed balanced batch.
+        if (any(view.padding for view in views)
+                or len({view.q_len for view in views}) != 1
+                or views[0].q_len <= 0 or extra % views[0].q_len):
+            raise ModelingError(
+                f"gdn_decode_capture_requires_exact_uniform_partition:{extra}")
+        zero_slots = extra // views[0].q_len
+    lengths = tuple(view.q_len for view in views) + (0,) * zero_slots
+    # A padding view retains its physical rows but owns no state: it adds a
+    # zero-length host-grid slot rather than a fake request/state row.
+    padding_slots = (tuple(index for index, view in enumerate(views) if view.padding)
+                     + tuple(range(len(views), len(views) + zero_slots)))
+    speculative = any(view.q_len > 1 for view in active)
+    max_query = max((view.q_len for view in active), default=1)
+    initial_flags = tuple(view.context > 0 and not view.padding for view in views)
+    runtime_meta = dict(runtime.metadata)
+    state_capacity = runtime_meta.get(
+        "gdn_state_rows", runtime_meta.get("gdn_state_capacity"))
+    raw_slots = runtime_meta.get("gdn_decode_state_indices",
+                                 runtime_meta.get("gdn_state_indices"))
+    slot_source = "caller_tensor"
+    slot_indices = None
+    if raw_slots is not None:
+        if isinstance(raw_slots, dict):
+            try:
+                slot_indices = tuple(
+                    None if raw_slots[view.request_id] is None
+                    else int(raw_slots[view.request_id]) for view in views)
+            except (KeyError, TypeError, ValueError):
+                raise ModelingError("gdn_decode_state_indices_missing_request")
+        elif isinstance(raw_slots, (list, tuple)) and len(raw_slots) == len(views):
+            slot_indices = tuple(None if value is None else int(value)
+                                 for value in raw_slots)
+        else:
+            raise ModelingError("gdn_decode_state_indices_length_mismatch")
+        slot_source = "caller_metadata"
+    contract, recurrent_effects = gdn_recurrent.state_contract(
+        views=views, phase="decode", state_dtype=plan.recurrent_state_dtype,
+        conv_state_dtype=conv_dtype, conv_kernel=plan.conv_kernel,
+        target_prefix=prefix, zero_slots=zero_slots,
+        index_row_stride=cache_index_row_stride, index_slots=len(lengths),
+        initial_state=initial_flags, direction="token",
+        target_kind="recurrent", slot_source=slot_source,
+        state_capacity=state_capacity, slot_indices=slot_indices)
+    conv_contract, conv_effects = gdn_recurrent.state_contract(
+        views=views, phase="decode", state_dtype=plan.recurrent_state_dtype,
+        conv_state_dtype=conv_dtype, conv_kernel=plan.conv_kernel,
+        target_prefix=prefix, zero_slots=zero_slots,
+        index_row_stride=cache_index_row_stride, index_slots=len(lengths),
+        initial_state=initial_flags, direction="token", target_kind="conv",
+        slot_source=slot_source, state_capacity=state_capacity,
+        slot_indices=slot_indices)
     keys = math.ceil((plan.linear_key_heads or plan.linear_heads) / tp)
     heads = math.ceil((plan.linear_value_heads or plan.linear_heads) / tp)
     dk, dv = plan.linear_key_head_dim or plan.linear_head_dim, plan.linear_head_dim
@@ -71,25 +140,71 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
                   family="tensor_fill", dtype="bf16")
     conv_input = tensors.contiguous(projection.narrow(0, 0, core_tokens).narrow(1, 0, width),
                                     "convolution_input_contiguous", reason="causal_conv1d_update.contiguous")
-    speculative = any(length > 1 for length in lengths)
-    if speculative and any(length == 1 for length in lengths):
+    if speculative and any(view.q_len == 1 for view in active):
         raise ModelingError("gdn_decode_mixed_spec_non_spec_caller_not_selected")
-    # The caller selects one state index per request before normalizing the
-    # view. Proposal-table stride is independent of query count and padding.
-    cache_indices = tensors.result(deps, (slots, cache_index_row_stride), "int32",
+    # The caller selects one state index per physical request slot before
+    # normalizing the view. Proposal-table stride is independent of query count
+    # and padding; a multi-column table needs the real one-column copy.
+    cache_indices = tensors.result(deps, (len(lengths), cache_index_row_stride), "int32",
                                     output="causal_cache_indices").narrow(1, 0, 1)
     cache_indices = tensors.contiguous(cache_indices, "state_indices_contiguous",
                                        reason="_normalize_causal_cache_indices.contiguous")
-    conv = b.work("short_convolution", tuple(dict.fromkeys((conv_input.producer, cache_indices.producer))), (actual, width),
-                  family="short_convolution", dtype="bf16",
+    state_write_bytes = sum(
+        (2 + view.q_len if speculative else plan.conv_kernel - 1) * width * 2
+        for view in active)
+    conv_deps = tuple(dict.fromkeys((conv_input.producer, cache_indices.producer)))
+    conv_views, cursor = [], 0
+    for view in views:
+        conv_views.append(conv_input.narrow(0, cursor, view.q_len))
+        cursor += view.q_len
+    conv = b.work("short_convolution", conv_deps, (active_rows, width),
+                  family="short_convolution", dtype=model.activation_dtype,
                   metadata=(("sequence_tokens", lengths), ("kernel_width", plan.conv_kernel),
-                            ("physical_sequence_tokens", physical_lengths),
+                            ("physical_sequence_tokens", lengths),
                             ("physical_query_rows", core_tokens),
-                            ("speculative", speculative), ("state_history_slots", plan.conv_kernel - 1 + max(lengths) - 1),
+                            ("active_query_rows", active_rows),
+                            ("padding_slots", padding_slots),
+                            ("speculative", speculative),
+                            ("state_history_slots", plan.conv_kernel - 1 + (max_query - 1 if speculative else 0)),
+                            ("state_dtype", conv_dtype), ("state_layout", "slots_history_channels"),
+                            ("state_mutation", "inplace_history_writeback"),
+                            ("state_write_bytes", state_write_bytes),
+                            ("state_slots", tuple(slot for slot in range(len(lengths)) if slot not in padding_slots)),
                             ("cache_index_row_stride", cache_index_row_stride),
                             ("cache_index_dtype", "int32"),
                             ("cache_index_source", {**SOURCE, "caller_lines": ((138, 143), (435, 445))}),
+                            ("state_copy_boundary", "cache_index_single_column_contiguous"),
+                            ("state_contract", "conv_history_slots_history_channels"),
+                            ("gdn_state_contract", conv_contract),
+                            ("gdn_state_effects", conv_effects),
                             ("bias", False), ("source", CONV_SOURCE)))
+    conv_contract, conv_outputs = gdn_recurrent.bind_state_ports(
+        {**conv_contract,
+         "candidate_storage": ("history_ring+query_rows" if speculative else ""),
+         "candidate_recovery": ("accepted_prefix_from_conv_history_and_query_inputs"
+                                if speculative else ""),
+         "value_inputs": tuple(gdn_recurrent.tensor_port(
+             value, role="conv_input", ready=value.producer,
+             owner=value.producer) for value in conv_views)},
+        conv, heads=heads, head_shards=1)
+    b.ops[-1] = replace(b.ops[-1], metadata=tuple(sorted({
+        **dict(b.ops[-1].metadata),
+        "state_ready": conv,
+        "state_value_inputs": conv_contract["value_inputs"],
+        "state_value_outputs": conv_outputs,
+        "state_candidate_stores": conv_contract["candidate_stores"],
+        "state_candidate_storage": {
+            "kind": conv_contract.get("candidate_storage", ""),
+            "recovery": conv_contract.get("candidate_recovery", ""),
+            "history_slots": plan.conv_kernel - 1 + (max_query - 1
+                                                    if speculative else 0),
+            "query_rows": tuple(view.q_len for view in active),
+            "cache_index_view": cache_indices.to_dict(),
+            "op": conv,
+        },
+        "gdn_state_contract": conv_contract,
+        "gdn_state_effects": conv_effects,
+    }.items())))
     b.ops[-1] = replace(b.ops[-1], recipe=CONV, source_boundary="kernel",
                         padded_shape=(core_tokens, width))
     values = rearrange_qkv(tensors, conv, core_tokens, heads, keys, dk, dv)
@@ -129,21 +244,68 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
     b.ops[-1] = replace(b.ops[-1], recipe=GATING, source_boundary="kernel")
     gate_values = (tensors.result(gated, (1, core_tokens, heads), "fp32", output="decay"),
                    tensors.result(gated, (1, core_tokens, heads), "bf16", output="beta"))
-    core = decode_core(b, tensors, values, gate_values, views, heads, keys, dk, dv,
-                       physical_tokens=core_tokens, physical_sequence_tokens=physical_lengths)
+    decode_offsets, offset_cursor = [], 0
+    for view in views:
+        if not view.padding:
+            decode_offsets.append(offset_cursor)
+        offset_cursor += view.q_len
+    core = decode_core(b, tensors, values, gate_values, active, heads, keys, dk, dv,
+                       physical_tokens=core_tokens, physical_sequence_tokens=lengths,
+                       physical_row_offsets=tuple(decode_offsets))
     scan = b.ops[-1]
+    scan_meta = dict(scan.metadata)
+    decode_value_inputs = tuple(
+        view_values[2] for view_values in scan_meta.get("state_value_views", ()))
+    checkpoint_versions = tuple(
+        None if count <= 0
+        else tuple(context + offset + 1 for offset in range(count))
+        for context, count in zip(contract["contexts"], contract["checkpoints"]))
+    contract, recurrent_outputs = gdn_recurrent.bind_state_ports(
+        contract, scan.op_id, heads=heads, head_shards=1)
+    state_metadata = tuple({**scan_meta,
+                            "padding_slots": padding_slots,
+                            "physical_query_rows": core_tokens,
+                            "state_ready": scan.op_id,
+                            "state_value_inputs": decode_value_inputs,
+                            "state_value_outputs": recurrent_outputs,
+                            "state_candidate_stores": contract["candidate_stores"],
+                            "state_candidate_storage": {
+                                "kind": "token_checkpoint_store",
+                                "recovery": "accepted_prefix_from_query_candidates",
+                                "history_slots": None,
+                                "query_rows": tuple(view.q_len for view in active),
+                                "op": scan.op_id,
+                            },
+                            "gdn_state_contract": contract,
+                            "gdn_state_effects": recurrent_effects,
+                            "state_checkpoint_versions": checkpoint_versions}.items())
+    b.ops[-1] = replace(scan, metadata=state_metadata)
+    scan = b.ops[-1]
+    use_recover_ssm = recover_ssm_enabled(runtime) and speculative
     if recurrent_implementation == "arch35_fp32":
-        b.ops[-1] = replace(scan, recipe=gdn_recurrent.IMPLEMENTATION, source_boundary="kernel",
+        recipe_name = GDN_ARCH35_RECOVER_SSM_RECIPE if use_recover_ssm else gdn_recurrent.IMPLEMENTATION
+        extra_meta = {"recover_ssm": True, "recover_ssm_stage": "verify_compact_record"} if use_recover_ssm else {}
+        b.ops[-1] = replace(scan, recipe=recipe_name, source_boundary="kernel",
                            metadata=tuple({**dict(scan.metadata), "source": gdn_recurrent.SOURCE,
                                "implementation_scope": "source_resident_qkv_and_state_pipeline",
                                "recurrence_selection": recurrent_implementation,
                                "unmodeled_features": ("scalar_metadata_issue_and_cache_latency",),
+                               **extra_meta,
                            }.items()))
     elif recurrent_implementation == "analytical":
-        b.ops[-1] = replace(scan, metadata=tuple({**dict(scan.metadata),
-                           "recurrence_selection": recurrent_implementation}.items()))
+        updated_scan = replace(scan, metadata=tuple({**dict(scan.metadata),
+                               "recurrence_selection": recurrent_implementation}.items()))
+        if use_recover_ssm:
+            updated_scan = rewrite_gdn_analytical_scan(
+                updated_scan, active_views=active, heads=heads, dk=dk, dv=dv,
+                state_dtype=plan.recurrent_state_dtype, kg_dtype=model.activation_dtype)
+        b.ops[-1] = updated_scan
     else:
         raise ModelingError("gdn_decode_recurrent_implementation_unknown:" + recurrent_implementation)
+    if use_recover_ssm:
+        emit_commit_op(b, name="recover_ssm_commit", deps=(scan.op_id,), views=active,
+                       heads=heads, dk=dk, dv=dv, state_dtype=plan.recurrent_state_dtype,
+                       kg_dtype=model.activation_dtype, runtime=runtime, attention_kind="gdn")
     copied = tensors.copy_into(core, tensors.result(zero, (tokens, heads, dv)).narrow(0, 0, core_tokens),
                                "core_output_copy")
     # gdn.py flattens token and head axes before norm. This crosses the

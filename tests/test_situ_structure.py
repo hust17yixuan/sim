@@ -15,7 +15,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def _case():
-    return parse_case(json.loads((ROOT / "examples/cases/kimi-k3-a5.json").read_text()))
+    raw = json.loads((ROOT / "examples/cases/kimi-k3-a5.json").read_text())
+    raw["model"]["layers"] = 2
+    return parse_case(raw)
 
 
 def test_kimi_config_changes_dense_shared_and_routed_work_to_situ():

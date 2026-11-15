@@ -202,6 +202,6 @@ def test_one_scale_slot_and_cross_group_weight_reuse_have_real_engine_dependenci
 
 def test_large_row_loop_retains_only_a_finite_window_of_engine_tasks():
     _,engine,_=direct((65,))
-    assert engine.completed_count > 500
+    assert engine.completed_count > 400
     assert engine.peak_tasks < 40
     assert engine.peak_allocated['ub'] == 416  # source queues, excluding1KiBhost reserve

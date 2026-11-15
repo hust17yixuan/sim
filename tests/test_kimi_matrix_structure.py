@@ -1,6 +1,7 @@
 """Independent Kimi MX declarations checked against retained native interfaces."""
 from copy import deepcopy
 from dataclasses import replace
+from functools import lru_cache
 import json
 from pathlib import Path
 
@@ -14,8 +15,11 @@ from mindie_sim.structure_native_contracts import grouped_situ_contract
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@lru_cache(maxsize=1)
 def case():
-    base = parse_case(json.loads((ROOT / "examples/cases/kimi-k3-a5.json").read_text()))
+    raw = json.loads((ROOT / "examples/cases/kimi-k3-a5.json").read_text())
+    raw["model"]["layers"] = 4
+    base = parse_case(raw)
     quant = replace(
         base.model.quant, weight_format="mxfp4", expert_weight_format="mxfp4",
         activation_format="fp8_e4m3", activation_group_size=32,
@@ -24,12 +28,19 @@ def case():
     return replace(base, model=replace(base.model, quant=quant))
 
 
+@lru_cache(maxsize=1)
+def _prefill_graph():
+    return export_structure(case(), phase="prefill", tokens=8192, scope="body")
+
+
 def captured(kind):
     import mindie_profiler
     from mindie_profiler.normalized import kernel_rows
 
-    path = Path(mindie_profiler.__file__).resolve().parents[1] / \
-        "tests/fixtures/fusion_contracts/kimi_matrix_branches.csv"
+    rel = Path("tests/fixtures/fusion_contracts/kimi_matrix_branches.csv")
+    path = Path(mindie_profiler.__file__).resolve().parents[1] / rel
+    if not path.exists():
+        path = Path(__file__).resolve().parents[2] / "profiler" / rel
     if not path.exists():
         pytest.skip("The companion profiler Kimi MX source fixture is unavailable.")
     return [row for row in kernel_rows(path, rank_id="rank_0") if row.kind == kind]
@@ -38,7 +49,7 @@ def captured(kind):
 def test_grouped_situ_declares_source_boundary_without_claiming_observed_routing(profiler_api):
     from mindie_profiler.tensor_contracts import observed_contract
 
-    graph = export_structure(case(), phase="prefill", tokens=8192, scope="body")
+    graph = _prefill_graph()
     nodes = {node["node_id"]: node for node in graph["nodes"]}
     groups = [group for group in graph["subgraphs"] if group["role"] == "grouped_gate_up_situ_quant"]
     assert groups
@@ -96,7 +107,7 @@ def test_dense_situ_and_mxfp4_matrices_share_declared_conversion_without_merging
 ):
     from mindie_profiler.tensor_contracts import observed_contract
 
-    graph = export_structure(case(), phase="prefill", tokens=8192, scope="body")
+    graph = _prefill_graph()
     contracts = [node["contract"] for node in graph["nodes"]] + [
         group["contract"] for group in graph["subgraphs"]]
     for kind in ("QuantBatchMatmulV4", "SituMxQuant"):

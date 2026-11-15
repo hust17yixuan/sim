@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+from mindie_sim.schema.common import ModelingError
 from .expressions import Add, Const, Div, Expr, Mul, Neg, Sub, Sum, Var, simplify
 
 

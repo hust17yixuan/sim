@@ -105,7 +105,7 @@ def resolve(runtime, views, *, padded_tokens, replay_scope, global_views=None,
     An idle expert participant uses the active cohort's phase composition but
     retains zero local row counts.
     """
-    from .implementations import select
+    from .implementations import plan_record, select
 
     bindings = runtime.kernels.get("lowerings", {})
     if not any(is_policy(raw) for raw in bindings.values()):
@@ -137,17 +137,54 @@ def resolve(runtime, views, *, padded_tokens, replay_scope, global_views=None,
         binding = case.get("binding", raw.get("otherwise", "error"))
         if binding == "error":
             raise ModelingError(f"implementation_domain_unmatched:{selector}:{geometry}")
+        # Candidate inventory and the selected physical plan are separate
+        # records.  An unselected candidate never contributes execution work.
+        candidates = []
+        for candidate_index, candidate in enumerate(raw["cases"]):
+            candidate_binding = candidate["binding"]
+            candidate_implementation = (
+                "analytical" if candidate_binding == "analytical"
+                else select({selector: candidate_binding}, selector).name)
+            candidates.append({
+                "case": candidate_index,
+                "binding": candidate_binding,
+                "implementation": candidate_implementation,
+                "domain": candidate["domain"],
+                "matches": bool(_matches(candidate["domain"], geometry)),
+                "basis": "declared_candidate",
+            })
+        otherwise = raw.get("otherwise", "error")
+        if otherwise != "error":
+            candidates.append({
+                "case": "otherwise", "binding": otherwise,
+                "implementation": ("analytical" if otherwise == "analytical"
+                                   else select({selector: otherwise}, selector).name),
+                "domain": None, "matches": not matches,
+                "basis": "declared_candidate",
+            })
         if binding == "analytical":
             resolved.pop(selector)
             implementation = "analytical"
+            selected_plan = plan_record(None)
         else:
             resolved[selector] = binding
-            implementation = select({selector: binding}, selector).name
-        records.append({"selector": selector, "case": index, "model_scope": model_scope,
-                        "implementation": implementation,
-                        "coverage": ("analytical_semantic_work" if binding == "analytical"
-                                     else "declared_implementation_domain"),
-                        "domain": case.get("domain", {}), "geometry": geometry})
+            selected = select({selector: binding}, selector)
+            implementation = selected.name
+            selected_plan = plan_record(selected)
+        records.append({
+            "selector": selector, "case": index, "model_scope": model_scope,
+            "implementation": implementation,
+            "coverage": ("analytical_semantic_work" if binding == "analytical"
+                         else "declared_implementation_domain"),
+            "domain": case.get("domain", {}), "geometry": geometry,
+            "basis": "selected_software_plan",
+            "candidates": tuple(candidates),
+            "selected": {"case": index,
+                         "binding": binding,
+                         "implementation": implementation,
+                         "domain": case.get("domain", {})},
+            "plan": selected_plan,
+        })
     return replace(runtime, kernels={**runtime.kernels, "lowerings": resolved}), tuple(records)
 
 
@@ -162,52 +199,203 @@ class LoweringRegion:
     selections: tuple = ()
 
 
-def lower_regions(regions, *, graph, replay_scope, runtime, prefix=(), resource_fusion=True):
-    """Keep transforms inside their selected model call and capture the whole DAG.
+def capture_state(ops, graph, runtime, replay_scope):
+    """Annotate with GraphPolicy once and return the reusable state mapping."""
+    annotated = graph.apply(tuple(ops), replay_scope, runtime)
+    return annotated, _capture_values(annotated)
 
-    Draft sample/target commit barriers retain the edges between regions. Graph
-    segments are assigned once across their ordered concatenation, before native
-    fusion checks that every member belongs to one captured segment.
+
+def _capture_values(ops):
+    return {op.op_id: (dict(op.metadata).get("graph_captured"),
+                       dict(op.metadata).get("graph_segment"))
+            for op in ops}
+
+
+def apply_capture_state(ops, state):
+    """Materialize the complete partition on the actual DAG before native admission."""
+    result = []
+    for op in ops:
+        value = state.get(op.op_id)
+        if value is None or value[0] is None:
+            result.append(op)
+            continue
+        metadata = dict(op.metadata)
+        metadata["graph_captured"] = bool(value[0])
+        metadata["graph_segment"] = value[1]
+        result.append(replace(op, metadata=tuple(metadata.items())))
+    return tuple(result)
+
+
+def apply_capture_inheritance(ops, state, source_ops):
+    """Public handoff for body/prepared entries: inherit pre-fusion partition."""
+    return _inherit_capture(ops, state, source_ops)
+
+
+def _inherit_capture(ops, state, original):
+    """Keep the pre-fusion captured/eager decision for replacements.
+
+    Only segment ordinals are recomputed; a fused node's new family is never
+    used to expand the capture domain.
     """
-    from .transforms import lower_implementations
+    inherited = dict(state)
+    generated = {}
+    for op in ops:
+        metadata = dict(op.metadata)
+        value = inherited.get(op.op_id)
+        if value is None:
+            value = (metadata.get("graph_captured"),
+                     metadata.get("graph_segment"))
+        if value[0] is None:
+            members = metadata.get("fusion_semantic_ids")
+            if members:
+                member_values = [state[member] for member in members
+                                 if member in state]
+                if member_values and all(item == member_values[0]
+                                         for item in member_values):
+                    value = member_values[0]
+        # No suffix/name guessing: generated quantizer/representation nodes
+        # must be present in the complete state returned by the lowering path.
+        if value[0] is None:
+            dep_values = [state[dep] for dep in op.deps if dep in state]
+            if dep_values and all(item == dep_values[0] for item in dep_values):
+                value = dep_values[0]
+        if value[0] is not None:
+            generated[op.op_id] = value
+    result, segment, last_stage, last_captured = [], 0, None, False
+    for op in ops:
+        captured, _ = generated.get(op.op_id, (None, None))
+        if captured is None:
+            result.append(op)
+            continue
+        if op.stage != last_stage or bool(captured) != last_captured:
+            segment += 1
+        metadata = dict(op.metadata)
+        metadata["graph_captured"] = bool(captured)
+        metadata["graph_segment"] = segment
+        result.append(replace(op, metadata=tuple(metadata.items())))
+        last_stage, last_captured = op.stage, bool(captured)
+    return tuple(result)
+
+
+def lower_regions(regions, *, graph, replay_scope, runtime, prefix=(),
+                  resource_fusion=True, public_outputs=()):
+    """Insert representations, then partition the actual prefix+region DAG once."""
+    from .transforms import insert_representations, lower_implementations
     from .native_fusion import lower_native_fusions, _ordered
 
-    lowered = [lower_implementations(region.ops, region.runtime, region.source_dtype,
-                                    resource_fusion=False, local_tokens=region.local_tokens)
-               for region in regions]
-    captured_ops = graph.apply((*prefix, *(op for ops in lowered for op in ops)),
-                               replay_scope, runtime)
-    captured = iter(captured_ops)
-    result = list(islice(captured, len(prefix)))
-    fusion_groups = []
-    for region, ops in zip(regions, lowered):
-        scoped = tuple(islice(captured, len(ops)))
-        if not resource_fusion:
-            result.extend(scoped)
-            continue
-        # An unscoped fusion declaration requires its roles in the complete
-        # selected graph, not in every MTP step. Equal declarations share that
-        # domain even when other lowering decisions differ between calls.
-        kernels = region.runtime.kernels
-        binding = kernels.get("lowerings", {}).get("native_fusion")
-        configuration = {key: value for key, value in kernels.items() if key != "lowerings"}
-        group = next((group for group in fusion_groups
-                      if group[0] == (binding, configuration)), None)
-        if group is None:
-            group = [(binding, configuration), region.runtime, [], 0]
-            fusion_groups.append(group)
-        group[2].extend(scoped)
-        group[3] += region.local_tokens
+    prefix_ops = tuple(prefix)
+    inserted_regions = []
+    for region in regions:
+        inserted, preactivated = insert_representations(
+            region.ops, region.runtime, region.source_dtype)
+        inserted_regions.append((inserted, preactivated))
+    actual = tuple(prefix_ops) + tuple(
+        op for ops, _ in inserted_regions for op in ops)
+    annotated_actual = graph.apply(actual, replay_scope, runtime)
+    state = _capture_values(annotated_actual)
+    annotated_iter = iter(annotated_actual)
+    annotated_prefix = tuple(islice(annotated_iter, len(prefix_ops)))
+    annotated_regions = [tuple(islice(annotated_iter, len(ops)))
+                         for ops, _ in inserted_regions]
+    lowered = []
+    for region, (_, preactivated), annotated in zip(
+            regions, inserted_regions, annotated_regions):
+        selected = {op.op_id: state[op.op_id] for op in annotated
+                    if op.op_id in state}
+        lowered.append(lower_implementations(
+            annotated, region.runtime, region.source_dtype,
+            resource_fusion=False, local_tokens=region.local_tokens,
+            replay_scope=replay_scope, capture_state=selected,
+            skip_passes=("activation_quantization",),
+            preactivated=preactivated))
+        state.update(selected)
+    lowered = [apply_capture_state(ops, state) for ops in lowered]
+    transformed = (*annotated_prefix, *(op for ops in lowered for op in ops))
+    result = list(annotated_prefix)
     if resource_fusion:
-        for _, selected_runtime, ops, tokens in fusion_groups:
-            result.extend(lower_native_fusions(ops, selected_runtime, local_tokens=tokens))
-        positions = {op.op_id: index for index, op in enumerate(captured_ops)}
+        # A fusion group is admitted inside one region.  Prefix and distinct
+        # regions are separate calls; a declared group crossing that boundary
+        # is rejected rather than joined after the partition.
+        for region, ops in zip(regions, lowered):
+            result.extend(lower_native_fusions(
+                ops, region.runtime, local_tokens=region.local_tokens,
+                public_outputs=public_outputs))
+        positions = {op.op_id: index for index, op in enumerate(transformed)}
         def position(op):
             members = dict(op.metadata).get("fusion_semantic_ids", (op.op_id,))
-            return min(positions[member] for member in members)
+            return min(positions[member] for member in members if member in positions)
         result = _ordered(sorted(result, key=position))
-    selections = tuple(record for region in regions for record in region.selections)
+    else:
+        for ops in lowered:
+            result.extend(ops)
+    if replay_scope != "none":
+        result = apply_capture_inheritance(tuple(result), state, annotated_actual)
+    selections = selection_delivery(
+        tuple(result), tuple(record for region in regions
+                            for record in region.selections),
+        public_outputs=public_outputs)
     return annotate(result, selections), selections
+
+
+def selection_delivery(ops, records, public_outputs=()):
+    """Attach the actual selected occurrence/program boundary for T12/T04.
+
+    This is a delivery record, not a second plan: values and capture are read
+    from the already lowered ops and the selected plan is copied verbatim.
+    """
+    from .implementations import produced_values
+    result = []
+    for record in records:
+        selected = record.get("selected") or {}
+        implementation = selected.get("implementation")
+        plan = record.get("plan") or {}
+        recipes = set(plan.get("recipes") or ())
+        matched = tuple(
+            op for op in ops
+            if (implementation and dict(op.metadata).get("implementation") == implementation)
+            or (op.recipe and op.recipe in recipes))
+        outputs = []
+        for op in matched:
+            try:
+                values = produced_values(op)
+            except ModelingError:
+                values = ()
+            for value in values:
+                outputs.append({
+                    "producer": value.get("producer") or op.op_id,
+                    "output": value.get("output"),
+                    "dtype": value.get("dtype"),
+                    "role": value.get("role"),
+                    "logical_shape": value.get("logical_shape"),
+                    "storage_shape": value.get("storage_shape"),
+                    "materialized": value.get("materialized"),
+                    "alias_of": value.get("alias_of"),
+                    "write_bytes": value.get("write_bytes"),
+                    "state_version": value.get("state_version"),
+                    "binding": value.get("binding"),
+                })
+        executions = tuple({
+            "producer": op.op_id,
+            "family": op.family,
+            "recipe": op.recipe,
+            "deps": tuple(op.deps),
+            "stream": op.stream,
+            "graph_captured": dict(op.metadata).get("graph_captured"),
+            "graph_segment": dict(op.metadata).get("graph_segment"),
+            "returns": tuple(op.returns),
+        } for op in matched)
+        result.append({
+            **record,
+            "delivery": {
+                "selector": record.get("selector"),
+                "selected": selected,
+                "program": plan,
+                "producer_outputs": tuple(outputs),
+                "executions": executions,
+                "public_roots": tuple(public_outputs),
+            },
+        })
+    return tuple(result)
 
 
 def annotate(ops, records):

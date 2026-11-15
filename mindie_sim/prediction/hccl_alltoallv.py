@@ -5,16 +5,22 @@
   caller inputs. At most 16 peer streams run concurrently. Slots, not rounds,
   serialize later peers. Read/write select different scratch copy directions.
   Each directed wire payload and each local HBM endpoint is charged once.
+  Optional chunk/startup/receive-credit options are explicit already-normalized
+  T06 services and use the common topology transport plan; absent options keep
+  the legacy whole-peer path.
 [Timeouts & Locks] O(ranks squared) cohort events; no locks or real-time waits.
 [Side-Effect Policy] Pure source plans and existing Engine tasks; no I/O/device.
 """
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
+import math
 from math import ceil
 
 from mindie_sim.schema.common import ModelingError
 from .communication import MessageFlow
 from .hccl_contracts import HcclPhase, HcclSelection, SOURCE, SOURCE_REVISION
 from .mechanism import Work
+from .topology import TransportOptions
 
 SOURCE_FILES = {
     'template': 'src/ops/all_to_all_v/algorithm/template/aicpu/ins_temp_all_to_all_v_mesh_1D.cc',
@@ -194,6 +200,38 @@ class AlltoAllVGroup:
     send_matrix: tuple[tuple[int, ...], ...]
     ranks: tuple[int, ...]
     topology: object
+    # Already-normalized service declarations.  They do not alter local bytes
+    # or the source peer schedule; only the physical wire schedule changes.
+    chunk_bytes: float | None = None
+    hop_startup_us: float = 0.0
+    receive_capacity_bytes_per_peer: float | None = None
+    receive_buffer_ids: tuple[tuple[int, str], ...] = ()
+
+    def __post_init__(self):
+        if self.chunk_bytes is not None:
+            if (isinstance(self.chunk_bytes, bool)
+                    or not isinstance(self.chunk_bytes, (int, float))
+                    or not math.isfinite(float(self.chunk_bytes))
+                    or float(self.chunk_bytes) <= 0):
+                raise ModelingError(
+                    f'hccl_alltoallv_chunk_bytes_invalid:{self.chunk_bytes}')
+        if (isinstance(self.hop_startup_us, bool)
+                or not isinstance(self.hop_startup_us, (int, float))
+                or not math.isfinite(float(self.hop_startup_us))
+                or float(self.hop_startup_us) < 0):
+            raise ModelingError(
+                f'hccl_alltoallv_hop_startup_invalid:{self.hop_startup_us}')
+        if self.receive_capacity_bytes_per_peer is not None:
+            value = self.receive_capacity_bytes_per_peer
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value)) or float(value) <= 0):
+                raise ModelingError(
+                    f'hccl_alltoallv_receive_capacity_invalid:{value}')
+        for rank, value in self.receive_buffer_ids:
+            if (isinstance(rank, bool) or not isinstance(rank, int)
+                    or not isinstance(value, str) or not value):
+                raise ModelingError(
+                    f'hccl_alltoallv_receive_buffer_invalid:{rank}:{value}')
 
     def plans(self):
         if len(self.ranks) != self.selection.ranks or len(set(self.ranks)) != len(self.ranks):
@@ -201,7 +239,8 @@ class AlltoAllVGroup:
         return tuple(contract(replace(self.selection, payload_bytes=sum(self.send_matrix[rank])),
                               self.send_matrix, rank) for rank in range(len(self.ranks)))
 
-    def start_participants(self, engine, name, ready_by_rank, bindings, *, owner=''):
+    def start_participants(self, engine, name, ready_by_rank, bindings, *,
+                           owner='', release_events=None):
         plans = self.plans()
         if set(ready_by_rank) != set(self.ranks) or set(bindings) != set(self.ranks):
             raise ModelingError('hccl_alltoallv_requires_ready_and_binding_for_each_rank')
@@ -248,11 +287,120 @@ class AlltoAllVGroup:
                                                after=deps, owner=owner,
                                                metadata={'unpriced_service_work': omitted}))
                 wire = []
+                transport = (self.chunk_bytes is not None or self.hop_startup_us
+                             or self.receive_capacity_bytes_per_peer is not None
+                             or bool(self.receive_buffer_ids))
                 for src, dst, size in ((left, right, peer.send_bytes), (right, left, peer.recv_bytes)):
                     if not size:
                         continue
                     source, destination = self.ranks[src], self.ranks[dst]
                     previous = engine.submit(f'{name}:{source}->{destination}:ready', after=deps, owner=owner)
+                    if transport:
+                        # The destination credit is an Engine pool bound by
+                        # T09; plans with the same destination/capacity share
+                        # it.  This plan contributes only its real directed
+                        # payload, not a fabricated aggregate capacity.
+                        buffer_ids = {
+                            rank: value for rank, value in self.receive_buffer_ids}
+                        capacity = (
+                            ((destination, self.receive_capacity_bytes_per_peer),)
+                            if self.receive_capacity_bytes_per_peer is not None
+                            else ())
+                        buffers = (
+                            ((destination, buffer_ids[destination]),)
+                            if destination in buffer_ids else ())
+                        options = TransportOptions(
+                            chunk_bytes=self.chunk_bytes,
+                            hop_startup_us=self.hop_startup_us,
+                            receive_capacity_bytes=capacity,
+                            receive_buffer_ids=buffers,
+                            max_physical_chunks=4096)
+                        transport_plan = self.topology.transport_plan(
+                            [MessageFlow(source, destination, size)],
+                            transport=options)
+                        dest_releases = (
+                            release_events.get(destination, ())
+                            if isinstance(release_events, Mapping)
+                            else release_events or ())
+                        dest_releases = (
+                            tuple(dest_releases)
+                            if isinstance(dest_releases, (tuple, list))
+                            else (dest_releases,))
+                        declared = (
+                            release_events is not None
+                            and (not isinstance(release_events, Mapping)
+                                 or destination in release_events))
+                        if declared:
+                            # A declared consumer covers the whole directed
+                            # payload.  Reserve its complete footprint once in
+                            # the shared T09 receive pool; do not copy one
+                            # future per chunk or let T09's arrival fallback
+                            # release the uncovered tail.
+                            from .engine import Allocation
+                            buffer_id = (buffer_ids[destination]
+                                         if destination in buffer_ids
+                                         else f"hccl:rx:{destination}")
+                            pool = f"transport:rx:{buffer_id}"
+                            capacity = (self.receive_capacity_bytes_per_peer
+                                        if self.receive_capacity_bytes_per_peer
+                                        is not None else float(size))
+                            if capacity + 1e-9 < float(size):
+                                raise ModelingError(
+                                    "hccl_alltoallv_receive_capacity_below_flow:"
+                                    f"{destination}:{capacity}<{size}")
+                            if pool in engine.pools:
+                                if not math.isclose(engine.pools[pool], capacity,
+                                                    rel_tol=1e-12, abs_tol=1e-9):
+                                    raise ModelingError(
+                                        "hccl_alltoallv_receive_pool_conflict:"
+                                        f"{destination}")
+                            else:
+                                engine.extend(pools={pool: float(capacity)})
+                            allocation = Allocation(
+                                f"{name}:{source}->{destination}:rx",
+                                pool, float(size), (0,))
+                            grant = engine.submit(
+                                f"{name}:{source}->{destination}:receive_grant",
+                                after=(previous,), acquire=(allocation,),
+                                owner=owner,
+                                metadata={"boundary":
+                                          "hccl_whole_flow_receive_grant",
+                                          "source_rank": source,
+                                          "destination_rank": destination,
+                                          "receive_buffer_id": buffer_id,
+                                          "footprint_bytes": float(size),
+                                          "pool_capacity_bytes": float(capacity)})
+                            options = TransportOptions(
+                                chunk_bytes=self.chunk_bytes,
+                                hop_startup_us=self.hop_startup_us,
+                                receive_buffer_ids=buffers,
+                                max_physical_chunks=4096)
+                            transport_plan = self.topology.transport_plan(
+                                [MessageFlow(source, destination, size)],
+                                transport=options)
+                            run = transport_plan.start(
+                                engine,
+                                f'{name}:{source}->{destination}:transport',
+                                {source: grant, destination: grant}, owner=owner)
+                            if dest_releases:
+                                engine.submit(
+                                    f"{name}:{source}->{destination}:receive_release",
+                                    after=tuple(run.completions) + (dest_releases[-1],),
+                                    free=(allocation,), owner=owner,
+                                    metadata={"boundary":
+                                              "hccl_whole_flow_receive_release",
+                                              "destination_rank": destination,
+                                              "receive_buffer_id": buffer_id})
+                            wire.extend(run.completions)
+                            continue
+                        run = transport_plan.start(
+                            engine, f'{name}:{source}->{destination}:transport',
+                            {source: previous, destination: previous}, owner=owner,
+                            release_events=(
+                                {destination: dest_releases}
+                                if dest_releases else None))
+                        wire.extend(run.completions)
+                        continue
                     route = self.topology.route_message(MessageFlow(source, destination, size))
                     for hop_index, hop in enumerate(route.hops):
                         service = engine.submit(f'{name}:{source}->{destination}:hop{hop_index}:service',

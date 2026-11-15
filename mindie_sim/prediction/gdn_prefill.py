@@ -2,21 +2,28 @@
 
 [Role] Lower contiguous BSND inputs, native Prepare/H/O and requested exports.
 [Invariants] Normalization is inside Prepare. Gate scalars become FP32 before
-  BSN->BNS conversion. State is V,K and remains independent per sequence.
-  Non-spec decode is a prefix of the actual batch; padded rows stop outside
-  the core. Physical kernels are shared with isolated operator analysis.
+  BSN->BNS conversion. Recurrent state is FP32 V,K; conv history is the
+  activation dtype. State is independent per sequence; padding slots keep
+  their physical rows but neither read nor write a state row. Gather reads the
+  cache, H keeps a local chunk bank, and only scatter publishes the final
+  request state. Non-spec decode is a prefix of
+  the actual batch; padded rows stop outside the core. Physical kernels are
+  shared with isolated operator analysis.
 [Timeouts & Locks] O(sequence count) metadata, lazy kernel work; no locks.
 [Side-Effect Policy] Appends operators only; no measurements or device access.
 """
 from dataclasses import replace
+from types import SimpleNamespace
 import math
 
 from mindie_sim.catalog.attention_common import AttentionResult
 from mindie_sim.schema.common import dtype_bytes
-from . import gdn_composite
+from mindie_sim.schema.tensors import TensorLayout, TensorValue
+from . import gdn_composite, gdn_recurrent
 from .lowering import Builder
 from .mechanism import PlannedRecipe
 from .operators import native_causal_conv_prefill
+from .operators import kda_state_selection as pcp_state_selection
 from .tensors import TensorLowering
 
 
@@ -46,7 +53,8 @@ def rearrange_qkv(tensors, conv, tokens, heads, key_heads, dk, dv):
 
 
 def core(*, builder, tensors, conv, gated, views, heads, key_heads, dk, dv,
-          chunk, gate_values=None, qkv_values=None, pcp=1, **_):
+          chunk, gate_values=None, qkv_values=None, pcp=1,
+          state_slot_indices=None, state_capacity=None, state_slot_source="", **_):
     b = builder
     tokens = sum(view.q_len for view in views)
     dtype = b.model.activation_dtype
@@ -54,42 +62,254 @@ def core(*, builder, tensors, conv, gated, views, heads, key_heads, dk, dv,
     values = (qkv_values if qkv_values is not None else
               rearrange_qkv(tensors, conv, tokens, heads, key_heads, dk, dv))
     # gdn.py always gathers an initial tensor, including zero states at context0.
+    # A graph-padded slot keeps its physical state row (initialized to zero) but
+    # neither reads a committed state nor later scatters a fake final state.
+    state_dtype = b.plan.recurrent_state_dtype or "fp32"
+    state_byte = dtype_bytes(state_dtype)
+    active = tuple(view for view in views if not view.padding)
+    active_elements = len(active) * heads * dk * dv
     state_elements = len(views) * heads * dk * dv
-    prior_elements = sum(view.context > 0 for view in views) * heads * dk * dv
+    padding_slots = tuple(index for index, view in enumerate(views) if view.padding)
+    prior = tuple(view.context > 0 for view in active)
+    prior_elements = sum(prior) * heads * dk * dv
     state_blocks = math.ceil(heads * dk * dv / 1024)
-    gather_metadata = state_blocks * (len(views) + 4 * sum(view.context > 0 for view in views))
+    gather_metadata = state_blocks * (len(views) + 4 * sum(prior))
+    initial_flags = tuple(view.context > 0 and not view.padding for view in views)
+    global_lengths = tuple(view.global_q_len or view.q_len for view in views)
+    slot_indices = state_slot_indices
+    slot_source = state_slot_source
+    gather_contract, gather_effects = gdn_recurrent.state_contract(
+        views=views, phase="prefill", state_dtype=state_dtype,
+        conv_state_dtype=b.model.activation_dtype, conv_kernel=b.plan.conv_kernel,
+        target_prefix=b.prefix, chunk=chunk, initial_state=initial_flags,
+        direction="gather", target_kind="recurrent",
+        global_lengths=global_lengths, slot_indices=slot_indices,
+        state_capacity=state_capacity, slot_source=slot_source)
     gather = b.work(
         "gather_recurrent_state", (conv,), (len(views), heads, dv, dk),
-        read=prior_elements * 4 + gather_metadata, write=state_elements * 4,
-        family="state_gather", dtype="fp32",
-        metadata=(("state_layout", "V,K"), ("has_initial_state", tuple(v.context > 0 for v in views)),
+        read=prior_elements * state_byte + gather_metadata,
+        # H reads a physical initial row for every prefill slot, including a
+        # padded slot with no persistent cache effect.  Materialize that row
+        # (zero for fresh/pad) so the H input is actually defined.
+        write=state_elements * state_byte,
+        family="state_gather", dtype=state_dtype,
+        metadata=(("state_layout", "V,K"), ("has_initial_state", initial_flags),
+                  ("padding_slots", padding_slots),
+                  ("active_state_rows", len(active)),
+                  ("effect_role", "gather_read"),
+                  ("state_value_output", "initial_state"),
+                  ("state_input_producer", conv),
+                  ("state_publish_point", gather_contract["publish_point"]),
+                  ("gdn_state_contract", gather_contract),
+                  ("gdn_state_effects", gather_effects),
                   ("index_dtype", "int32"), ("metadata_cache_reuse", False)),
     )
+    gather_contract, gather_outputs = gdn_recurrent.bind_state_ports(
+        gather_contract, gather, heads=heads, head_shards=1)
+    b.ops[-1] = replace(b.ops[-1], metadata=tuple(sorted({
+        **dict(b.ops[-1].metadata),
+        "state_ready": gather,
+        "state_value_outputs": gather_outputs,
+        "gdn_state_contract": gather_contract,
+    }.items())))
     gate, beta = gate_values or (
         tensors.result(gated, (1, tokens, heads), "fp32", output="decay"),
         tensors.result(gated, (1, tokens, heads), dtype, output="beta"))
+    state_bytes = heads * dk * dv * dtype_bytes(state_dtype)
+    state_segments = []
+    contiguous = pcp == 1 and all(len(view.query_ranges) <= 1 for view in views)
+    if contiguous:
+        contract, effects = gdn_recurrent.state_contract(
+            views=views, phase="prefill", state_dtype=state_dtype,
+            conv_state_dtype=b.model.activation_dtype,
+            conv_kernel=b.plan.conv_kernel, target_prefix=b.prefix,
+            chunk=chunk, initial_state=initial_flags, direction="h",
+            target_kind="local", global_lengths=global_lengths,
+            slot_indices=slot_indices, state_capacity=state_capacity,
+            slot_source=slot_source)
+        state_segments.append({
+            "length": sum(lengths), "lengths": tuple(lengths),
+            "contract": contract, "effects": effects,
+            "initial_dependency": gather, "exchange_bytes": 0,
+            "value_inputs": gather_outputs,
+        })
+    for view_index, view in enumerate(views):
+        if contiguous:
+            break
+        ranges = tuple(view.query_ranges) or ((0, view.q_len),)
+        first_start = int(ranges[0][0]) if ranges else 0
+        initial_dependency = gather
+        version = view.context
+        remote_initial = None
+        if pcp > 1 and first_start > 0:
+            remote_initial = b.work(
+                "pcp_remote_initial_state", (gather,), (0,),
+                family="state_transfer",
+                metadata=(("status", "pending_external_rank"),
+                          ("producer_scope", "external_rank"),
+                          ("source_implementation", "pcp1_only"),
+                          ("from_version", view.context),
+                          ("to_version", view.context + first_start)))
+            initial_dependency = remote_initial
+            version += first_start
+        previous_end = first_start
+        for segment_index, (start, end) in enumerate(ranges):
+            length = int(end) - int(start)
+            if length <= 0:
+                continue
+            gap = 0 if previous_end is None else int(start) - previous_end
+            if gap < 0:
+                raise ValueError("gdn_prefill_query_ranges_not_ordered")
+            exchange_bytes = 0
+            from_version = to_version = None
+            if gap:
+                from_version = version
+                version += gap
+                to_version = version
+                if pcp > 1:
+                    exchange_bytes = state_bytes * (2 * pcp - 1) / pcp
+            if pcp == 1 and gap:
+                # A single-rank caller may still pack non-contiguous requested
+                # ranges; the state advances over the gap without a collective.
+                to_version = version
+            segment_view = SimpleNamespace(
+                request_id=f"{view.request_id}#seg{segment_index}",
+                q_len=length, context=version, global_q_len=length,
+                query_ranges=((0, length),), padding=False, phase="prefill",
+                draft_accepted_tokens=0, draft_advanced_tokens=0)
+            initial = (True,) if segment_index else (
+                view.context > 0 and not view.padding,)
+            contract, effects = gdn_recurrent.state_contract(
+                views=(segment_view,), phase="prefill",
+                state_dtype=state_dtype,
+                conv_state_dtype=b.model.activation_dtype,
+                conv_kernel=b.plan.conv_kernel, target_prefix=b.prefix,
+                chunk=chunk, initial_state=initial, direction="h",
+                target_kind="local", global_lengths=(length,),
+                slot_indices=(None if slot_indices is None
+                              else (slot_indices[view_index],)),
+                state_capacity=state_capacity, slot_source=slot_source)
+            segment_inputs = None
+            if segment_index == 0:
+                if remote_initial is not None:
+                    segment_inputs = (gdn_recurrent.tensor_port(
+                        TensorValue(
+                            "", state_dtype,
+                            TensorLayout.contiguous((1, heads, dv, dk)),
+                            binding="external",
+                            binding_name=(f"pcp_peer:{view.request_id}:state@"
+                                          f"{view.context + first_start}"),
+                            state_version=view.context + first_start),
+                        ready=str(remote_initial), role="remote_input",
+                        owner="external_rank"),)
+                elif view_index < len(gather_outputs):
+                    segment_inputs = (gather_outputs[view_index],)
+            state_segments.append({
+                "length": length, "lengths": (length,),
+                "range": (int(start), int(end)),
+                "contract": contract,
+                "effects": effects,
+                "initial_dependency": (initial_dependency
+                                       if segment_index == 0 else None),
+                "exchange_bytes": exchange_bytes,
+                "from_version": from_version,
+                "to_version": to_version,
+                "value_inputs": segment_inputs,
+            })
+            version += length
+            previous_end = int(end)
+    if not state_segments:
+        raise ValueError("gdn_prefill_requires_a_positive_state_segment")
     composite = gdn_composite.prefill(
         builder=b, tensors=tensors, q=values[0], k=values[1], v=values[2],
         gate=gate, beta=beta, lengths=lengths, heads=heads, key_heads=key_heads,
         dk=dk, dv=dv, chunk=chunk, initial_state_dependency=gather,
-        native_requests=tuple(view.request_id for view in views))
-    b.work("scatter_recurrent_state", (composite.state,), (len(views), heads, dv, dk),
-           read=state_elements * 4 + len(views) * state_blocks * 4, write=state_elements * 4,
-           family="state_scatter", dtype="fp32", metadata=(("state_layout", "V,K"),
-                  ("index_dtype", "int32"), ("metadata_cache_reuse", False)))
-    out_id = composite.output
+        native_requests=tuple(view.request_id for view in views),
+        state_segments=state_segments)
+    # A PCP rank publishes a global state commit only when it actually owns
+    # the whole global sequence.  Covering the local head and tail of a
+    # longer sequence (or a prefix/suffix) still leaves the final state to a
+    # peer, so the scatter stays remote-pending and only its local version is
+    # committed here.
+    remote_flags = tuple(
+        pcp_state_selection.pcp_remote_publish(
+            view.query_ranges, view.q_len,
+            view.global_q_len or view.q_len, pcp=pcp,
+            padding=view.padding)
+        for view in views)
+    scatter_contract, scatter_effects = gdn_recurrent.state_contract(
+        views=views, phase="prefill", state_dtype=state_dtype,
+        conv_state_dtype=b.model.activation_dtype, conv_kernel=b.plan.conv_kernel,
+        target_prefix=b.prefix, chunk=chunk, initial_state=initial_flags,
+        direction="scatter", target_kind="recurrent",
+        global_lengths=global_lengths, slot_indices=slot_indices,
+        state_capacity=state_capacity, slot_source=slot_source,
+        remote_publish=remote_flags)
     if pcp > 1:
-        state_bytes = heads * dk * dv * dtype_bytes(b.plan.recurrent_state_dtype or "fp32")
-        for idx in range(len(views)):
-            out_id = b.communicate(
-                f"pcp_recurrent_state_step{idx}", (out_id,),
-                state_bytes * (2 * pcp - 1) / pcp, "allgather", "pcp")
-    return out_id
+        owner_slots = tuple(slot for slot in scatter_contract["active_slots"]
+                            if not remote_flags[slot])
+        remote_slots = tuple(slot for slot in scatter_contract["active_slots"]
+                             if remote_flags[slot])
+        all_owner = bool(owner_slots) and not remote_slots
+        remote_publish = b.work(
+            "pcp_remote_state_publish", tuple(composite.states), (0,),
+            family="state_publish", vector=0, read=0, write=0,
+            metadata=(("status", ("local_owner" if all_owner
+                                  else "pending_external_rank")),
+                      ("producer_scope", ("local_writeback" if all_owner else
+                                          "per_slot" if owner_slots else
+                                          "external_rank")),
+                      ("owner_slots", owner_slots),
+                      ("remote_slots", remote_slots),
+                      ("completion_owner", "T04/final_writeback"),
+                      ("source_implementation", "pcp1_only"),
+                      ("global_versions", scatter_contract["global_versions"]),
+                      ("local_commit_versions",
+                       scatter_contract["local_commit_versions"])))
+        scatter_deps = (remote_publish,)
+    else:
+        scatter_deps = tuple(composite.states)
+    scatter = b.work("scatter_recurrent_state", scatter_deps,
+           (len(views), heads, dv, dk),
+           read=active_elements * state_byte + len(active) * state_blocks * 4,
+           write=active_elements * state_byte,
+           family="state_scatter", dtype=state_dtype,
+           metadata=(("state_layout", "V,K"), ("padding_slots", padding_slots),
+                     ("active_state_rows", len(active)), ("effect_role", "scatter_publish"),
+                     ("state_value_input", tuple(composite.states)),
+                     ("state_value_output", "persistent_cache"),
+                     ("state_publish_versions", scatter_contract["publish_versions"]),
+                     ("state_publish_point", scatter_contract["publish_point"]),
+                     ("gdn_state_contract", scatter_contract),
+                     ("gdn_state_effects", scatter_effects),
+                     ("index_dtype", "int32"), ("metadata_cache_reuse", False)))
+    scatter_inputs = tuple(
+        gdn_recurrent.tensor_port(TensorValue(
+            str(state), state_dtype,
+            TensorLayout.contiguous((len(views), heads, dv, dk)),
+            state_version=(scatter_contract.get("local_commit_versions") or (None,))[0]),
+            ready=str(state), role="state_input", owner=str(state))
+        for state in composite.states)
+    scatter_contract, scatter_outputs = gdn_recurrent.bind_state_ports(
+        scatter_contract, scatter, heads=heads, head_shards=1)
+    b.ops[-1] = replace(b.ops[-1], metadata=tuple(sorted({
+        **dict(b.ops[-1].metadata),
+        "state_ready": scatter,
+        "state_value_inputs": scatter_inputs,
+        "state_value_outputs": scatter_outputs,
+        "gdn_state_contract": scatter_contract,
+    }.items())))
+    return composite.output
 
 
 def decode_core(b, tensors, values, gate_values, views, heads, keys, dk, dv, *,
-                physical_tokens=None, physical_sequence_tokens=None):
-    """Explicit analytical decode until the native recurrence is accepted."""
+                physical_tokens=None, physical_sequence_tokens=None,
+                physical_row_offsets=()):
+    """Explicit analytical decode until the native recurrence is accepted.
+
+    ``views`` are active query rows; padding physical slots remain in the
+    buffer and host partition but never consume or produce a state row.
+    """
     tokens = sum(view.q_len for view in views)
     physical = tokens if physical_tokens is None else physical_tokens
     lengths = tuple(view.q_len for view in views)
@@ -100,9 +320,29 @@ def decode_core(b, tensors, values, gate_values, views, heads, keys, dk, dv, *,
                   ("implementation_scope", "analytical_decode_l2norm")))
         for name, value in zip(("q", "k"), values[:2])]
     state_bytes = heads * dk * dv * dtype_bytes(b.plan.recurrent_state_dtype)
+    input_slices, row_ranges, value_views = [], [], []
+    if len(physical_row_offsets) == len(views):
+        for view, offset in zip(views, physical_row_offsets):
+            q_view = values[0].narrow(1, offset, view.q_len)
+            k_view = values[1].narrow(1, offset, view.q_len)
+            v_view = values[2].narrow(1, offset, view.q_len)
+            gate_views = tuple(value.narrow(1, offset, view.q_len)
+                               for value in gate_values)
+            # The narrowed TensorValue is the actual stage input: its layout
+            # carries the physical byte offset ([32,33) after a pad slot), and
+            # its producer/output identity survives instead of being reduced
+            # to the original full-buffer producer string.
+            value_views.append((q_view, k_view, v_view, *gate_views))
+            input_slices.extend(value.producer
+                                for value in (q_view, k_view, v_view, *gate_views))
+            row_ranges.append((int(offset), int(offset) + view.q_len))
+    if input_slices:
+        scan_inputs = (*normalized, *input_slices)
+    else:
+        scan_inputs = (*normalized, values[2].producer,
+                       *[value.producer for value in gate_values])
     output = b.work(
-        "decode_recurrent_scan", (*normalized, values[2].producer,
-                                  *[value.producer for value in gate_values]),
+        "decode_recurrent_scan", scan_inputs,
         (tokens, heads, dk, dv), family="recurrent_vector",
         vector=7 * tokens * heads * dk * dv,
         read=len(views) * state_bytes + tokens * heads * ((2 * dk + dv) * 2 + 6),
@@ -111,6 +351,28 @@ def decode_core(b, tensors, values, gate_values, views, heads, keys, dk, dv, *,
                   ("dk", dk), ("dv", dv), ("sequence_tokens", lengths),
                   ("physical_query_rows", physical),
                   ("physical_sequence_tokens", physical_sequence_tokens or lengths),
+                  ("physical_row_offsets", tuple(physical_row_offsets)),
+                  ("input_row_ranges", tuple(row_ranges)),
+                  ("state_value_views", tuple(
+                      tuple(gdn_recurrent.tensor_port(value, role=name,
+                                                      ready=value.producer)
+                            for name, value in zip(
+                                ("q", "k", "v", "decay", "beta"), view_values))
+                      for view_values in value_views)),
+                  ("state_input_views_actual", tuple(
+                      tuple({"producer": value.producer,
+                             "output": value.output,
+                             "offset": value.layout.offset,
+                             "shape": value.layout.shape,
+                             "strides": value.layout.strides,
+                             "storage_shape": value.layout.storage_shape,
+                             "alias_of": value.alias_of,
+                             "storage": value.storage,
+                             "state_version": value.state_version,
+                             "binding": value.binding,
+                             "binding_name": value.binding_name}
+                            for value in view_values)
+                      for view_values in value_views)),
                   ("state_dtype", b.plan.recurrent_state_dtype),
                   ("state_element_bytes", dtype_bytes(b.plan.recurrent_state_dtype)),
                   ("state_checkpoints", tokens),
@@ -120,15 +382,73 @@ def decode_core(b, tensors, values, gate_values, views, heads, keys, dk, dv, *,
     return tensors.result(output, (physical, heads, dv))
 
 
+def _state_slot_inputs(runtime, ordered):
+    """Resolve index presence, optional values and optional capacity.
+
+    Three independent facts are retained: an index tensor exists, its values
+    may still be caller-bound, and the allocation capacity may be unknown.  The
+    unknown-value path must not select the native absent-index identity ABI.
+    """
+    metadata = dict(runtime.metadata)
+    capacity = metadata.get("gdn_state_rows",
+                            metadata.get("gdn_state_capacity"))
+    if capacity is not None:
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
+            raise ValueError("gdn_prefill_state_capacity_invalid")
+    if all(view.padding for view in ordered):
+        return ((0,) * len(ordered), capacity, "padding_null", 0)
+    raw = metadata.get("gdn_prefill_state_indices",
+                       metadata.get("gdn_state_indices"))
+    fixture = bool(metadata.get("gdn_state_uniform_fixture", False))
+    if raw is None and not fixture:
+        # Index tensor present, values not yet bound.  Keep the pad slots known
+        # null so FN/UPDATE skip only those; active slots stay dynamic.
+        active = sum(1 for view in ordered if not view.padding)
+        if capacity is not None and capacity < active:
+            raise ValueError("gdn_prefill_state_capacity_below_active_slots")
+        return (tuple(0 if view.padding else None for view in ordered),
+                capacity, "dynamic_caller_index", 0)
+    if raw == "uniform" or raw is None:
+        indices = tuple(range(1, len(ordered) + 1))
+        source = "uniform_fixture"
+    elif isinstance(raw, dict):
+        try:
+            indices = tuple(0 if view.padding else
+                            (None if raw[view.request_id] is None else
+                             int(raw[view.request_id]))
+                            for view in ordered)
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("gdn_prefill_state_indices_missing_request")
+        source = "caller_metadata"
+    elif isinstance(raw, (list, tuple)):
+        if len(raw) != len(ordered):
+            raise ValueError("gdn_prefill_state_indices_length_mismatch")
+        try:
+            indices = tuple(0 if view.padding else
+                            (None if value is None else int(value))
+                            for view, value in zip(ordered, raw))
+        except (TypeError, ValueError):
+            raise ValueError("gdn_prefill_state_indices_must_be_integers")
+        source = "caller_metadata"
+    else:
+        raise ValueError("gdn_prefill_state_indices_invalid")
+    known = tuple(index for index in indices if index is not None and index != 0)
+    if any(index < 1 for index in known):
+        raise ValueError("gdn_prefill_state_indices_must_be_positive")
+    if capacity is not None and max(known, default=0) >= capacity:
+        raise ValueError("gdn_prefill_state_index_exceeds_capacity")
+    return tuple(indices), capacity, source, 0
+
+
 def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
           padded_tokens, policy, runtime):
     if plan.recurrent_state_dtype != "fp32":
         raise ValueError("gdn_prefill_arch35_state_precision_branch_not_implemented:"
                          + plan.recurrent_state_dtype)
+    if plan.conv_state_dtype != model.activation_dtype:
+        raise ValueError("gdn_prefill_conv_state_dtype_must_match_activation")
     prefill = tuple(view for view in views if view.phase == "prefill")
     decode = tuple(view for view in views if view.phase == "decode")
-    if any(view.q_len != 1 or view.draft_proposal_tokens for view in decode):
-        raise ValueError("gdn_prefill_arch35_speculative_mixed_caller_not_implemented")
     if len(prefill) + len(decode) != len(views) or not prefill:
         raise ValueError("gdn_prefill_arch35_requires_non_spec_prefill")
     # The selected serving caller packs decode rows before prefill rows.
@@ -159,24 +479,324 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
     conv_input = tensors.contiguous(projection.narrow(0, 0, actual).narrow(1, 0, width),
                                     "convolution_input_contiguous",
                                     reason="causal_conv1d_fn.contiguous")
-    conv_op = native_causal_conv_prefill.make_op({
-        "lengths": tuple(view.q_len for view in ordered), "dim": width,
-        "width": plan.conv_kernel, "dtype": model.activation_dtype,
+    padding_slots = tuple(index for index, view in enumerate(ordered) if view.padding)
+    cache_indices, state_rows, index_source, null_block_id = _state_slot_inputs(
+        runtime, ordered)
+    chunk = policy.recurrent_chunk if policy else 64
+    global_lengths = tuple(view.global_q_len or view.q_len for view in ordered)
+    initial_flags = tuple(view.context > 0 and not view.padding for view in ordered)
+    # Physical row positions and qsl stay intact.  FN resolves the cache index
+    # per sequence and skips the null/pad *work* while preserving the request's
+    # physical offset (the next request's qsl must still start at this row).
+    conv_lengths = tuple(view.q_len for view in ordered)
+    conv_params = {
+        "lengths": conv_lengths,
+        "dim": width, "width": plan.conv_kernel, "dtype": model.activation_dtype,
         "activation": "silu", "bias": False, "metadata_placement": "device",
-        "has_initial_state": tuple(view.context > 0 for view in ordered),
-        "cache_indices": tuple(range(1, len(ordered) + 1)),
-        "state_rows": len(ordered) + 1,
+        "has_initial_state": initial_flags,
+        "cache_indices": cache_indices,
         "state_history_slots": plan.conv_kernel - 1 + int(
             dict(runtime.metadata).get("draft_proposal_tokens", 0)),
-        "null_block_id": 0,
-    })
-    conv = b.add(replace(conv_op, op_id=prefix + ".short_convolution",
-                         deps=(conv_input.producer,), **b.common))
-    if parallel.pcp > 1:
-        conv = b.communicate(
-            "pcp_conv_state_step", (conv,),
-            len(prefill) * max(0, plan.conv_kernel - 1) * width * 2 * (2 * parallel.pcp - 1) / parallel.pcp,
-            "allgather", "pcp")
+        "null_block_id": null_block_id,
+    }
+    if state_rows is not None:
+        conv_params["state_rows"] = state_rows
+    conv_op = native_causal_conv_prefill.make_op(conv_params)
+    conv_parts = []
+    conv_cursor = 0
+    for index, view in enumerate(ordered):
+        part_direction = "token" if view.phase == "decode" else "conv"
+        conv_view = conv_input.narrow(0, conv_cursor, view.q_len)
+        conv_cursor += view.q_len
+        part, part_effects = gdn_recurrent.state_contract(
+            views=(view,), phase=view.phase,
+            state_dtype=plan.recurrent_state_dtype,
+            conv_state_dtype=plan.conv_state_dtype,
+            conv_kernel=plan.conv_kernel, target_prefix=prefix, chunk=chunk,
+            initial_state=(initial_flags[index],),
+            direction=part_direction, target_kind="conv",
+            global_lengths=(global_lengths[index],),
+            slot_indices=(None if cache_indices is None else cache_indices[index],),
+            state_capacity=state_rows, slot_source=index_source,
+            value_inputs=(conv_view,), heads=heads,
+            remote_publish=(parallel.pcp > 1
+                            and view.phase == "prefill"))
+        conv_parts.append((part, part_effects))
+    mixed_contract = gdn_recurrent.merge_contracts(
+        [part for part, _ in conv_parts], allow_mixed_directions=True)
+    mixed_conv = tuple(effect for _, effects in conv_parts for effect in effects)
+    conv_meta = {
+        "padding_slots": padding_slots,
+        "state_dtype": plan.conv_state_dtype,
+        "state_layout": "slots_history_channels",
+        "state_mutation": "inplace_history_writeback",
+        "state_write_bytes": (len(ordered) - len(padding_slots))
+                             * (plan.conv_kernel - 1) * width * 2,
+        "state_slots": tuple(index for index in range(len(ordered))
+                             if index not in padding_slots),
+        "state_copy_boundary": "caller_state_rows_to_conv_history_slots",
+        "state_index_source": index_source,
+        "state_capacity_source": ("caller_metadata" if state_rows is not None
+                                  else "unbound"),
+        "state_rows": state_rows,
+        "state_rows_bound": state_rows is not None,
+        "cache_indices": cache_indices,
+        "cache_index_present": cache_indices is not None,
+        "cache_index_bound": (cache_indices is not None
+                              and all(value is not None for value in cache_indices)),
+        "null_block_id": null_block_id,
+    }
+    pcp_ranges = (parallel.pcp > 1 and not decode
+                  and all(not view.padding for view in prefill)
+                  and any(len(view.query_ranges) > 1 for view in prefill))
+    if pcp_ranges:
+        # Segmented conv history: each real query range advances the local
+        # history with the absolute version of that range (512->544, then the
+        # remote 608 prefix ->640).  The gap to the next range is bridged by a
+        # state exchange before that range's convolution, not by post-output
+        # communication.  Every segment owns its own read/write effect; one
+        # request's prefix never overrides another request's reads.
+        parts, offset = [], 0
+        segment_index = 0
+        for view_index, view in enumerate(prefill):
+            previous_seg = None
+            view_offset = 0
+            ranges = tuple(view.query_ranges)
+            first_start = int(ranges[0][0]) if ranges else 0
+            global_end = view.context + (view.global_q_len or view.q_len)
+            version = view.context + first_start
+            remote_initial = None
+            if parallel.pcp > 1 and first_start > 0:
+                remote_initial = b.work(
+                    "pcp_remote_conv_state", (conv_input.producer,), (0,),
+                    family="state_transfer",
+                    metadata=(("status", "pending_external_rank"),
+                              ("producer_scope", "external_rank"),
+                              ("completion_owner", "T09/COMM-LEAVES"),
+                              ("source_implementation", "pcp1_only"),
+                              ("request", view.request_id),
+                              ("from_version", view.context),
+                              ("to_version", version),
+                              ("state_value_output", gdn_recurrent.tensor_port(
+                                  TensorValue(
+                                      "", plan.conv_state_dtype or "bf16",
+                                      TensorLayout.contiguous(
+                                          (1, plan.conv_kernel - 1, width)),
+                                      binding="external",
+                                      binding_name=(f"pcp_peer:{view.request_id}:"
+                                                    f"conv@{version}"),
+                                      state_version=version),
+                                  ready="remote_transfer", role="state_input",
+                                  owner="external_rank"))))
+            for range_index, (start, end) in enumerate(ranges):
+                length = int(end) - int(start)
+                if length <= 0:
+                    continue
+                seg_input = conv_input.narrow(0, offset, length)
+                seg_params = {**conv_params, "lengths": (length,),
+                              "cache_indices": (cache_indices[view_index]
+                                                if cache_indices is not None else None,),
+                              "has_initial_state": (version > 0
+                                                    and not view.padding,)}
+                seg_op = native_causal_conv_prefill.make_op(seg_params)
+                deps = [seg_input.producer]
+                if range_index == 0 and remote_initial is not None:
+                    deps.append(remote_initial)
+                if previous_seg is not None:
+                    exchange = b.communicate(
+                        f"pcp_conv_state_step{segment_index}", (previous_seg,),
+                        max(0, plan.conv_kernel - 1) * width * 2
+                        * (2 * parallel.pcp - 1) / parallel.pcp,
+                        "state_transfer", "pcp",
+                        state_scope="conv_history",
+                        request=view.request_id,
+                        from_version=version,
+                        to_version=view.context + int(start),
+                        remote_producer="external_rank",
+                        completion_owner="T09/COMM-LEAVES",
+                        source_implementation="pcp1_only",
+                        status="pending_external_rank")
+                    deps.append(exchange)
+                segment_context = view.context + int(start)
+                segment_view = SimpleNamespace(
+                    request_id=f"{view.request_id}#convseg{segment_index}",
+                    q_len=length, context=segment_context, global_q_len=length,
+                    query_ranges=(), padding=False, phase="prefill",
+                    draft_accepted_tokens=0, draft_advanced_tokens=0)
+                seg_contract, seg_effects = gdn_recurrent.state_contract(
+                    views=(segment_view,), phase="prefill",
+                    state_dtype=plan.recurrent_state_dtype,
+                    conv_state_dtype=plan.conv_state_dtype,
+                    conv_kernel=plan.conv_kernel, target_prefix=prefix,
+                    chunk=chunk, initial_state=(version > 0,),
+                    direction="conv", target_kind="conv",
+                    global_lengths=(length,),
+                    slot_indices=((cache_indices[view_index]
+                                   if cache_indices is not None else None),),
+                    state_capacity=state_rows, slot_source=index_source,
+                    remote_publish=parallel.pcp > 1)
+                seg_contract = {
+                    **seg_contract,
+                    "request_id": view.request_id,
+                    "global_versions": (global_end,),
+                    "publish_versions": (None,),
+                    "publish_pending": ("remote_producer"
+                                        if parallel.pcp > 1 else ""),
+                }
+                seg_contract, seg_outputs = gdn_recurrent.bind_state_ports(
+                    seg_contract, "", heads=heads, head_shards=1)
+                meta = dict(conv_meta)
+                seg_index_value = (None if cache_indices is None
+                                   else cache_indices[view_index])
+                remote_port = (gdn_recurrent.tensor_port(TensorValue(
+                    str(remote_initial), plan.conv_state_dtype or "bf16",
+                    TensorLayout.contiguous((1, plan.conv_kernel - 1, width)),
+                    state_version=version), ready=str(remote_initial),
+                    role="remote_input", owner="external_rank")
+                    if remote_initial is not None else None)
+                meta.update({
+                    "state_segment_index": segment_index,
+                    "state_segment_range": (int(start), int(end)),
+                    "state_segment_local_offset": offset,
+                    "state_segment_from_version": segment_context,
+                    "state_segment_to_version": segment_context + length,
+                    "state_segment_global_version": global_end,
+                    "state_value_inputs": (gdn_recurrent.tensor_port(
+                        seg_input, ready=seg_input.producer, role="conv_input",
+                        owner=seg_input.producer),),
+                    "state_remote_inputs": ((remote_port,) if remote_port else
+                                            (gdn_recurrent.tensor_port(TensorValue(
+                                                str(exchange) if previous_seg is not None
+                                                else "", plan.conv_state_dtype or "bf16",
+                                                TensorLayout.contiguous(
+                                                    (1, plan.conv_kernel - 1, width)),
+                                                state_version=version),
+                                                ready=(str(exchange)
+                                                       if previous_seg is not None
+                                                       else ""),
+                                                role="remote_input",
+                                                owner="external_rank"),)
+                                            if previous_seg is not None else ()),
+                    "state_ready": None,
+                    "cache_indices": (seg_index_value,),
+                    "cache_index_present": cache_indices is not None,
+                    "cache_index_bound": (cache_indices is not None
+                                          and seg_index_value is not None),
+                    "state_rows": state_rows,
+                    "state_rows_bound": state_rows is not None,
+                })
+                seg_op = replace(seg_op, metadata=tuple(sorted({
+                    **dict(seg_op.metadata), **meta}.items())))
+                seg = b.add(replace(seg_op,
+                                    op_id=prefix + f".short_convolution_seg{segment_index}",
+                                    deps=tuple(dict.fromkeys(deps)), **b.common))
+                seg_contract, _ = gdn_recurrent.bind_state_ports(
+                    seg_contract, seg, heads=heads, head_shards=1)
+                b.ops[-1] = replace(b.ops[-1], metadata=tuple(sorted({
+                    **dict(b.ops[-1].metadata),
+                    "state_ready": seg,
+                    "gdn_state_contract": seg_contract,
+                    "gdn_state_effects": seg_effects,
+                    "state_value_outputs": seg_contract["value_outputs"],
+                    "state_value_inputs": (gdn_recurrent.tensor_port(
+                        seg_input, ready=seg_input.producer, role="conv_input",
+                        owner=seg_input.producer),),
+                }.items())))
+                parts.append(tensors.reshape(
+                    tensors.result(seg, (length, width)), (length * width,),
+                    name=f"conv_seg_flat{segment_index}"))
+                previous_seg = seg
+                version += length
+                offset += length
+                view_offset += length
+                segment_index += 1
+        combined = tensors.concatenate_flat(parts, "pcp_conv_concatenate")
+        conv = tensors.reshape(combined, (actual, width),
+                               name="pcp_conv_output").producer
+    else:
+        # This path also carries the selected mixed (decode+prefill) batch.
+        # Per-slot contracts above already read each request's own start
+        # version; there is no first-request override.  A rank that only owns
+        # a tail range waits for its own external prefix value before the
+        # convolution runs.
+        remote_inputs = [None] * len(ordered)
+        conv_deps = [conv_input.producer]
+        for index, view in enumerate(ordered):
+            if view.phase != "prefill":
+                continue
+            ranges = tuple(view.query_ranges)
+            first_start = int(ranges[0][0]) if ranges else 0
+            if parallel.pcp <= 1 or first_start <= 0:
+                continue
+            remote = b.work(
+                "pcp_remote_conv_state", (conv_input.producer,), (0,),
+                family="state_transfer",
+                metadata=(("status", "pending_external_rank"),
+                          ("producer_scope", "external_rank"),
+                          ("completion_owner", "T09/COMM-LEAVES"),
+                          ("source_implementation", "pcp1_only"),
+                          ("request", view.request_id),
+                          ("from_version", view.context),
+                          ("to_version", view.context + first_start)))
+            remote_inputs[index] = gdn_recurrent.tensor_port(
+                TensorValue("", plan.conv_state_dtype or "bf16",
+                            TensorLayout.contiguous((1, plan.conv_kernel - 1, width)),
+                            binding="external",
+                            binding_name=(f"pcp_peer:{view.request_id}:conv@"
+                                          f"{view.context + first_start}"),
+                            state_version=view.context + first_start),
+                ready=str(remote), role="remote_input", owner="external_rank")
+            conv_deps.append(remote)
+        mixed_contract = {**mixed_contract,
+                          "candidate_storage": ("history_ring+query_rows"
+                                                if any(direction == "token"
+                                                       for direction in
+                                                       mixed_contract["slot_directions"])
+                                                else ""),
+                          "candidate_recovery": (
+                              "accepted_prefix_from_conv_history_and_query_inputs"
+                              if any(direction == "token"
+                                     for direction in
+                                     mixed_contract["slot_directions"]) else "")}
+        mixed_contract, _ = gdn_recurrent.bind_state_ports(
+            mixed_contract, "", heads=heads, head_shards=1,
+            remote_input=tuple(remote_inputs))
+        conv_op = replace(conv_op, metadata=tuple(sorted({
+            **dict(conv_op.metadata), **conv_meta,
+            "state_remote_inputs": tuple(remote_inputs),
+            "gdn_state_contract": mixed_contract,
+            "gdn_state_effects": mixed_conv,
+        }.items())))
+        conv = b.add(replace(conv_op, op_id=prefix + ".short_convolution",
+                             deps=tuple(dict.fromkeys(conv_deps)), **b.common))
+        mixed_contract, _ = gdn_recurrent.bind_state_ports(
+            mixed_contract, conv, heads=heads, head_shards=1,
+            remote_input=tuple(remote_inputs))
+        b.ops[-1] = replace(b.ops[-1], metadata=tuple(sorted({
+            **dict(b.ops[-1].metadata),
+            "state_ready": conv,
+            "state_remote_inputs": tuple(remote_inputs),
+            "state_value_inputs": mixed_contract.get("value_inputs"),
+            "state_value_outputs": mixed_contract.get("value_outputs"),
+            "state_candidate_stores": mixed_contract.get("candidate_stores"),
+            "state_candidate_storage": {
+                "kind": mixed_contract.get("candidate_storage", ""),
+                "recovery": mixed_contract.get("candidate_recovery", ""),
+                "history_slots": conv_params.get("state_history_slots"),
+                "kernel": plan.conv_kernel,
+                "query_rows": tuple(view.q_len for view in ordered
+                                    if view.phase == "decode"),
+                "op": conv,
+            },
+            "gdn_state_contract": mixed_contract,
+            "gdn_state_effects": mixed_conv,
+        }.items())))
+        if parallel.pcp > 1:
+            conv = b.communicate(
+                "pcp_conv_state_step", (conv,),
+                len(prefill) * max(0, plan.conv_kernel - 1) * width * 2
+                * (2 * parallel.pcp - 1) / parallel.pcp,
+                "allgather", "pcp")
     gated = b.vector(
         "delta_gates", tuple(value.producer for value in gate_inputs), actual * heads, 12,
         family="gdn_gating", shape=(actual, heads),
@@ -189,13 +809,56 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
                    tensors.result(gated, (1, actual, heads), output="beta"))
     outputs = []
     if decode:
+        decode_active = tuple(view for view in decode if not view.padding)
+        decode_offsets, cursor = [], 0
+        for view in decode:
+            if not view.padding:
+                decode_offsets.append(cursor)
+            cursor += view.q_len
         outputs.append(decode_core(
             b, tensors, tuple(v.narrow(1, 0, decode_tokens) for v in qkv),
             tuple(v.narrow(1, 0, decode_tokens) for v in gate_values),
-            decode, heads, keys, dk, dv))
+            decode_active, heads, keys, dk, dv,
+            physical_tokens=decode_tokens,
+            physical_sequence_tokens=tuple(view.q_len for view in decode),
+            physical_row_offsets=tuple(decode_offsets)))
+        decode_contract, decode_effects = gdn_recurrent.state_contract(
+            views=decode, phase="decode", state_dtype=plan.recurrent_state_dtype,
+            conv_state_dtype=plan.conv_state_dtype, conv_kernel=plan.conv_kernel,
+            target_prefix=prefix, chunk=chunk,
+            initial_state=tuple(view.context > 0 and not view.padding
+                                for view in decode),
+            direction="token", target_kind="recurrent",
+            global_lengths=tuple(view.global_q_len or view.q_len for view in decode),
+            slot_indices=(None if cache_indices is None else
+                          tuple(cache_indices[index] for index, view in enumerate(ordered)
+                                if view.phase == "decode")),
+            state_capacity=state_rows, slot_source=index_source)
+        scan = b.ops[-1]
+        scan_meta = dict(scan.metadata)
+        decode_value_inputs = tuple(
+            view_values[2] for view_values in scan_meta.get("state_value_views", ()))
+        decode_contract, decode_outputs = gdn_recurrent.bind_state_ports(
+            decode_contract, scan.op_id, heads=heads, head_shards=1,
+            value_outputs=None)
+        b.ops[-1] = replace(scan, metadata=tuple({**scan_meta,
+            "state_ready": scan.op_id,
+            "state_value_inputs": decode_value_inputs,
+            "state_value_outputs": decode_outputs,
+            "gdn_state_contract": decode_contract,
+            "gdn_state_effects": decode_effects,
+            "padding_slots": decode_contract["padding_slots"],
+            "state_checkpoint_versions": tuple(
+                None if count <= 0 else (context + 1,)
+                for context, count in zip(decode_contract["contexts"],
+                                          decode_contract["checkpoints"]))}.items()))
+    prefill_slots = (None if cache_indices is None else
+                     tuple(cache_indices[len(decode) + index]
+                           for index in range(len(prefill))))
     output = core(builder=b, tensors=tensors, conv=conv, gated=gated, views=prefill,
-                  heads=heads, key_heads=keys, dk=dk, dv=dv,
-                  chunk=policy.recurrent_chunk if policy else 64,
+                  heads=heads, key_heads=keys, dk=dk, dv=dv, chunk=chunk,
+                  state_slot_indices=prefill_slots, state_capacity=state_rows,
+                  state_slot_source=index_source,
                   qkv_values=tuple(v.narrow(1, decode_tokens, prefill_tokens) for v in qkv),
                   gate_values=tuple(v.narrow(1, decode_tokens, prefill_tokens) for v in gate_values),
                   pcp=parallel.pcp)

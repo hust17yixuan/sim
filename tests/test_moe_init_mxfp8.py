@@ -127,3 +127,31 @@ def test_declared_source_resource_slowdown_changes_real_program(axis):
         results.append(row['duration_ms'])
     assert results[0] >= results[1] >= results[2]
     assert results[0] > results[2]
+
+
+def test_moe_init_capability_registry_and_dtype_width_gates():
+    from mindie_sim.prediction.family_moe_init import apply, capabilities
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.common import ModelingError
+
+    caps = capabilities()
+    assert caps["selector"] == "moe_init_routing"
+    assert caps["native_kind"] == "MoeInitRoutingV3"
+    assert caps["input_dtypes"] == ("bf16",)
+    assert caps["scale_group_size"] == 32
+    assert "no_moe_transport_quantization" in caps["requires"]
+
+    raw = case(16, selected=False)
+    parsed = parse_case(raw)
+    ops = graph(raw, 16)
+    bindings = {"moe_init_routing": {"implementation": RECIPE}}
+    pack = next(op for op in ops if op.recipe == "route_pack")
+    matrix = next(op for op in ops if op.recipe in {"grouped_gate_up", "balanced_grouped_gate_up"})
+    direct = replace(matrix, deps=(pack.op_id,),
+                     local_shape=(matrix.local_shape[0], matrix.local_shape[1], 100))
+    with pytest.raises(ModelingError, match="width_multiple_of_256"):
+        apply((pack, direct), bindings, parsed.runtime)
+    fp16 = replace(pack, dtype="fp16")
+    ok_matrix = replace(matrix, deps=(pack.op_id,))
+    with pytest.raises(ModelingError, match="complete_BF16_to_E4M3_MX32"):
+        apply((fp16, ok_matrix), bindings, parsed.runtime)

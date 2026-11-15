@@ -1,31 +1,40 @@
 """Multi-tier outbound-ratio and A5 EP MC2 analytical models.
 
 [Role]
-  Convert declared Ethernet/UB link tiers into an EP all-to-all effective
-  bandwidth, and evaluate speculative decoding plus MC2 dispatch/combine
-  communication time from structural geometry.
+  Materialize declared Ethernet/UB tier domains as physical links, expose an
+  explicit directed EP all-to-all transport plan, and keep the older
+  group-level effective-bandwidth budget for comparison.
 
 [Invariants]
-  * An all-to-all source rank sends ``(ep - 1) / ep`` of its traffic to peers.
-    Crossing a declared tier boundary retains only the fraction that leaves
-    that domain, so the bottleneck is the minimum ``B / outbound_ratio`` over
-    active tiers.
+  * Tier links are non-overlapping physical groups of the declared width; an
+    EP pair uses the narrowest domain that contains both. A tier that does not
+    enlarge the domain for the selected EP is not duplicated.
+  * A shared-domain link, a per-port injection plane and a per-pair direction
+    are distinct resources. The transport plan reports aggregate binding work
+    separately from the full Engine span.
+  * The legacy ``analyze_ep_mc2_communication`` result is an explicitly
+    labelled group-level analytic budget, not a topology service span; its
+    startup defaults are caller-visible placeholders, not T06-identified
+    parameters. Missing chunk/credit/startup inputs stay unknown.
   * Precision sizes are explicit: MXFP8 block scaling is 33/32 bytes per value,
     FP8/INT8 are one byte and BF16/FP16 are two bytes.
-  * Timings use topological bytes, declared layer counts and explicit startup
-    latency. No serving floor, fitted residual or measurement-presence check is
-    applied.
+  * No serving floor, fitted residual or measurement-presence check is applied.
 
-[Timeouts & Locks] Pure bounded arithmetic over the requested EP values.
+[Timeouts & Locks] Pure bounded arithmetic and bounded EP expansion.
 [Side-Effect Policy] No I/O, device context or mutable global state.
 """
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.hardware import Hardware, Link
+from mindie_sim.schema.parallel import ParallelSpec
+from .communication import MessageFlow
+from .topology import Topology
 
 
 EP_TIER_PRESETS: dict[str, tuple[dict[str, Any], ...]] = {
@@ -105,9 +114,11 @@ def _tiers_for(preset: str, tiers: Sequence[Mapping[str, Any]] | None
                 or max_ranks <= previous):
             raise ModelingError(f"ep_tier_max_ranks_invalid:{index}")
         bw_gbps = _positive(tier.get("bw_gbps"), f"ep_tier_bw_gbps_invalid:{index}")
+        latency = _non_negative(tier.get("latency_us", 0.0),
+                                f"ep_tier_latency_us_invalid:{index}")
         name = str(tier.get("name", f"tier_{index}"))
         normalized.append({"name": name, "max_ranks": max_ranks,
-                           "bw_gbps": bw_gbps})
+                           "bw_gbps": bw_gbps, "latency_us": latency})
         previous = max_ranks
     return tuple(normalized)
 
@@ -196,6 +207,152 @@ def compute_ep_effective_bandwidth(
     }
 
 
+def ep_tier_links(
+    ep: int,
+    tiers: Sequence[Mapping[str, Any]] | None = None,
+    *,
+    preset: str = "a5_pcie_16p",
+    semantics: str = "per_port",
+) -> tuple[Link, ...]:
+    """Materialize nested EP tier domains as physical link records.
+
+    Each tier contributes non-overlapping groups of its own width.  A pair
+    inside one 4P/8P/... group uses that group's declared rate; a pair that
+    only shares the larger domain uses the larger (usually slower) tier.  The
+    link semantics is explicit because a per-rank injection port and a shared
+    forwarding plane are different resources with different contention.
+    """
+    if not isinstance(ep, int) or isinstance(ep, bool) or ep < 2:
+        raise ModelingError(f"ep_tier_topology_requires_ep_at_least_two:{ep}")
+    if semantics not in {"shared", "per_port", "per_pair", "mesh"}:
+        raise ModelingError(f"ep_tier_semantics_unknown:{semantics}")
+    normalized = _tiers_for(str(preset), tiers)
+    links = []
+    previous_width = 1
+    for tier in normalized:
+        width = min(ep, int(tier["max_ranks"]))
+        # A tier that does not enlarge the physical domain for this EP is a
+        # duplicate of the previous (narrower) tier.  Keep the narrower one.
+        if width <= previous_width:
+            continue
+        previous_width = width
+        if width < 2:
+            continue
+        for first in range(0, ep, width):
+            members = tuple(range(first, min(first + width, ep)))
+            if len(members) < 2:
+                continue
+            links.append(Link(
+                name=f"ep_tier:{tier['name']}:{first}",
+                capacity_bytes_per_ms=float(tier["bw_gbps"]) * 1e6,
+                members=members,
+                latency_us=float(tier.get("latency_us", 0.0)),
+                channel=f"ep_{tier['name']}",
+                semantics=semantics,
+            ))
+    if not links:
+        raise ModelingError(f"ep_tier_topology_empty:{ep}")
+    return tuple(links)
+
+
+def _tier_site_width(ep: int, tiers, preset: str) -> int:
+    """Declared on-node width, not merely the largest named EP tier.
+
+    ``a3_superpod`` has a 16-rank node followed by a 384-rank superpod; the
+    superpod link must still connect different nodes, so its site width is 16,
+    not 384.  A named superpod stops the on-node expansion; otherwise the last
+    tier before the scale-out marker is the node width.
+    """
+    previous = 1
+    for tier in _tiers_for(str(preset), tiers):
+        width = min(ep, int(tier["max_ranks"]))
+        text = str(tier["name"]).lower().replace("-", "_")
+        if any(marker in text for marker in ("inter_node", "inter_pod")):
+            return max(1, previous)
+        if "superpod" in text:
+            return max(1, previous) if previous > 1 else max(1, width)
+        if width > previous:
+            previous = width
+    return max(1, previous)
+
+
+def ep_tier_machine(
+    ep: int,
+    tiers: Sequence[Mapping[str, Any]] | None = None,
+    *,
+    preset: str = "a5_pcie_16p",
+    semantics: str = "per_port",
+    sku: str = "Ascend950DT_9581",
+    ranks_per_node: int | None = None,
+) -> Hardware:
+    """Declared A5 device records plus the selected EP tier links."""
+    links = ep_tier_links(ep, tiers, preset=preset, semantics=semantics)
+    site = (int(ranks_per_node) if ranks_per_node is not None
+            else _tier_site_width(ep, tiers, preset))
+    if site < 1:
+        raise ModelingError(f"ep_tier_ranks_per_node_invalid:{site}")
+    base = Hardware.from_mapping({
+        "backend": "ascend", "sku": sku,
+        "num_devices": ep, "ranks_per_node": min(ep, site),
+    })
+    return replace(base, links=links)
+
+
+def ep_alltoall_transport(
+    ep: int,
+    per_source_bytes: float,
+    *,
+    tiers: Sequence[Mapping[str, Any]] | None = None,
+    preset: str = "a5_pcie_16p",
+    semantics: str = "per_port",
+    chunk_bytes: float | None = None,
+    receive_capacity_bytes=None,
+    hop_startup_us: float = 0.0,
+    ranks_per_node: int | None = None,
+    max_ranks: int = 128,
+):
+    """Build an explicit EP all-to-all transport over actual tier domains.
+
+    ``per_source_bytes`` is the total payload one source sends to all peers;
+    the uniform peer share is ``per_source_bytes / (ep - 1)``.  The returned
+    plan separates the aggregate shared-link lower bound from the full
+    chunk/credit span and never treats one group's duration as a link rate.
+    """
+    if not isinstance(ep, int) or isinstance(ep, bool) or ep < 2:
+        raise ModelingError(f"ep_transport_requires_ep_at_least_two:{ep}")
+    if ep > int(max_ranks):
+        raise ModelingError(
+            "ep_transport_topology_requires_domain_aggregation:"
+            f"{ep}>{int(max_ranks)}")
+    total = _non_negative(per_source_bytes, "ep_transport_per_source_bytes")
+    machine = ep_tier_machine(
+        ep, tiers, preset=preset, semantics=semantics,
+        ranks_per_node=ranks_per_node)
+    topology = Topology(machine, ParallelSpec(tp=ep))
+    share = total / (ep - 1)
+    flows = tuple(MessageFlow(source, destination, share)
+                  for source in range(ep)
+                  for destination in range(ep) if source != destination)
+    plan = topology.transport_plan(
+        flows, chunk_bytes=chunk_bytes,
+        receive_capacity_bytes=receive_capacity_bytes,
+        hop_startup_us=hop_startup_us)
+    return {
+        "ep": ep,
+        "preset": str(preset),
+        "sharing": semantics,
+        "per_source_bytes": total,
+        "peer_share_bytes": share,
+        "topology": topology,
+        "plan": plan,
+        "links": tuple(link.to_dict() for link in machine.links),
+        "lower_bound": plan.lower_bound(),
+        "stage_count": plan.stage_count,
+        "unknowns": dict(plan.unknowns),
+        "coverage": "explicit_directed_ep_domains_not_group_effective_bw",
+    }
+
+
 def analyze_ep_mc2_communication(
     ep_values: Sequence[int] = (2, 4, 8, 16, 32, 64, 128, 256),
     batch_size: int = 32,
@@ -261,6 +418,9 @@ def analyze_ep_mc2_communication(
             dispatch_us = startup_us + (dispatch_per_layer / (effective * 1e9)) * 1e6
             combine_us = startup_us + (combine_per_layer / (effective * 1e9)) * 1e6
             total_comm_ms = (dispatch_us + combine_us) * num_moe_layers / 1000.0
+            wire_service_ms = (
+                (dispatch_per_layer + combine_per_layer)
+                / (effective * 1e9) * 1e6 * num_moe_layers / 1000.0)
             rows.append({
                 "ep": ep,
                 "bw_utilization": utilization,
@@ -270,12 +430,24 @@ def analyze_ep_mc2_communication(
                 "dispatch_us": dispatch_us,
                 "combine_us": combine_us,
                 "total_comm_ms": total_comm_ms,
+                # This excludes the declared startup term; it is still a
+                # group-level budget because one effective bandwidth replaces
+                # the actual route/sharing domains.
+                "wire_service_lower_bound_ms": wire_service_ms,
                 "tpot_comm_ms": total_comm_ms / accept_step,
             })
     return {
         "preset": str(preset),
         "accept_step": accept_step,
         "startup_latency_us": startup_us,
+        "startup_parameters": {
+            "per_hop_latency_us": per_hop,
+            "switch_base_latency_us": switch,
+            "software_launch_latency_us": software,
+            "source": "caller_visible_analytic_inputs_not_T06_identified",
+            "omitted_arguments_use_function_defaults": True,
+            "boundary": "one additive startup term per dispatch/combine call",
+        },
         "dispatch_bytes_per_layer": dispatch_per_layer,
         "combine_bytes_per_layer": combine_per_layer,
         "num_moe_layers": num_moe_layers,
@@ -284,4 +456,13 @@ def analyze_ep_mc2_communication(
         "rows": rows,
         "results": rows,
         "ep_results": rows,
+        "coverage": "group_level_analytic_budget_not_a_topology_service_span",
+        "topology_example": "use ep_alltoall_transport() for explicit domains",
+        "unknowns": {
+            "protocol_startup_us": (
+                "analytic defaults are caller-visible placeholders, not a "
+                "T06 identified per-resource service"),
+            "receiver_credit_bytes": "not declared by this group-level budget",
+            "per_hop_route": "collapsed into one effective group bandwidth",
+        },
     }

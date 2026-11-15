@@ -47,8 +47,10 @@ def test_partial_source_binding_executes_same_store_and_survives_graph_roundtrip
     exported = export_structure(raw, **GEOMETRY)
     assert exported["execution"]["software"]["kernels"]["lowerings"]["gdn_decode"] == binding
     graph = graph_costs(raw, graphs, external_inputs={"analysis_input": 0}, isolated=False)
-    assert graph["duration_ms"] == body["body_forward_ms"]
-    assert graph["execution"]["serviced"] == body["execution"]["serviced"]
+    assert graph["duration_ms"] == pytest.approx(
+        body["body_forward_ms"], rel=1e-9, abs=1e-15)
+    assert graph["execution"]["serviced"] == pytest.approx(
+        body["execution"]["serviced"], rel=1e-9, abs=1e-9)
     assert raw == before
 
 
