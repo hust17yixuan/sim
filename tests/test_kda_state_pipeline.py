@@ -295,7 +295,7 @@ def test_two_sequences_keep_two_state_streams_and_initialization_writes():
 
     engine = execute(params(lengths=(64, 64), heads=1),
                      hardware_case(units=2), trace_limit=10000)
-    assert sum(row["task"].endswith(":init") for row in engine.trace) == 2
+    assert sum(row["task"].endswith(":init:store") for row in engine.trace) == 2
     assert sum(row["task"].endswith(":states0:store") for row in engine.trace) == 2
 
 
@@ -362,17 +362,17 @@ def test_causal_c1_delta_c2_state_handoffs_by_chunk():
                          "mte1": 1e30, "fixpipe": 1e30, "vector": 1e9}),
                      trace_limit=10000)
 
-    def event(chunk, name):
+    def event(chunk, *names):
         return next(row for row in engine.trace
-                    if f":tile{chunk}:{name}" in row["task"])
+                    if any(f":tile{chunk}:{name}" in row["task"] for name in names))
 
     init_end = max(row["end_ms"] for row in engine.trace
-                   if row["task"].endswith(":init"))
+                   if row["task"].endswith(":init:store"))
     assert init_end <= event(0, "c1s0:load")["start_ms"]
     for chunk in (0, 1):
-        assert event(chunk, "c1s0:store")["end_ms"] <= event(chunk, "deltas0:load")["start_ms"]
+        assert event(chunk, "c1s0:store", "c1s0:publish")["end_ms"] <= event(chunk, "deltas0:load")["start_ms"]
         assert event(chunk, "deltas0:store")["end_ms"] <= event(chunk, "c2s0:load")["start_ms"]
-        assert event(chunk, "c2s0:store")["end_ms"] <= event(chunk, "states0:load")["start_ms"]
+        assert event(chunk, "c2s0:store", "c2s0:publish")["end_ms"] <= event(chunk, "states0:load")["start_ms"]
         for phase in ("c1s0", "c2s0"):
             assert event(chunk, phase + ":l0")["end_ms"] <= event(
                 chunk, phase + ":compute")["start_ms"]
@@ -392,7 +392,7 @@ def test_short_slot_refills_before_other_stream_finishes_and_h0_is_global():
     engine = execute(params(lengths=lengths, heads=1),
                      hardware_case(units=2), trace_limit=10000)
     init_end = max(row["end_ms"] for row in engine.trace
-                   if row["task"].endswith(":init"))
+                   if row["task"].endswith(":init:store"))
     c1_rows = [row for row in engine.trace if row["task"].endswith(":c1s0:load")
                or row["task"].endswith(":c1s1:load")]
     assert min(row["start_ms"] for row in c1_rows) >= init_end

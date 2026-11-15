@@ -54,6 +54,7 @@ LIMITATIONS = (
     'MTE1_base_pipe_bytes_no_directional_instruction_rate_assumption',
     'source_control_flags_zero_latency_readiness_dependencies',
     'pre_stage2_row_batches_conservative_serial_completion',
+    'pre_stage1_multi_m_tiles_execute_serially_within_one_source_core',
 )
 
 
@@ -70,10 +71,20 @@ def _frozen_groups(groups):
 def _pre_template(g, iterations):
     # Future layers share source IR, never bound programs, rates or Engine events.
     # Capacity checks still run before this cache lookup on each physical device.
-    first = _frozen_groups(pre_owner(g, owner) for owner in range(g.k_parts))
+    first = _frozen_groups(pre_owner(g, owner)
+                           for owner in range(g.m_dim * g.k_parts))
     second = _frozen_groups(pre_second_owner(g, owner, iterations)
                            for owner in range((g.rows + g.row_former - 1) // g.row_former))
     return first, second, _frozen_work(total_work((*first, *second)))
+
+
+@lru_cache(maxsize=4)
+def _msplit_template(g, iterations):
+    from .hc_arch35_program import pre_msplit_parts
+    parts = tuple((_frozen_groups((first,))[0], _frozen_groups((second,))[0])
+                  for first, second in pre_msplit_parts(g, iterations))
+    groups = tuple(first + second for first, second in parts)
+    return groups, _frozen_work(total_work(groups)), parts
 
 
 @lru_cache(maxsize=4)
@@ -109,21 +120,54 @@ def selected_plan(op, geometry):
             if name in exposed and phase['recipe'] not in {'hc_sinkhorn', 'hc_pre_mix'}:
                 raise ModelingError('hc_arch35_cannot_export_internal_intermediate')
         g = pre_geometry(view, geometry)
-        first, second, work = _pre_template(g, view['sinkhorn_iters'])
-        from .hc_arch35_compact import eligible
-        compact=profile==COMPACT_PRE_PROFILE and eligible(g)
+        from .hc_arch35_compact import eligible, finite_template_available
+        parts = None
+        if g.tiling_key == 1001:
+            first, work, parts = _msplit_template(g, view['sinkhorn_iters'])
+            second = None
+            compact = profile == COMPACT_PRE_PROFILE and eligible(g)
+        else:
+            first, second, work = _pre_template(g, view['sinkhorn_iters'])
+            compact = profile == COMPACT_PRE_PROFILE and eligible(g)
         diagnostic.update(geometry=vars(g), logical_projection_flops=2 * g.rows * g.width * 24,
-                          physical_projection_flops=2 * g.m_l1 * g.width * 32,
+                          physical_projection_flops=int(work.matrix.get('hf32', 0)),
+                          m_k_tiling={
+                              'basis': 'hc_pre_tiling_arch35.h:295-429',
+                              'source_revision': SOURCE['revision'],
+                              'm_l1_max': 256, 'm_dim': g.m_dim,
+                              'single_core_m': g.single_core_m,
+                              'm_l1': g.m_l1, 'm_tiles': g.m_tiles,
+                              'k_dim': g.k_dim, 'k_span': g.k_span,
+                              'k_parts': g.k_parts, 'k_l1': g.k_l1,
+                              'owner_count': g.m_dim * g.k_parts,
+                              'tiling_key': g.tiling_key,
+                              'm_cnt': g.m_cnt, 'm_rounds': g.m_rounds,
+                              'm_main': g.m_main,
+                          },
                           source_workspace_bytes=g.rows * g.k_parts * 25 * 4,
                           compact_pipeline={
                               'requested':profile==COMPACT_PRE_PROFILE,
                               'applied':compact,
-                              'domain':'one_L1_panel_per_Cube_owner',
-                              'outside_domain':'original_detailed_DAG',
-                              'contention':'coupled_fluid_interior; original_prologue_RMS_projection_outputs',
+                              'domain':'one_HCPre_owner_source_chunk_dag',
+                              'outside_domain':'source_geometry_or_pipe_unavailable',
+                              'pipeline':'source_chunk_read_cast_transpose_publish; weight_micro_operands_cube',
+                              'producer_ready':'source_Phase.after',
+                              'l1_release':'source_Phase.after',
+                              'l0_reuse':'source_Phase.after',
+                              'aiv_chunk_pipeline':'source_Phase.after_input_and_UB_rings',
+                              'terminal_ready':'source_Phase.after_RMS_last_vector_and_write_FIFO',
+                              'stage_merge':'none_across_source_slot_boundaries',
+                              'finite_template':('ordered_phases_key1000_stage1'
+                                                 if compact and g.tiling_key == 1000
+                                                 and finite_template_available()
+                                                 else 'exact_reference'),
+                              'stage2':'local_vector_unchanged' if g.tiling_key == 1001
+                                       else 'global_k_partial_unchanged',
+                              'work_conserved':True,
                           })
         return OperatorPlan(work,
-            lambda context: pre_program(g, first, second, context,compact=compact), diagnostic)
+            lambda context: pre_program(g, first, second, context,compact=compact,
+                                        parts=parts), diagnostic)
     size = post_geometry(view, geometry)
     units = geometry.resource_units['vector']
     used = min(view['tokens'], units)

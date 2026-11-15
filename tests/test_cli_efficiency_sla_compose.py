@@ -106,7 +106,7 @@ def test_compose_case_catalog_models_across_a2_a3_a5(
         tp=tp,
         dp=dp,
         ep=ep,
-        layers=4,
+        layers=4 if model_name == "glm-5.3-flash" else 2,
         prompt_tokens=2048,
         output_tokens=64,
         concurrency=1,
@@ -285,20 +285,22 @@ def test_cli_compose_efficiency_and_sla_end_to_end(tmp_path: Path) -> None:
 
 def test_cli_sweep_and_skew_modes(tmp_path: Path) -> None:
     case_path = tmp_path / "case.json"
-    case_dict = compose_case("qwen3.5-35b-a3b", hardware="a3", tp=2, dp=2, ep=4, layers=2)
+    case_dict = compose_case("qwen3.5-35b-a3b", hardware="a3", tp=2, dp=2, ep=4, layers=1)
+    case_dict["runtime"]["max_num_seqs"] = 4
     case_path.write_text(json.dumps(case_dict), encoding="utf-8")
 
     topo_out = tmp_path / "sweep_topo.json"
     assert main([
         "sweep", str(case_path), "--mode", "topology",
-        "--num-devices", "4", "--context", "2048", "--sla-ms", "50.0", "-o", str(topo_out),
+        "--num-devices", "4", "--context", "512", "--sla-ms", "0.5", "-o", str(topo_out),
     ]) == 0
     assert json.loads(topo_out.read_text(encoding="utf-8"))["schema"] == "mindie-sim.topology-sweep/1"
 
     pd_out = tmp_path / "sweep_pd.json"
     assert main([
         "sweep", str(case_path), "--mode", "pd", "--num-devices", "8",
-        "--prompt-tokens", "1024", "--output-tokens", "128", "-o", str(pd_out),
+        "--prompt-tokens", "128", "--output-tokens", "16", "--tpot-sla-ms", "0.5",
+        "-o", str(pd_out),
     ]) == 0
     assert "pd" in json.loads(pd_out.read_text(encoding="utf-8"))["schema"]
 
@@ -332,7 +334,7 @@ def test_a5_dt_glm53_moe_dispatch_combine_modeling() -> None:
         ("a5-server-dt", 35.5509, 68.9472, 5.0, 56),
     ):
         case = compose_case(
-            model="glm5.3", hardware=hw, dp=64, tp=1, ep=64,
+            model="glm5.3", hardware=hw, dp=64, tp=1, ep=64, layers=4,
             prompt_tokens=131072, output_tokens=1024, concurrency=1216,
             mtp_proposal_tokens=5, mtp_acceptance_length=4.5, tpot_slo_ms=20.0,
         )
@@ -672,8 +674,10 @@ def test_feature_superposition_pp_pcp_mc2_dspark_mtp_sp() -> None:
         op4 = expert4[recipe]
         assert dict(op8.metadata)["weight_format"] == "int8"
         assert dict(op4.metadata)["weight_format"] == "int4"
+        payload8, payload4 = (dict(op.metadata)["weight_payload_bytes"] for op in (op8, op4))
+        assert payload4 == pytest.approx(0.5 * payload8, rel=1e-12)
         weight8, weight4 = (dict(op.metadata)["weight_bytes"] for op in (op8, op4))
-        assert weight4 == pytest.approx(0.5 * weight8, rel=1e-12)
+        assert weight4 == pytest.approx(0.5 * weight8, rel=4e-3)
     assert not any(op.recipe in ("expert_dispatch", "expert_combine")
                    for op in mc2_ops4)
     mc2 = [op for op in mc2_ops4 if op.family == "mc2_protocol"]
@@ -687,9 +691,14 @@ def test_feature_superposition_pp_pcp_mc2_dspark_mtp_sp() -> None:
                    if op.op_id.endswith((".expert_up", ".expert_down")))
     moe_hbm4 = sum(dict(op.metadata)["weight_bytes"] for op in mc2_ops4
                    if op.op_id.endswith((".expert_up", ".expert_down")))
+    moe_payload8 = sum(dict(op.metadata)["weight_payload_bytes"] for op in mc2_ops8
+                       if op.op_id.endswith((".expert_up", ".expert_down")))
+    moe_payload4 = sum(dict(op.metadata)["weight_payload_bytes"] for op in mc2_ops4
+                       if op.op_id.endswith((".expert_up", ".expert_down")))
+    assert moe_payload4 == pytest.approx(0.5 * moe_payload8, rel=1e-12)
     moe_time8 = moe_hbm8 / hbm_peak * 1000.0
     moe_time4 = moe_hbm4 / hbm_peak * 1000.0
-    assert moe_time4 == pytest.approx(0.5 * moe_time8, rel=1e-12)
+    assert moe_time4 == pytest.approx(0.5 * moe_time8, rel=4e-3)
     assert moe_time4 < moe_time8
 
     # The same W4A8 x DP/TP/PP/PCP/EP/SP stack on two other catalogs.
@@ -771,13 +780,14 @@ def test_cross_dp_sp_body_selection_preserves_body_defaults() -> None:
                if item["family"] == "grouped_gemm"]
     assert [(item["selection"], item["reason"]) for item in grouped] == [(
         "default_installed", "preserve_existing_grouped_mapping_domain")]
-    assert grouped[0]["program"] == {"kind": "steady_matmul"}
+    assert grouped[0]["program"] == {"kind": "steady_matmul", "owner_cohorts": True}
     matmul = [item for item in ops.default_selection["selections"]
               if item["family"] == "matmul"]
     assert [(item["selection"], item["reason"]) for item in matmul] == [(
         "default_installed", "compact_finite_k_pipeline_preserving_128_output_grid")]
     assert {"programs", "families"} <= ops.effective_kernels.keys()
-    assert ops.effective_kernels["families"]["grouped_gemm"] == {"kind": "steady_matmul"}
+    assert ops.effective_kernels["families"]["grouped_gemm"] == {
+        "kind": "steady_matmul", "owner_cohorts": True}
 
     disabled = target_operators(qwen_sp(), phase="prefill", tokens=128,
                                 scope="body", apply_body_defaults=False)

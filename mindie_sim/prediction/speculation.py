@@ -17,6 +17,23 @@ from .structure import stage_map
 from .implementation_selection import resolve, LoweringRegion
 
 
+def _tag_draft_ops(ops, rows_by_request, *, step=0):
+    """Attach the actual draft producer identity and materialized row counts.
+
+    A target layer and a draft layer can share a numeric index.  Offload and
+    state consumers must use this scope, not the layer number alone, to choose
+    the producer and completion handle.
+    """
+    rows = tuple(sorted((str(request), int(count)) for request, count in rows_by_request.items()))
+    return tuple(replace(op, metadata=tuple({
+        **dict(op.metadata),
+        "layer_scope": "draft",
+        "producer_scope": "draft",
+        "draft_step": int(step),
+        "draft_rows_by_request": rows,
+    }.items())) for op in ops)
+
+
 def draft_program(frontend, model, runtime, views, ready, *, global_views=None, prefill=False,
                   replica=0, replay_scope="none"):
     kind = dict(runtime.metadata).get("draft_mode", "mtp")
@@ -147,8 +164,10 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
         )
         ops.extend(body)
         if prefill:
-            regions.append(LoweringRegion(tuple(ops), selected_runtime,
-                                          draft_model.activation_dtype, rows, selections))
+            rows_by_request = {view.request_id: view.q_len for view in proposal_views}
+            regions.append(LoweringRegion(
+                _tag_draft_ops(ops, rows_by_request),
+                selected_runtime, draft_model.activation_dtype, rows, selections))
             continue
         heads, previous = frontend.logits(draft_model, selected_runtime, proposal_views, previous,
                                          prefix=prefix, mode="draft", stage=stage, sample=False)
@@ -188,8 +207,13 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
                 recipe="draft_sample")
             ops.append(sample)
             previous = sample.op_id
-        regions.append(LoweringRegion(tuple(ops), selected_runtime,
-                                      draft_model.activation_dtype, rows, selections))
+        rows_by_request = {
+            view.request_id: (view.q_len if prefill else 1 if serial else view.draft_proposal_tokens)
+            for view in selected
+        }
+        regions.append(LoweringRegion(
+            _tag_draft_ops(ops, rows_by_request, step=step),
+            selected_runtime, draft_model.activation_dtype, rows, selections))
     # Draft runs on the last pipeline stage. Send accepted proposal ids back
     # to stage 0 so the target schedule can consume them.
     if not prefill and runtime.parallel.pp > 1 and regions and rows > 0:
@@ -213,6 +237,9 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
                 ("destination_stage", 0),
             ),
         )
+        xfer = _tag_draft_ops((xfer,), {
+            view.request_id: view.draft_proposal_tokens for view in active
+        })[0]
         last = regions[-1]
         regions[-1] = replace(last, ops=last.ops + (xfer,))
         previous = xfer.op_id

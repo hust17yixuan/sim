@@ -33,6 +33,16 @@ SOURCE = {
         "sha256": "d2ba785ac291998012c3b33671d708ad184970bd5ff896f79aa74dc319ae2906",
         "lines": [271, 420],
     },
+    # Local matching operator checkout used for the review: its arch22 cube and
+    # vector hashes equal the two entries above.  The host tiler, not a sampled
+    # shape table, supplies the named implementation's legal domain.
+    "host_tiler": {
+        "path": "csrc/attention/quant_lightning_indexer_v2/op_host/quant_lightning_indexer_v2_tiling.cpp",
+        "sha256": "c87c4e5ffd04802bf22f54d09131f9d54f8017b706854b936cfdc144748f33ec",
+        "lines": [339, 355, 928, 955],
+        "scope": ("local matching arch22 checkout whose cube/vector hashes equal "
+                  "the SOURCE entries above; not a captured binary identity"),
+    },
     "capture_binary_identity": "not_established",
 }
 
@@ -66,13 +76,100 @@ def _owned_spans(view):
     return tuple((start, end) for start, end in ranges if end > start)
 
 
-def declare(builder, *, deps, views, plan, quant, parallel):
-    """Declare the supported complete boundary without inferring native owners."""
+# Declared native arch22 implementation domain (the SOURCE cube/vector files
+# are arch22).  These are the host tiler's actual gates, not a sampled tuple:
+# N1/N2 = 64, head dim 128, sparse_count <= 2048, cmp_ratio <= 128 and a power
+# of two.
+NATIVE_HEAD_DIM = 128
+NATIVE_HEAD_COUNT = 64
+NATIVE_TOPK_MAX = 2048
+NATIVE_COMPRESSION_MAX = 128
+NATIVE_BLOCK_ROWS_FACTOR = 16
+NATIVE_BLOCK_ROWS_MAX = 1024
+
+
+def _check_representation(plan, quant, parallel):
+    """Validate the representation and single-call boundary shared by both paths."""
     if (parallel.cp != 1 or parallel.pcp < 1 or plan.candidate_filter
-            or plan.index_kpool != 1 or plan.compress_ratio != 4
-            or (plan.index_heads, plan.index_dim, plan.index_topk) != (64, 128, 512)
+            or plan.index_kpool != 1
             or quant.index_dtype != "int8" or quant.index_scale_dtype != "fp16"):
         raise ModelingError("quant_lightning_indexer_v2_complete_domain_mismatch")
+    for value in (plan.index_heads, plan.index_dim,
+                  plan.index_topk, plan.compress_ratio):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ModelingError("quant_lightning_indexer_v2_complete_domain_mismatch")
+
+
+def _check_domain(plan, quant, parallel, block_size=None):
+    """Validate the selected arch22 native implementation's legal domain.
+
+    The generic analytic path remains available for other legal geometry; this
+    check only guards the named ``VllmAscendQuantLightningIndexerV2`` selection.
+    """
+    _check_representation(plan, quant, parallel)
+    if (plan.index_dim != NATIVE_HEAD_DIM
+            or plan.index_heads != NATIVE_HEAD_COUNT
+            or plan.index_topk > NATIVE_TOPK_MAX
+            or plan.compress_ratio > NATIVE_COMPRESSION_MAX
+            or (plan.compress_ratio & (plan.compress_ratio - 1))):
+        raise ModelingError("quant_lightning_indexer_v2_complete_domain_mismatch")
+    if block_size is not None:
+        if (type(block_size) is not int or block_size <= 0
+                or block_size % NATIVE_BLOCK_ROWS_FACTOR
+                or block_size > NATIVE_BLOCK_ROWS_MAX):
+            raise ModelingError("quant_lightning_indexer_v2_complete_domain_mismatch")
+
+
+def _visible_rows(spans, ratio):
+    """Rows with at least one visible compressed key (spans are (q, context))."""
+    return sum(max(0, q - max(0, ratio - c - 1)) for q, c in spans)
+
+
+def _selection_comparisons(pairs, topk, visible_rows):
+    """TopK selection work; Top1 is a maximum reduction, not zero work."""
+    if topk == 1:
+        return max(0, pairs - visible_rows)
+    return pairs * math.log2(topk)
+
+
+def generic_work(*, spans, heads, dim, topk, ratio):
+    """Representation-agnostic indexer work for legal unsampled geometry.
+
+    This does not claim the arch22 native binary; it lets the analytic path
+    predict arbitrary positive head/width/TopK/compression combinations that
+    the source formula can express.
+    """
+    normalized = []
+    for q, c in spans:
+        if (isinstance(q, bool) or not isinstance(q, int) or q < 1
+                or isinstance(c, bool) or not isinstance(c, int) or c < 0):
+            raise ModelingError("quant_indexer_generic_geometry_invalid")
+        normalized.append((q, c))
+    for name, value in (("heads", heads), ("dim", dim),
+                        ("topk", topk), ("ratio", ratio)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ModelingError("quant_indexer_generic_geometry_invalid")
+    pairs = sum(_floor_sum(q, ratio, 1, c + 1) for q, c in normalized)
+    visible = _visible_rows(normalized, ratio)
+    return {
+        "query_key_pairs": pairs,
+        "qk_int8_flops": 2 * pairs * heads * dim,
+        "weighted_head_reduce_fp16_flops": 2 * pairs * heads * 16,
+        "topk_comparisons": _selection_comparisons(pairs, topk, visible),
+        "selection_output_bytes": sum(q for q, _ in normalized) * topk * 4,
+    }
+
+
+def declare(builder, *, deps, views, plan, quant, parallel, block_size=None):
+    """Declare the supported complete boundary without inferring native owners.
+
+    ``block_size`` is the actual KV/index key block size from the runtime. The
+    host tiler requires a multiple of 16 in (0, 1024]; T14 must pass it through
+    the normal builder option when available. When absent, the domain is not
+    silently assumed: the ledger records that the runtime parameter was not
+    supplied.
+    """
+    _check_domain(plan, quant, parallel, block_size)
     tokens = sum(view.q_len for view in views)
     # Causal compressed-key counts follow each owned span. PCP chunks pass
     # query_ranges; padding and cache allocation do not create index work.
@@ -81,6 +178,9 @@ def declare(builder, *, deps, views, plan, quant, parallel):
     pairs = sum(_floor_sum(end - start, ratio, 1, view.context + start + 1)
                 for view, start, end in spans)
     heads, width = plan.index_heads, plan.index_dim
+    visible_rows = _visible_rows(
+        tuple((end - start, view.context + start) for view, start, end in spans), ratio)
+    topk_comparisons = _selection_comparisons(pairs, plan.index_topk, visible_rows)
     sentinel_fills = sum(
         short * plan.index_topk - _floor_sum(short, ratio, 1, view.context + start + 1)
         for view, start, end in spans
@@ -108,7 +208,7 @@ def declare(builder, *, deps, views, plan, quant, parallel):
     # ProcessQk loads query/key from L1 to L0A/L0B; ProcessWs loads the FP16
     # score tensor (written to L1 by FixpSToL1) and broadcasted FP16 weights.
     mte1_bytes = (aic_read_bytes + 2 * pairs * heads) if pairs else 0
-    vector = active_query_rows * heads * 17 + pairs * 2 + pairs * math.log2(plan.index_topk) + sentinel_fills
+    vector = active_query_rows * heads * 17 + pairs * 2 + topk_comparisons + sentinel_fills
     matrix = {"int8": 2 * pairs * heads * width,
               "fp16": 2 * pairs * heads * 16}
     ledger = {
@@ -127,7 +227,17 @@ def declare(builder, *, deps, views, plan, quant, parallel):
         "reduced_score_workspace_read_write_bytes": 2 * score_workspace_bytes,
         "selection_output_bytes": output_bytes,
         "sentinel_fill_elements": sentinel_fills,
-        "topk_comparisons": pairs * math.log2(plan.index_topk),
+        "topk_comparisons": topk_comparisons,
+        "visible_query_rows": visible_rows,
+        "native_domain": {"head_dim": NATIVE_HEAD_DIM,
+                          "head_count": NATIVE_HEAD_COUNT,
+                          "topk_max": NATIVE_TOPK_MAX,
+                          "compression_max": NATIVE_COMPRESSION_MAX,
+                          "block_rows_factor": NATIVE_BLOCK_ROWS_FACTOR,
+                          "block_rows_max": NATIVE_BLOCK_ROWS_MAX},
+        "key_block_size": block_size,
+        "key_block_size_source": ("runtime" if block_size is not None
+                                  else "not_supplied"),
         "traffic_scope": "query_and_key_once_per_query; native_cache_reloads_unresolved",
         "topk_scope": "logical_comparisons; cross_owner_partial_lists_unresolved",
     }
@@ -142,7 +252,8 @@ def declare(builder, *, deps, views, plan, quant, parallel):
                 "cache_dtype": "int8", "cache_head_shape": (1, width),
                 "scale_dtype": "fp16", "weight_dtype": "fp16",
                 "output_shape": (tokens, 1, plan.index_topk), "output_dtype": "int32",
-                "layout": "ND", "compression_ratio": 4}),
+                "layout": "ND", "compression_ratio": ratio,
+                "key_block_size": block_size}),
             ("native_implementation", {"native_kind": "VllmAscendQuantLightningIndexerV2",
                 "selection": IMPLEMENTATION, "conditions": {"submitted_kernels": 1,
                     "source_boundary": "qk_weighted_head_reduce_topk",

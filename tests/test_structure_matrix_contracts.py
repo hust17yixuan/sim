@@ -1,4 +1,5 @@
 """Independent matrix declarations checked against retained native captures."""
+import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 from copy import deepcopy
 from dataclasses import replace
 import json
@@ -23,7 +24,10 @@ def capture(name, kind):
     import mindie_profiler
     from mindie_profiler.normalized import kernel_rows
 
-    path = Path(mindie_profiler.__file__).resolve().parents[1] / "tests/fixtures/fusion_contracts"
+    rel = Path("tests/fixtures/fusion_contracts")
+    path = Path(mindie_profiler.__file__).resolve().parents[1] / rel
+    if not path.is_dir():
+        path = Path(__file__).resolve().parents[2] / "profiler" / rel
     if not path.is_dir():
         pytest.skip("Retained profiler fusion fixtures are unavailable.")
     return [row for row in kernel_rows(path / f"{name}.csv") if row.kind == kind]

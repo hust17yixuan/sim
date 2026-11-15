@@ -62,8 +62,15 @@ def _find_seq(cfg, token):
     return left, reads
 
 
+def _cache_value(cfg, seq):
+    """Known slot value, or None when the caller-bound tensor is not bound."""
+    if not cfg.cache_index_present:
+        return None
+    return None if cfg.cache_indices is None else cfg.cache_indices[seq]
+
+
 def _cache_skipped(cfg, cache_idx):
-    if cfg.cache_indices is None:
+    if not cfg.cache_index_present or cache_idx is None:
         return False
     if cache_idx == cfg.pad_slot_id:
         return True
@@ -225,9 +232,9 @@ def _block_chunks(cfg, host, block_index, base_size):
         if tile_end <= cursor:
             seq += 1
             continue
-        if cfg.cache_indices is not None:
+        if cfg.cache_index_present:
             cache_bytes += cache_width
-            if _cache_skipped(cfg, cfg.cache_indices[seq]):
+            if _cache_skipped(cfg, _cache_value(cfg, seq)):
                 cursor = tile_end
                 seq += 1
                 continue
@@ -252,8 +259,8 @@ def _prefetch_block(cfg, host, token_tile, base_size):
             his_bytes += his_width
             if not cfg.has_init(seq):
                 continue
-            cache_idx = seq if cfg.cache_indices is None else cfg.cache_indices[seq]
-            if cfg.cache_indices is not None:
+            cache_idx = _cache_value(cfg, seq) if cfg.cache_index_present else seq
+            if cfg.cache_index_present:
                 cache_bytes += cache_width
             if _cache_skipped(cfg, cache_idx):
                 continue
@@ -558,8 +565,8 @@ def _snapshot_program(context, cfg, host, block, owners):
             return tuple(stages)
         previous = "flag"
         cache_idx = seq
-        if cfg.cache_indices is not None:
-            cache_idx = cfg.cache_indices[seq]
+        if cfg.cache_index_present:
+            cache_idx = _cache_value(cfg, seq)
             cache_bytes = _dtype_width(cfg.dtypes.cache_indices)
             stages.append(Stage("cache", _bind(context, _work(
                 hbm=cache_bytes, mte2=cache_bytes)),
@@ -601,6 +608,16 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
             raise ValueError("execution vector ownership differs from build geometry")
         stages = []
         allocations = {}
+        gm_workspace = None
+        gm_grant = None
+        if workspace and "workspace" in context.pool_names:
+            gm_workspace = context.allocate(
+                "native_conv_gm_workspace", "workspace",
+                int(host["workspace_bytes"]),
+                unit_group(0, owners,
+                           context.pool_units.get("workspace", owners)))
+            stages.append(Stage("gm_grant", acquire=(gm_workspace,)))
+            gm_grant = "gm_grant"
         for block in blocks:
             items = ()
             if "ub" in context.pool_names:
@@ -609,7 +626,8 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
                 items = (context.allocate(f"native_conv_ub{block.index}", "ub",
                                           UB_RESIDENT_BYTES, units),)
             allocations[block.index] = items
-            stages.append(Stage(f"reserve{block.index}", acquire=items))
+            stages.append(Stage(f"reserve{block.index}", acquire=items,
+                                after=(gm_grant,) if gm_grant else ()))
         prefetch_tails = []
         if workspace:
             for block in blocks:
@@ -632,6 +650,10 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
             release = f"release{block.index}"
             stages.append(Stage(release, after=(name,), free=allocations[block.index]))
             body_names.append(release)
+        if gm_workspace is not None:
+            stages.append(Stage("gm_release", after=tuple(body_names),
+                                free=(gm_workspace,)))
+            body_names.append("gm_release")
         stages.append(Stage("complete", after=tuple(body_names)))
         return KernelProgram(tuple(stages))
 
@@ -666,8 +688,8 @@ def source_ledger(op_or_params, geometry=None) -> dict:
     his_bytes = sum(block.his_bytes + block.prefetch_his_bytes for block in blocks)
     active = [seq for seq in range(cfg.batch)
               if cfg.qsl[seq + 1] > cfg.qsl[seq]
-              and not _cache_skipped(cfg, seq if cfg.cache_indices is None
-                                     else cfg.cache_indices[seq])]
+              and not _cache_skipped(
+                  cfg, _cache_value(cfg, seq) if cfg.cache_index_present else seq)]
     return {
         "work": dict(sorted(split_reads(work, 0, geometry.resource_units).resources.items())),
         "host_tiling": host,

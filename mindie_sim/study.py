@@ -14,9 +14,11 @@ from copy import deepcopy
 from dataclasses import fields
 from hashlib import sha256
 import json
+import math
 
 from .prediction.api import predict
 from .prediction.dispatch import cohorts
+from .prediction.efficiency import attribute_program
 from .prediction.graph_analysis import graph_costs
 from .prediction.operator_analysis import operator_costs, target_graphs
 from .prediction.program import RecipeBook
@@ -225,6 +227,8 @@ def _probe(case, probe, *, level, primitives, top, include_submission):
         graph = {
             "duration_ms": report["duration_ms"], "boundary": report["boundary"],
             "replay_scope": report["replay_scope"],
+            "plan_mode": "reselected_case",
+            "attribution": attribute_program(report, (report.get("isolated") or {}).get("operators")),
             "bounds": {**report["bounds"], "precedence": {
                 key: value for key, value in report["bounds"]["precedence"].items()
                 if key != "operators"}},
@@ -262,9 +266,48 @@ def _probe(case, probe, *, level, primitives, top, include_submission):
     }
 
 
+
+def _work_total(row):
+    work = ((row.get("operators") or {}).get("work") or {})
+    return sum(float(value) for value in work.values()
+               if isinstance(value, (int, float)) and not isinstance(value, bool))
+
+
+def _normalize_ranking_row(row):
+    """Reject positive-work rows whose modeled duration is zero, negative or non-finite."""
+    if row.get("status") != "modeled":
+        return row
+    try:
+        duration = float(row.get("duration_ms"))
+    except (TypeError, ValueError):
+        duration = float("nan")
+    work = _work_total(row)
+    row["work_total"] = work
+    if not math.isfinite(duration):
+        reason = "invalid_nonfinite_duration"
+    elif duration < 0.0:
+        reason = "invalid_negative_duration"
+    elif duration == 0.0 and work > 0.0:
+        reason = "invalid_zero_duration_with_positive_work"
+    else:
+        reason = None
+    if reason is not None:
+        row["status"] = "invalid"
+        row["invalid_reason"] = reason
+        row["error"] = reason
+        row["rankable"] = False
+        return row
+    row["ranking_duration_ms"] = duration
+    row["rankable"] = True
+    if duration == 0.0:
+        row["zero_work_noop"] = work <= 0.0
+    return row
+
+
 def _rankings(evaluations):
     groups = {}
     for row in evaluations:
+        row = _normalize_ranking_row(row)
         if row["status"] != "modeled":
             continue
         key = (row["probe"], row["workload_key"], row["boundary"],
@@ -272,18 +315,22 @@ def _rankings(evaluations):
         groups.setdefault(key, []).append(row)
     result = []
     for (probe, workload, boundary, isolation, signature), members in groups.items():
-        ordered = sorted(members, key=lambda row: row["duration_ms"])
-        best = ordered[0]["duration_ms"]
+        ranked = [row for row in members if not row.get("zero_work_noop")]
+        if not ranked:
+            ranked = members
+        ordered = sorted(ranked, key=lambda row: row["ranking_duration_ms"])
+        best = ordered[0]["ranking_duration_ms"]
         result.append({
             "probe": probe, "workload_key": workload, "boundary": boundary,
             "operator_isolation": isolation,
             "operator_isolation_signature": signature,
+            "plan_selection": "reselected_case_per_candidate",
             "status": "ranked" if len(ordered) > 1 else "single_candidate",
             "candidates": [{
-                "candidate": row["candidate"], "duration_ms": row["duration_ms"],
+                "candidate": row["candidate"], "duration_ms": row["ranking_duration_ms"],
                 "physical_devices": row["physical_devices"],
-                "ratio_to_fastest": row["duration_ms"] / best if best else
-                                    (1 if row["duration_ms"] == 0 else None),
+                "ratio_to_fastest": row["ranking_duration_ms"] / best if best else
+                                    (1 if row["ranking_duration_ms"] == 0 else None),
             } for row in ordered],
         })
     return result
@@ -343,6 +390,9 @@ def study(candidates, probes, *, level="operators", serving=False, primitives=No
             except ValueError as exc:
                 row = {"status": "failed", "stage": level, "error": str(exc)}
                 entry["status"] = "partial"
+            row = _normalize_ranking_row(row)
+            if row.get("status") != "modeled":
+                entry["status"] = "partial"
             evaluations.append({"candidate": name, "probe": probe["id"], **row})
         if serving:
             try:
@@ -370,9 +420,15 @@ def study(candidates, probes, *, level="operators", serving=False, primitives=No
         },
         "status": ("partial" if succeeded else "failed") if failures else "completed",
         "level": level, "evaluations": evaluations, "candidates": candidate_rows,
+        "evaluation_boundary": {
+            "plan_selection": "reselected_case_per_candidate",
+            "comparison": "one_complete_candidate_graph_per_ranked_row",
+            "fixed_plan_counterfactual": "prediction.efficiency.evaluate_resource_counterfactual",
+        },
         "rankings": _rankings(evaluations),
         "summary": {"modeled": succeeded, "failed": len(evaluations) - succeeded,
                     "candidate_count": len(candidates), "probe_count": len(probes)},
+        "invalid_evaluations": sum(row.get("status") == "invalid" for row in evaluations),
         "interpretation": {
             "rankings": "predicted_order_within_equal_declared_work_not_measured_accuracy_or_global_optimum",
             "serving": "actual_case_requests_and_slo_separate_from_probe_device_costs",

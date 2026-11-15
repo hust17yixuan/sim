@@ -7,30 +7,99 @@
 [Timeouts & Locks] One finite graph; no request history or external work.
 [Side-Effect Policy] Pure local simulation; no hardware access or calibration.
 """
+import hashlib
+import json
+from collections.abc import Mapping
+
 from .graph_analysis import graph_costs
 from .operator_analysis import target_graphs, cohort_sequence_counts
 from .structure import parse_case
 from mindie_sim.schema.common import ModelingError
 
 
+#: Structural catalog reuse. The declared target graph is a pure function of
+#: the case declaration and the probe geometry: no clock, request history or
+#: measured value enters it. One probe of the same declaration re-executes every
+#: operator through the Engine; only repeated frontend construction is skipped.
+_GRAPH_CACHE: dict = {}
+_GRAPH_CACHE_LIMIT = 4
+
+
+def _freeze_key(value):
+    if isinstance(value, Mapping):
+        return tuple(sorted((k, _freeze_key(v)) for k, v in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_key(v) for v in value)
+    return value
+
+
+def _declaration_key(case, geometry):
+    if isinstance(case, Mapping):
+        payload = json.dumps(case, sort_keys=True, default=repr,
+                             ensure_ascii=False)
+    else:
+        payload = repr(case)
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return digest, _freeze_key(geometry)
+
+
+def _declared_graphs(case, *, phase, tokens, context, sequences, scope,
+                     apply_body_defaults, padded_idle):
+    key = _declaration_key(case, {
+        "phase": phase, "tokens": tokens, "context": context,
+        "sequences": sequences, "scope": scope,
+        "defaults": apply_body_defaults, "padded_idle": padded_idle})
+    cached = _GRAPH_CACHE.get(key)
+    if cached is not None:
+        return cached
+    parsed = parse_case(case)
+    graphs = target_graphs(
+        parsed, phase=phase, tokens=tokens, context=context,
+        sequences=sequences, scope=scope,
+        apply_body_defaults=apply_body_defaults, padded_idle=padded_idle)
+    if len(_GRAPH_CACHE) >= _GRAPH_CACHE_LIMIT:
+        _GRAPH_CACHE.clear()
+    _GRAPH_CACHE[key] = (parsed, graphs)
+    return parsed, graphs
+
+
+def physical_global_ranks(runtime, replicas):
+    """Global rank scope for DP replicas under the declared DP-outer/TP-inner layout.
+
+    The value is a scope, not an observed-owner substitution: W18F/W19F select
+    the actual TP member (for example TP0 or TP2) from source provenance.
+    """
+    tp = max(1, int(runtime.parallel.tp))
+    dp = max(1, int(runtime.parallel.dp))
+    out = {}
+    for replica in replicas:
+        replica = int(replica)
+        if replica < 0 or replica >= dp:
+            raise ModelingError(f"body_replica_outside_declared_dp:{replica}:{dp}")
+        out[replica] = tuple(replica * tp + tp_rank for tp_rank in range(tp))
+    return out
+
+
 def body_forward(case, *, phase="decode", tokens=1, context=0, sequences=1,
-                 recipes=None, primitives=None, event_limit=0):
-    case = parse_case(case)
+                 recipes=None, primitives=None, event_limit=0, compact=False,
+                 padded_idle=False):
+    case, graphs = _declared_graphs(
+        case, phase=phase, tokens=tokens, context=context, sequences=sequences,
+        scope="body", apply_body_defaults=recipes is None,
+        padded_idle=padded_idle)
     if case.model.is_standalone_draft:
         raise ModelingError("draft_requires_target_model:attach_auxiliary_to_target;catalog_inspection_available")
-    graphs = target_graphs(case, phase=phase, tokens=tokens, context=context,
-                           sequences=sequences, scope="body",
-                           apply_body_defaults=recipes is None)
-    default_selection = (graphs.default_selection if recipes is None else
+    default_selection = (dict(graphs.default_selection) if recipes is None else
                          {"profile": "explicit_recipe_book_preserved"})
     result = graph_costs(case, graphs, recipes=recipes, primitives=primitives,
                          external_inputs={"analysis_input": 0},
                          include_submission=False, isolated=False,
-                         trace_limit=event_limit)
+                         trace_limit=event_limit, compact=compact)
     counts = cohort_sequence_counts(sequences, tuple(graphs))
     from .decode_probe import probe_capacity
     capacity = probe_capacity(case, context=context, tokens=tokens,
-                              sequences=sequences, phase=phase)
+                              sequences=sequences, phase=phase,
+                              padded_idle=padded_idle)
     padded = capacity["padded_query_tokens_by_replica"]
     graph_rows = capacity["graph_query_tokens_by_replica"]
     return {
@@ -45,6 +114,9 @@ def body_forward(case, *, phase="decode", tokens=1, context=0, sequences=1,
                      "graph_query_tokens_by_replica": graph_rows,
                      "graph_query_tokens": sum(graph_rows.values()),
                      "padded_query_tokens_by_replica": padded,
+                     "physical_global_rank_basis": "dp_replica * tp + tp_rank",
+                     "physical_global_ranks_by_replica": physical_global_ranks(
+                         case.runtime, tuple(graphs)),
                      "padding_basis": "graph_bucket_then_declared_sequence_parallel_padding",
                      "valid_query_tokens": tokens * sum(counts.values()),
                      "padded_query_tokens": sum(padded.values())},

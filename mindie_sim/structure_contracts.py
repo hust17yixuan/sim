@@ -1,9 +1,10 @@
 """Shared tensor contracts for declared operator structures.
 
-[Role] Describe shape/dtype contracts independently of latency estimation.
+[Role] Describe shape/dtype/representation contracts independently of latency.
 [Invariants] Contracts preserve the native ABI and declared conditions. A tensor
   match does not establish a vendor implementation, layer identity or timing.
-  Unsupported or absent descriptors remain unknown.
+  Each projected value keeps its own dtype/layout/quant/attrs. Unsupported or
+  absent descriptors become named gaps; no measured shape gates recognition.
 [Timeouts & Locks] Bounded per-operator metadata arithmetic; no I/O or locks.
 [Side-Effect Policy] Pure records; no profiler dependency or device contexts.
 """
@@ -96,14 +97,18 @@ def conv_contract(op):
     meta = op["metadata"]
     tokens, dim, width = sum(meta["lengths"]), meta["dim"], meta["width"]
     batch = len(meta["lengths"])
-    state = bool(meta["state_rows"] and meta["state_history_slots"])
+    has_conv_states = (meta.get("dispatch") or {}).get("has_conv_states")
+    state = bool(meta["state_history_slots"]) and (
+        bool(meta["state_rows"]) if meta["state_rows"] is not None else bool(has_conv_states)
+    )
     cache, flags = meta["cache_indices"] is not None, meta["has_initial_state"] is not None
     shapes = ((tokens, dim), (width, dim), (dim,) if meta["bias"] else (),
               (meta["state_history_slots"], dim) if state else (),
               (batch + 1,), (batch,) if cache else (), (batch,) if flags else ())
     metadata_dtypes = meta["metadata_dtypes"]
+    state_dtype = meta.get("state_dtype") or meta["dtype"]
     dtypes = (meta["dtype"], meta["dtype"], meta["dtype"] if meta["bias"] else None,
-              meta["dtype"] if state else None, metadata_dtypes["query_start_loc"],
+              state_dtype if state else None, metadata_dtypes["query_start_loc"],
               metadata_dtypes["cache_indices"] if cache else None,
               metadata_dtypes["has_initial_state"] if flags else None)
     return "CausalConv1d", shapes, ((tokens, dim),), dtypes, (meta["dtype"],)
@@ -340,3 +345,10 @@ def predicted_contract(op):
     if family == "relu" and shape:
         return "relu", shape, op["dtype"]
     return None
+
+
+def typed_values(operator, contract, *, context=None):
+    """Compatibility entry; the projection lives in ``structure_values``."""
+    from .structure_values import typed_values as _typed_values
+
+    return _typed_values(operator, contract, context=context)

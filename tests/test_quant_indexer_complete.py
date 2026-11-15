@@ -8,11 +8,16 @@
 from copy import deepcopy
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from mindie_sim import graph_costs, operator_costs, target_operators
+from mindie_sim.prediction.family_quant_indexer import (
+    RECIPE, _check_domain, declare, generic_work,
+)
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.operators import OpSpec
 from mindie_sim.structure import export_structure
 
 
@@ -97,6 +102,129 @@ def test_explicit_wrong_representation_is_a_visible_domain_error(field, value):
     raw["model"]["quant"][field] = value
     with pytest.raises(ModelingError, match="quant_lightning_indexer_v2_complete_domain_mismatch"):
         target_operators(raw, phase="decode", tokens=2, context=4096)
+
+
+def _domain_plan(**overrides):
+    values = dict(candidate_filter=False, index_kpool=1, index_heads=64,
+                  index_dim=128, index_topk=512, compress_ratio=4)
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _domain_quant(**overrides):
+    values = dict(index_dtype="int8", index_scale_dtype="fp16")
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_native_quant_domain_uses_the_named_arch22_constraints():
+    parallel = SimpleNamespace(cp=1, pcp=1)
+    for plan in (_domain_plan(compress_ratio=2), _domain_plan(compress_ratio=8),
+                 _domain_plan(compress_ratio=128), _domain_plan(index_topk=1024),
+                 _domain_plan(index_topk=2048)):
+        _check_domain(plan, _domain_quant(), parallel)
+    for block_size in (16, 128, 1024):
+        _check_domain(_domain_plan(), _domain_quant(), parallel,
+                      block_size=block_size)
+    for plan, quant, *block in (
+            (_domain_plan(index_dim=64), _domain_quant()),
+            (_domain_plan(index_heads=32), _domain_quant()),
+            (_domain_plan(index_dim=72), _domain_quant()),
+            (_domain_plan(index_topk=0), _domain_quant()),
+            (_domain_plan(index_topk=4096), _domain_quant()),
+            (_domain_plan(compress_ratio=0), _domain_quant()),
+            (_domain_plan(compress_ratio=3), _domain_quant()),
+            (_domain_plan(compress_ratio=256), _domain_quant()),
+            (_domain_plan(index_kpool=4), _domain_quant()),
+            (_domain_plan(candidate_filter=True), _domain_quant()),
+            (_domain_plan(), _domain_quant(index_dtype="bf16")),
+            (_domain_plan(), _domain_quant(index_scale_dtype="fp32")),
+            (_domain_plan(), _domain_quant(), 120),
+            (_domain_plan(), _domain_quant(), 0),
+            (_domain_plan(), _domain_quant(), 2048)):
+        with pytest.raises(ModelingError,
+                           match="quant_lightning_indexer_v2_complete_domain_mismatch"):
+            _check_domain(plan, quant, parallel,
+                          block_size=block[0] if block else None)
+
+
+def test_generic_quant_prediction_keeps_unsampled_legal_geometry():
+    # D=64/ratio=2/topk=1024 is not the arch22 native binary's domain, but the
+    # analytic formula still predicts it and must not be rejected wholesale.
+    work = generic_work(spans=((5, 1000),), heads=32, dim=64, topk=1024, ratio=2)
+    pairs = sum((1000 + i + 1) // 2 for i in range(5))
+    assert work["query_key_pairs"] == pairs
+    assert work["qk_int8_flops"] == 2 * pairs * 32 * 64
+    assert work["selection_output_bytes"] == 5 * 1024 * 4
+    with pytest.raises(ModelingError,
+                       match="quant_lightning_indexer_v2_complete_domain_mismatch"):
+        _check_domain(_domain_plan(index_dim=64, compress_ratio=2,
+                                   index_topk=1024),
+                      _domain_quant(), SimpleNamespace(cp=1, pcp=1))
+
+
+class _FakeBuilder:
+    def __init__(self):
+        self.ops = []
+
+    def work(self, name, deps, shape, *, flops=0, vector=0, read=0, write=0,
+             family="attention", dtype=None, metadata=()):
+        op = OpSpec(
+            op_id="L0." + name, deps=tuple(deps), recipe=name, family=family,
+            phase="decode", stage=0, layer=0, requests=(),
+            semantic_shape=shape, local_shape=shape, padded_shape=shape,
+            launch_shape=shape, flops=flops, vector_ops=vector,
+            hbm_bytes=read + write, mte2_bytes=read, mte3_bytes=write,
+            dtype=dtype or "bf16", metadata=tuple(metadata))
+        self.ops.append(op)
+        return op
+
+
+def _declare(plan, tokens, context, **kwargs):
+    builder = _FakeBuilder()
+    declare(builder, deps=("query", "weights", "cache"),
+            views=(SimpleNamespace(q_len=tokens, context=context,
+                                   query_ranges=()),),
+            plan=plan, quant=_domain_quant(),
+            parallel=SimpleNamespace(cp=1, pcp=1), **kwargs)
+    return builder.ops[-1]
+
+
+def test_new_native_geometry_predicts_from_the_same_ledger():
+    tokens, context, ratio, topk, heads, width = 5, 1000, 2, 2048, 64, 128
+    plan = SimpleNamespace(index_kpool=1, candidate_filter=False,
+                           compress_ratio=ratio, index_heads=heads,
+                           index_dim=width, index_topk=topk)
+    op = _declare(plan, tokens, context, block_size=128)
+    pairs = sum((context + i + 1) // ratio for i in range(tokens))
+    assert op.recipe == RECIPE and op.local_shape == (tokens, 1, topk)
+    assert dict(op.matrix_flops) == {"int8": 2 * pairs * heads * width,
+                                     "fp16": 2 * pairs * heads * 16}
+    ledger = dict(op.metadata)["quant_indexer_work"]
+    assert ledger["query_key_pairs"] == pairs
+    assert ledger["selection_output_bytes"] == tokens * topk * 4
+    assert ledger["key_block_size"] == 128
+    assert ledger["key_block_size_source"] == "runtime"
+    assert dict(op.metadata)["native_tensor_view"]["compression_ratio"] == ratio
+    assert dict(op.metadata)["native_tensor_view"]["key_block_size"] == 128
+    assert op.hbm_bytes == op.mte2_bytes + op.mte3_bytes + 4 * pairs
+
+
+def test_quant_top1_counts_the_maximum_reduction():
+    tokens, context, ratio, topk = 5, 100, 4, 1
+    plan = SimpleNamespace(index_kpool=1, candidate_filter=False,
+                           compress_ratio=ratio, index_heads=64,
+                           index_dim=128, index_topk=topk)
+    op = _declare(plan, tokens, context, block_size=128)
+    pairs = sum((context + i + 1) // ratio for i in range(tokens))
+    visible_rows = sum(1 for i in range(tokens) if (context + i + 1) // ratio > 0)
+    ledger = dict(op.metadata)["quant_indexer_work"]
+    assert ledger["query_key_pairs"] == pairs
+    assert ledger["visible_query_rows"] == visible_rows
+    assert ledger["topk_comparisons"] == pairs - visible_rows > 0
+    generic = generic_work(spans=((tokens, context),), heads=32, dim=128,
+                           topk=1, ratio=ratio)
+    assert generic["topk_comparisons"] == pairs - visible_rows
 
 
 def test_short_prefix_sentinel_initialization_applies_vector_invocation():

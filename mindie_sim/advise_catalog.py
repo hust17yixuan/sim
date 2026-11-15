@@ -32,7 +32,7 @@ from .advise_core import (
     _decode_step,
     _emitted_tokens,
     _is_a3_or_a5,
-    _memory_facts,
+    memory_stage_facts,
     _proposal_tokens,
     _should_run_graph,
     _sla_metrics,
@@ -109,10 +109,13 @@ def _execution_mutations(base: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 def _memory_guardrails(case: Mapping[str, Any], cfg: _Config) -> list[dict[str, Any]]:
     parsed = parse_case(case)
-    memory, available, hbm, kv, workspace = _memory_facts(parsed, cfg)
+    facts = memory_stage_facts(parsed, phase=cfg.phase, prefix_tokens=cfg.prefix_tokens,
+                               tokens=cfg.tokens, context=cfg.context,
+                               sequences=cfg.sequences, output_tokens=cfg.output_tokens)
+    memory = facts["memory"]
     graph_pool = float(memory.policy.graph_pool_bytes or 0.0)
-    capture = max(graph_pool, 2.0 * workspace + 0.02 * hbm)
-    headroom = available - kv * cfg.sequences
+    capture = max(graph_pool, 2.0 * facts["max_workspace_bytes"] + 0.02 * facts["hbm_bytes"])
+    headroom = facts["joint_min_headroom_bytes"]
     if capture > max(0.0, headroom):
         return [_guardrail("aclgraph_capture_memory_exceeds_hbm_headroom",
                            "ACLGraph capture pool exceeds remaining KV headroom",

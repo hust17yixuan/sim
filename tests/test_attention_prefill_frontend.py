@@ -92,15 +92,20 @@ def test_draft_prefill_phase_binds_the_same_explicit_recipe():
 
 
 def test_source_required_binding_precedes_generic_recipe():
+    from mindie_sim.prediction.mechanism import PlannedRecipe
     op = make_source_op()
     book = RecipeBook.from_mapping(
         {"recipes": {"flash_attention_prefill": {"kind": "staged_gqa_prefill"}}})
     target = replace(op, recipe="flash_attention_prefill",
                      source_boundary="kernel")
+    # T10's factory now supplies a PlannedRecipe: the source binding has a
+    # real prepare/Work.apply/lower path instead of falling through.
+    assert isinstance(book.select(target), PlannedRecipe)
+    unbound = RecipeBook.from_mapping({"recipes": {}})
     with pytest.raises(ModelingError, match="source_plan_binding_required"):
-        book.select(target)
-    # A semantic recipe remains selectable when no source binding is required.
-    assert isinstance(book.select(op), StagedGQAPrefill)
+        unbound.select(target)
+    # The configured recipe selects the same PlannedRecipe for a semantic op.
+    assert isinstance(book.select(op), PlannedRecipe)
 
 
 def make_source_op():

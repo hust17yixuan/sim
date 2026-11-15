@@ -37,9 +37,20 @@ class RequestView:
             object.__setattr__(self, "semantic_phase", self.phase)
         if not self.execution_mode:
             object.__setattr__(self, "execution_mode", self.phase)
+        # A padding view is a physical graph allocation, not an active
+        # request.  It has no logical history; any active context belongs to
+        # the graph/source declaration, never to this pseudo-request.
+        if self.padding:
+            object.__setattr__(self, "context", 0)
+
+    @property
+    def logical_q_len(self) -> int:
+        return 0 if self.padding else self.q_len
 
     @property
     def kv_len(self) -> int:
+        if self.padding:
+            return 0
         return self.context + (self.global_q_len or self.q_len)
 
     def to_dict(self) -> dict[str, Any]:
@@ -49,7 +60,8 @@ class RequestView:
             "samples": self.samples, "phase": self.phase,
             "semantic_phase": self.semantic_phase,
             "execution_mode": self.execution_mode,
-            "prefix_tokens": self.prefix_tokens, "padding": self.padding,
+            "prefix_tokens": self.prefix_tokens, "priority": self.priority,
+            "padding": self.padding,
             "media_encoded": self.media_encoded,
             "draft_verify": self.draft_verify,
             "draft_prepare": self.draft_prepare,
@@ -57,6 +69,13 @@ class RequestView:
             "draft_accepted_tokens": self.draft_accepted_tokens,
             "draft_advanced_tokens": self.draft_advanced_tokens,
             "prompt_tokens": self.prompt_tokens,
+            # The execution geometry may have been split across CP/PCP ranks.
+            # ``kv_len`` above is derived from ``global_q_len``, so omitting the
+            # global width and owned query spans would export an inconsistent
+            # request: its cache length could no longer be reconstructed from
+            # the local ``q_len``.
+            "global_q_len": self.global_q_len,
+            "query_ranges": self.query_ranges,
         }
 
 @dataclass(frozen=True)
@@ -72,7 +91,7 @@ class IterationPlan:
 
     @property
     def valid_tokens(self) -> int:
-        return sum(view.q_len for view in self.requests)
+        return sum(view.logical_q_len for view in self.requests)
 
     @property
     def modes(self) -> set[str]:
@@ -81,9 +100,15 @@ class IterationPlan:
     def to_dict(self) -> dict[str, Any]:
         return {
             "iteration": self.iteration,
+            "reason": self.reason,
             "requests": [view.to_dict() for view in self.requests],
             "valid_tokens": self.valid_tokens,
             "mode": selected_mode(self),
+            # Acceptance lookup key and completion/status bindings are part of
+            # the scheduled plan, not derivable from the request rows.
+            "output_tokens": self.output_tokens,
+            "all_request_ids": self.all_request_ids,
+            "request_statuses": self.request_statuses,
         }
 
 

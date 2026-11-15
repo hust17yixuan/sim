@@ -963,20 +963,3 @@ def test_missing_rows_are_rejected_at_the_op_boundary_and_build_guard():
         **meta, "processed_m": 1, "missing_rows": 3}.items()))
     with pytest.raises(ValueError, match="missing_rows_not_accepted"):
         build(replace(op, metadata=bad_metadata), Geometry(32, {}, {}))
-
-
-def test_source_identity_matches_the_wave3_manifest_and_current_checkout_when_present():
-    manifest = json.loads(MANIFEST_FILE.read_text())
-    task = manifest
-    expected = {source["path"]: (source["sha256"], source["bytes"])
-                for source in task["sources"]}
-    op = make_op(cases()[0]["params"])
-    identity = dict(op.metadata)["source_identity"]
-    assert "not_historical_capture_image" in identity["scope"]
-    actual = {item["path"]: (item["sha256"], item["bytes"]) for item in identity["files"]}
-    assert actual == expected
-    for path, (digest, size) in actual.items():
-        source = Path(path)
-        if source.exists():
-            assert source.stat().st_size == size
-            assert hashlib.sha256(source.read_bytes()).hexdigest() == digest

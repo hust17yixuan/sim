@@ -52,15 +52,18 @@ def pipeline(model, *, feature_overrides=None, policy=POLICY, supply=SUPPLY):
 def dense_model(*, layers=1, quant=None):
     return make_model(plans=[dense_plan(index) for index in range(layers)], quant=quant)
 
-@pytest.mark.parametrize(("kind", "role", "fusion_name", "kept", "positive"), [ ("N0", "attn_norm", "add_rmsnorm_quant",
+@pytest.mark.parametrize(("kind", "role", "fusion_name", "kept", "positive"), [ ("layernorm", "attn_norm", "add_rmsnorm_quant",
      {"residual", "rstd", "scale", "norm_output"}, {"residual", "rstd", "scale", "norm_output"}),
-    ("A0", "attention", "qkv_norm_rope", {"query", "key", "value", "residual"}, {"query", "key", "value"}),
-    ("F0", "dense_ffn", "dequant_swiglu_quant", {"down_input", "activation_scale", "residual"}, {"down_input", "activation_scale"}), ])
+    ("gqa_attention", "attention", "qkv_norm_rope", {"query", "key", "value", "residual"}, {"query", "key", "value"}),
+    ("mlp", "dense_ffn", "dequant_swiglu_quant", {"down_input", "activation_scale", "residual"}, {"down_input", "activation_scale"}), ])
 def test_native_fusion_removes_internal_traffic_and_keeps_consumers( kind, role, fusion_name, kept, positive):
     quant = dict(name="w8a8", weight_format="int8", activation_format="int8", weight_block=(128, 128), scale_bytes=4)
-    model = dense_model(quant=quant)
+    # Layer 0's attention input norm is the decoder entry: its residual is the
+    # embedding itself, so it has no residual add to fuse.  Interior layers
+    # own the add+norm+quant fusion this test exercises.
+    model = dense_model(layers=2, quant=quant)
     pipe = pipeline(model)
-    instance = pipe.instantiated.find(kind, layer=0, role=role)
+    instance = pipe.instantiated.find(kind, layer=1, role=role)
     compiled = pipe._subgraph(instance)
     geometry = WorkloadGeometry.homogeneous(2, 4, 32)
     evaluation = compiled.evaluate(geometry)
@@ -84,7 +87,7 @@ def test_mla_prolog_fusion_keeps_kv_and_query_outputs():
         head_dim=16, intermediate_size=128, q_lora_rank=16, kv_lora_rank=16,
         qk_nope_head_dim=8, qk_rope_head_dim=8, v_head_dim=16, mla_variant="latent_mla")])
     pipe = pipeline(model)
-    instance = pipe.instantiated.find("A1", layer=0, role="attention")
+    instance = pipe.instantiated.find("mla_attention", layer=0, role="attention")
     compiled = pipe._subgraph(instance)
     geometry = WorkloadGeometry.homogeneous(2, 4, 32)
     evaluation = compiled.evaluate(geometry)
@@ -96,7 +99,7 @@ def test_mla_prolog_fusion_keeps_kv_and_query_outputs():
 def test_serial_sum_identity_and_late_input_gap():
     model = dense_model()
     pipe = pipeline(model)
-    compiled = pipe._subgraph(pipe.instantiated.find("F0", layer=0, role="dense_ffn"))
+    compiled = pipe._subgraph(pipe.instantiated.find("mlp", layer=0, role="dense_ffn"))
     geometry = WorkloadGeometry.homogeneous(2, 4, 32)
     result = evaluate_serial_split(compiled, geometry, fusion=())
     assert result.total_ms == sum(cost.duration_ms for cost in result.costs)
@@ -133,12 +136,14 @@ def test_fork_join_hbm_contention_and_shared_branch_envelope():
     assert envelope.makespan_ms > envelope.isolated_max_ms
     assert {"hbm", "cube"} <= set(envelope.shared_pipes)
     assert {"shared", "routed"} == set(dict(envelope.branches))
-    assert {item.kind for item in layer.subgraphs} >= {"F2", "F3", "F4"}
+    assert {item.kind for item in layer.subgraphs} >= {"moe_token_dispatcher", "routed_experts", "shared_experts"}
     for attn, flag in (("gdn", "multistream_kda_proj"), ("kda", "multistream_kda_proj")):
         m_rec = make_model(plans=[dict(index=0, attention=attn, ffn="dense", num_heads=4, num_kv_heads=2, head_dim=16, intermediate_size=64, linear_heads=4, linear_head_dim=16)])
         p_rec = pipeline(m_rec, feature_overrides={flag: True}).forward(WorkloadGeometry.homogeneous(2, 1, 16)).layers[0]
         assert p_rec.contention is not None and {"main", "aux"} == set(dict(p_rec.contention.branches))
-    m_idx = make_model(plans=[dict(index=0, attention="mla", ffn="dense", num_heads=4, num_kv_heads=1, head_dim=16, intermediate_size=64, indexer=True, index_heads=2, index_dim=16, index_topk=8)], mla=dict(q_lora_rank=16, kv_lora_rank=16, qk_nope_head_dim=8, qk_rope_head_dim=8, v_head_dim=8, index_topk=8))
+    m_idx = make_model(plans=[dict(index=0, attention="mla", ffn="dense", num_heads=4, num_kv_heads=1, head_dim=16, intermediate_size=64, indexer=True, index_heads=2, index_dim=16, index_topk=8,
+                                  owns_index_k=True, index_k_owner_layer_id=0,
+                                  topk_owner_layer_id=0, owns_topk=True)], mla=dict(q_lora_rank=16, kv_lora_rank=16, qk_nope_head_dim=8, qk_rope_head_dim=8, v_head_dim=8, index_topk=8))
     p_idx = pipeline(m_idx, feature_overrides={"multistream_attention_indexer": True}).forward(WorkloadGeometry.homogeneous(2, 1, 16)).layers[0]
     assert p_idx.contention is not None and {"attention", "indexer"} == set(dict(p_idx.contention.branches))
 
@@ -152,9 +157,9 @@ def test_shared_kv_store_once_consumer_reads_and_r1_slots_evolve():
     assert contract.owner_layer == 0 and contract.consumers == (1, 2)
     assert contract.store_bytes(8) == 8 * contract.row_bytes
     assert contract.read_bytes(64) == 64 * contract.row_bytes
-    owner = pipe._subgraph(pipe.instantiated.find("K0", layer=0, role="kv"))
-    first = pipe._subgraph(pipe.instantiated.find("K0", layer=1, role="kv"))
-    second = pipe._subgraph(pipe.instantiated.find("K0", layer=2, role="kv"))
+    owner = pipe._subgraph(pipe.instantiated.find("kv_cache", layer=0, role="kv"))
+    first = pipe._subgraph(pipe.instantiated.find("kv_cache", layer=1, role="kv"))
+    second = pipe._subgraph(pipe.instantiated.find("kv_cache", layer=2, role="kv"))
     geometry = WorkloadGeometry.homogeneous(2, 4, 32)
     state = owner.evaluate(geometry).state_out
     with pytest.raises(ModelingError):
@@ -164,7 +169,7 @@ def test_shared_kv_store_once_consumer_reads_and_r1_slots_evolve():
     store = next(cost for cost in owner.evaluate(geometry).operators if cost.name == "kv_store")
     assert read_one.get("kv_bytes") == read_two.get("kv_bytes") == 0
     assert store.get("kv_bytes") > 0
-    consumer_a0 = pipe.instantiated.find("A0", layer=1, role="attention")
+    consumer_a0 = pipe.instantiated.find("gqa_attention", layer=1, role="attention")
     assert "qkv_projection" not in {operator.name for operator in consumer_a0.operators}
     ratio = 4
     state = CompressionState.start(ratio)
@@ -197,12 +202,16 @@ def test_gemma4_standard_subgraph_assembly():
     assert model.attention == "gqa" and model.layers == 4
     pipe = pipeline(model)
     slots = [[(item.kind, item.variant) for item in layer.subgraphs] for layer in pipe.instantiated.layers]
-    assert ("E1", "ple") in slots[0] and ("E1", "ple") in slots[-1]
-    assert ("F0", "gelu") in slots[0]
-    assert ("A0", "gqa") in slots[0] and ("A0", "shared_consumer") in slots[2]
-    assert ("K0", "read") in slots[2] and ("K0", "read") in slots[3]
-    local = pipe.instantiated.find("A0", layer=0, role="attention")
-    global_attention = pipe.instantiated.find("A0", layer=1, role="attention")
+    assert ("per_layer_embedding", "ple") in slots[0] and ("per_layer_embedding", "ple") in slots[-1]
+    assert ("mlp", "gelu") in slots[0]
+    # Gemma4's sliding layers declare ``window > 0`` with no compression, so
+    # they execute the SWA schedule; the full-attention layer stays GQA.
+    assert ("swa_attention", "window_only") in slots[0]
+    assert ("swa_attention", "shared_consumer") in slots[2]
+    assert ("gqa_attention", "gqa") in slots[1]
+    assert ("kv_cache", "read") in slots[2] and ("kv_cache", "read") in slots[3]
+    local = pipe.instantiated.find_attention(0, role="attention")
+    global_attention = pipe.instantiated.find_attention(1, role="attention")
     local_theta = local.operator("attention").theta
     global_theta = global_attention.operator("attention").theta
     assert local_theta.find("window") == 8
@@ -216,12 +225,12 @@ def test_gemma4_standard_subgraph_assembly():
     with_kv = global_attention.operator("qkv_projection").theta
     plain_model = gemma4_model_spec(gemma_config(attention_k_eq_v=False))
     plain = pipeline(plain_model)
-    without_kv = plain.instantiated.find("A0", layer=1, role="attention").operator( "qkv_projection").theta
+    without_kv = plain.instantiated.find_attention(1, role="attention").operator( "qkv_projection").theta
     assert with_kv.require("N") < without_kv.require("N")
-    assert pipeline(model).instantiated.find("N0", layer=0, role="attn_norm").operator( "rmsnorm").theta.find("norm_weight_offset") == 1.0
+    assert pipeline(model).instantiated.find("layernorm", layer=0, role="attn_norm").operator( "rmsnorm").theta.find("norm_weight_offset") == 1.0
     prediction = pipe.forward(WorkloadGeometry.homogeneous(2, 4, 32))
     assert prediction.total_ms > 0
-    assert any(row.kind == "E1" for row in prediction.rows)
+    assert any(row.kind == "per_layer_embedding" for row in prediction.rows)
 
 def compact(model, limit=8):
     groups = {}
@@ -232,20 +241,46 @@ def compact(model, limit=8):
     selected = set()
     for plan in groups.values():
         selected.add(plan.index)
-        if 0 <= plan.kv_owner_layer_id < plan.index:
-            selected.add(plan.kv_owner_layer_id)
+        for owner in (plan.kv_owner_layer_id, plan.index_k_owner_layer_id,
+                      plan.topk_owner_layer_id, plan.index_source_layer_id,
+                      plan.candidate_source_layer_id):
+            if 0 <= owner < plan.index:
+                selected.add(owner)
     indices = sorted(selected)[:limit]
+    # Keep every declared owner of a retained layer.  A compacted model must
+    # preserve the original shared cache/top-k topology, not turn a shared
+    # consumer into a self-owner.  The limit is a soft group budget; owners are
+    # mandatory and may take the final count above it.
     keep = set(indices)
-    for plan in model.layer_plans:
-        if plan.index in keep and 0 <= plan.kv_owner_layer_id < plan.index:
-            keep.add(plan.kv_owner_layer_id)
+    changed = True
+    while changed:
+        changed = False
+        for plan in model.layer_plans:
+            if plan.index not in keep:
+                continue
+            for owner in (plan.kv_owner_layer_id, plan.index_k_owner_layer_id,
+                          plan.topk_owner_layer_id, plan.index_source_layer_id,
+                          plan.candidate_source_layer_id):
+                if 0 <= owner < plan.index and owner not in keep:
+                    keep.add(owner)
+                    changed = True
     indices = sorted(keep)
     remap = {old: new for new, old in enumerate(indices)}
+    def owner(old):
+        return remap.get(int(old), -1)
+
     plans = []
     for new, old in enumerate(indices):
         plan = model.layer_plans[old]
-        owner = remap.get(plan.kv_owner_layer_id, new)
-        plans.append(replace(plan, index=new, kv_owner_layer_id=owner, owns_long_kv=owner == new))
+        kv_owner = owner(plan.kv_owner_layer_id)
+        plans.append(replace(
+            plan, index=new,
+            kv_owner_layer_id=kv_owner,
+            owns_long_kv=kv_owner == new,
+            index_k_owner_layer_id=owner(plan.index_k_owner_layer_id),
+            topk_owner_layer_id=owner(plan.topk_owner_layer_id),
+            index_source_layer_id=owner(plan.index_source_layer_id),
+            candidate_source_layer_id=owner(plan.candidate_source_layer_id)))
     return replace(model, layers=len(plans), layer_plans=tuple(plans), body_layers=len(plans))
 
 def fixture_model(name):
@@ -254,18 +289,18 @@ def fixture_model(name):
 
 def llama_model():
     return make_model(name="llama", plans=[dense_plan(index) for index in range(2)])
-FAMILIES = [ ("deepseek-v3", lambda: compact(load_model("deepseek-v3")), {"A1", "F1", "F2", "F3"}),
-    ("deepseek-v3.2", lambda: compact(load_model("deepseek-v3.2")), {"A1", "I0", "I1", "F3"}),
-    ("deepseek-v4f", lambda: compact(load_model("deepseek-v4-flash-0731")), {"A2", "K1", "I0", "I1", "R0"}),
-    ("deepseek-v4.1", lambda: compact(load_model("deepseek-v4.1-flash")), {"A2", "K1", "I0", "I1"}),
-    ("qwen3", lambda: compact(load_model("qwen3-32b")), {"A0", "F0"}), ("qwen3.5", lambda: compact(load_model("qwen3.5-27b")), {"A3", "A0", "F0"}),
-    ("qwen3.6", lambda: compact(load_model("qwen3.6-27b")), {"A3", "A0", "F0"}),
-    ("qwen3.8", lambda: compact(load_model("qwen3.8-27b")), {"A3", "A0", "F0"}),
-    ("glm-4.5", lambda: compact(fixture_model("glm45.json")), {"A0", "F0", "F1", "F3"}),
-    ("glm-5.1", lambda: compact(load_model("glm-5.1")), {"A1", "I0", "I1"}), ("glm-5.3", lambda: compact(load_model("glm-5.3")), {"A1", "I0", "I1"}),
-    ("kimi-k2.5", lambda: compact(load_model("kimi-k2.5")), {"A1", "F1", "F3"}),
-    ("kimi-k3", lambda: compact(load_model("kimi-k3")), {"A4", "A1", "R1", "F3"}), ("llama", llama_model, {"A0", "F0"}),
-    ("gemma4", lambda: gemma4_model_spec(gemma_config()), {"A0", "E1", "F0"}), ]
+FAMILIES = [ ("deepseek-v3", lambda: compact(load_model("deepseek-v3")), {"mla_attention", "moe_router", "moe_token_dispatcher", "routed_experts"}),
+    ("deepseek-v3.2", lambda: compact(load_model("deepseek-v3.2")), {"dsa_attention", "indexer_prolog", "lightning_indexer", "routed_experts"}),
+    ("deepseek-v4f", lambda: compact(load_model("deepseek-v4-flash-0731")), {"csa_attention", "kv_compressor", "indexer_prolog", "lightning_indexer", "hyper_connection"}),
+    ("deepseek-v4.1", lambda: compact(load_model("deepseek-v4.1-flash")), {"csa2_attention", "kv_compressor", "indexer_prolog", "lightning_indexer"}),
+    ("qwen3", lambda: compact(load_model("qwen3-32b")), {"gqa_attention", "mlp"}), ("qwen3.5", lambda: compact(load_model("qwen3.5-27b")), {"gdn_linear_attn", "gqa_attention", "mlp"}),
+    ("qwen3.6", lambda: compact(load_model("qwen3.6-27b")), {"gdn_linear_attn", "gqa_attention", "mlp"}),
+    ("qwen3.8", lambda: compact(load_model("qwen3.8-27b")), {"gdn_linear_attn", "gqa_attention", "mlp"}),
+    ("glm-4.5", lambda: compact(fixture_model("glm45.json")), {"gqa_attention", "mlp", "moe_router", "routed_experts"}),
+    ("glm-5.1", lambda: compact(load_model("glm-5.1")), {"dsa_attention", "indexer_prolog", "lightning_indexer"}), ("glm-5.3", lambda: compact(load_model("glm-5.3")), {"dsa_attention", "indexer_prolog", "lightning_indexer"}),
+    ("kimi-k2.5", lambda: compact(load_model("kimi-k2.5")), {"mla_attention", "moe_router", "routed_experts"}),
+    ("kimi-k3", lambda: compact(load_model("kimi-k3")), {"kda_linear_attn", "mla_attention", "attn_residual", "routed_experts"}), ("llama", llama_model, {"gqa_attention", "mlp"}),
+    ("gemma4", lambda: gemma4_model_spec(gemma_config()), {"gqa_attention", "swa_attention", "per_layer_embedding", "mlp"}), ]
 
 @pytest.mark.parametrize(("family", "factory", "expected"), FAMILIES, ids=[item[0] for item in FAMILIES])
 def test_all_named_model_families_assemble_and_predict(family, factory, expected):
@@ -285,16 +320,26 @@ def test_layer_template_aggregation_keeps_per_layer_report():
     pipe = pipeline(model)
     prediction = pipe.forward(WorkloadGeometry.homogeneous(2, 4, 32))
     assert len(prediction.layers) == 6
-    assert prediction.evaluation_count == 1
-    assert prediction.template_groups == 1
+    # The decoder entry differs structurally from interior layers (its
+    # attention norm has no residual add), so it is its own template group;
+    # layers 1..5 remain one repeated group.
+    assert prediction.evaluation_count == 2
+    assert prediction.template_groups == 2
     assert prediction.layers[0].reused is False
-    assert all(layer.reused for layer in prediction.layers[1:])
-    assert all(layer.group == 0 for layer in prediction.layers)
-    assert all(len(layer.rows) == len(prediction.layers[0].rows) for layer in prediction.layers)
+    assert prediction.layers[1].reused is False
+    assert all(layer.reused for layer in prediction.layers[2:])
+    assert prediction.layers[0].group == 0
+    assert all(layer.group == 1 for layer in prediction.layers[1:])
+    # The entry norm is a plain RMSNorm; interior attention norms fuse the
+    # residual add.  The row count can coincide, so assert the actual split.
+    assert "rmsnorm" in {row.cost.name for row in prediction.layers[0].rows}
+    assert "rmsnorm" not in {row.cost.name for row in prediction.layers[1].rows}
+    assert all(len(layer.rows) == len(prediction.layers[1].rows)
+               for layer in prediction.layers[1:])
     assert {row.layer for row in prediction.rows} >= {0, 5}
     report = prediction.to_dict()
     assert len(report["layers"]) == 6
-    assert report["evaluation_count"] == 1
+    assert report["evaluation_count"] == 2
     assert any(key.startswith("family:") for key, _ in prediction.bottlenecks())
 
 def test_aclgraph_bucket_padding_preserves_active_attention_rows():
@@ -368,6 +413,46 @@ def test_dp_and_ep_cross_rank_sync_waits():
         FrameworkConfig(supply=SUPPLY, max_batch=1, routing=((0, (4, 0, 4, 0)),)))
     assert balanced.sync["ep_skew_ms"] < ep_result.sync["ep_skew_ms"]
 
+def test_weighted_return_follows_routed_combine_without_shared_experts():
+    plan = dict(index=0, attention="gqa", ffn="moe", num_heads=4,
+                num_kv_heads=2, head_dim=16, intermediate_size=128,
+                num_experts=4, top_k=2, moe_intermediate_size=32,
+                num_shared_experts=0)
+    model = make_model(name="moe_no_shared", plans=[plan],
+                       num_experts=4, top_k=2, moe_intermediate_size=32,
+                       num_shared_experts=0)
+    pipe = pipeline(model, feature_overrides={"ep": 2})
+    prediction = pipe.forward(WorkloadGeometry(
+        (RequestGeometry(64, 0, phase="prefill"),), phase="prefill"))
+    rows = tuple(row for layer in prediction.layers for row in layer.rows)
+    names = [row.cost.name for row in rows]
+    assert "combine" in names and "router_finalize" in names
+    assert names.index("combine") < names.index("router_finalize")
+    finalize = next(row for row in rows if row.cost.name == "router_finalize")
+    assert finalize.kind == "moe_token_dispatcher"
+    assert finalize.role == "transport_combine"
+    combine = pipe.instantiated.find("moe_token_dispatcher", layer=0, role="transport_combine")
+    assert combine is not None
+    assert [op.name for op in combine.operators] == ["combine", "router_finalize"]
+    assert combine.operators[-1].theta.find("router_upstream") == "combine"
+    assert not any(row.kind == "shared_experts" for row in rows)
+
+
+def test_mc2_fused_recipe_does_not_emit_external_finalize():
+    plan = dict(index=0, attention="gqa", ffn="moe", num_heads=4,
+                num_kv_heads=2, head_dim=16, intermediate_size=128,
+                num_experts=4, top_k=2, moe_intermediate_size=32,
+                num_shared_experts=0)
+    model = make_model(name="moe_mc2", plans=[plan], num_experts=4, top_k=2,
+                       moe_intermediate_size=32, num_shared_experts=0)
+    pipe = pipeline(model, feature_overrides={"ep": 2, "moe_recipe": "mc2"})
+    prediction = pipe.forward(WorkloadGeometry(
+        (RequestGeometry(64, 0, phase="prefill"),), phase="prefill"))
+    names = [row.cost.name for layer in prediction.layers for row in layer.rows]
+    assert "combine" in names
+    assert "router_finalize" not in names
+
+
 def mtp_model():
     raw = dict( name="mtp", layers=1, hidden_size=64, num_heads=4, num_kv_heads=2,
         head_dim=16, intermediate_size=128, vocab_size=128, layer_plans=[dense_plan(0)],
@@ -413,7 +498,7 @@ def test_mtp_rollback_commits_only_accepted_tokens():
 
 def test_r0_projection_matches_hyperconnection_block_width():
     model = make_model(plans=[dense_plan(0, hyper_connections=True, hc_mult=4, hc_sinkhorn_iters=2)])
-    r0 = pipeline(model).instantiated.find("R0", layer=0, role="pre")
+    r0 = pipeline(model).instantiated.find("hyper_connection", layer=0, role="pre")
     assert dict(r0.operator("hc_projection").theta.matrix) == { "K": 64 * 4, "N": (2 + 4) * 4}
 
 def mla_model(tp=1, o_groups=4):
@@ -425,7 +510,7 @@ def mla_model(tp=1, o_groups=4):
 
 def test_mla_prolog_binds_query_kv_norms_store_and_grouped_output():
     model, pipe = mla_model(tp=2)
-    a1 = pipe.instantiated.find("A1", layer=0, role="attention")
+    a1 = pipe.instantiated.find("mla_attention", layer=0, role="attention")
     names = {operator.name for operator in a1.operators}
     assert {"q_down", "q_norm", "q_up", "kv_down", "kv_norm", "rotary",
             "kv_store", "mla_attention", "grouped_output_a", "grouped_output_b", "tp_allreduce"} <= names
@@ -443,10 +528,10 @@ def test_shared_consumer_owns_query_projection_and_qk_norm_runs_once():
     plans = [dense_plan(0, owns_long_kv=True), dense_plan(1, kv_owner_layer_id=0, q_output_gate=True)]
     model = make_model(plans=plans)
     pipe = pipeline(model, feature_overrides={"tp": 2})
-    n0 = pipe.instantiated.find("N0", layer=1, role="attn_norm")
+    n0 = pipe.instantiated.find("layernorm", layer=1, role="attn_norm")
     assert "qk_norm" not in {operator.name for operator in n0.operators}
-    owner = pipe.instantiated.find("A0", layer=0, role="attention")
-    consumer = pipe.instantiated.find("A0", layer=1, role="attention")
+    owner = pipe.instantiated.find("gqa_attention", layer=0, role="attention")
+    consumer = pipe.instantiated.find("gqa_attention", layer=1, role="attention")
     assert "qkv_projection" in {operator.name for operator in owner.operators}
     cnames = {operator.name for operator in consumer.operators}
     assert {"q_projection", "qk_norm", "rotary", "output_gate"} <= cnames
@@ -456,7 +541,7 @@ def test_shared_consumer_owns_query_projection_and_qk_norm_runs_once():
 def test_local_kv_rows_and_raw_tp_allreduce_payload():
     model = make_model(plans=[dense_plan(0, num_heads=64, num_kv_heads=2, head_dim=64)], hidden_size=512, num_heads=64, num_kv_heads=2, head_dim=64)
     pipe = pipeline(model, feature_overrides={"tp": 8})
-    a0 = pipe.instantiated.find("A0", layer=0, role="attention")
+    a0 = pipe.instantiated.find("gqa_attention", layer=0, role="attention")
     assert a0.operator("attention").theta.find("kv_bytes") == 1 * (64 + 64) * 2
     assert a0.operator("tp_allreduce").theta.find("wire_bytes") == 512 * 2
 
@@ -466,16 +551,18 @@ def test_recurrent_tp_shards_heads_and_conv_consumes_full_qkv():
     model = make_model(plans=[plan])
     for tp in (1, 2):
         pipe = pipeline(model, feature_overrides={"tp": tp})
-        a3 = pipe.instantiated.find("A3", layer=0, role="attention")
+        a3 = pipe.instantiated.find("gdn_linear_attn", layer=0, role="attention")
         key_heads, value_heads = 4 // tp, 4 // tp
         assert dict(a3.operator("conv").theta.matrix)["row_bytes"] == ( 2 * key_heads * 8 + value_heads * 8) * 2
         assert dict(a3.operator("qkvz_projection").theta.matrix)["N"] == ( key_heads * 8 * 2 + value_heads * 8 * 2)
 
 def test_fusion_preserves_external_stores_stages_and_member_readiness():
     quant = dict(name="w8a8", weight_format="int8", activation_format="int8", weight_block=(128, 128), scale_bytes=4)
-    pipe = pipeline(dense_model(quant=quant))
+    # Layer 0's attention norm is the decoder entry (no residual add); the
+    # add+norm fusion under test starts at the first interior layer.
+    pipe = pipeline(dense_model(layers=2, quant=quant))
     geometry = WorkloadGeometry.homogeneous(2, 4, 32)
-    f0 = pipe._subgraph(pipe.instantiated.find("F0", layer=0, role="dense_ffn"))
+    f0 = pipe._subgraph(pipe.instantiated.find("mlp", layer=0, role="dense_ffn"))
     fused = lower_fusion(f0.instance, f0.evaluate(geometry).operators, "dequant_swiglu_quant", supply=SUPPLY)
     assert fused.fused.pipe_work("mte3") == 128 * 8
     assert dict(fused.kept)["down_input"] == 128 * 8
@@ -484,8 +571,12 @@ def test_fusion_preserves_external_stores_stages_and_member_readiness():
     assert "mte2" in first and fused.fused.duration_ms > max( fused.fused.stage_times)
     baseline = evaluate_serial_split(f0, geometry, fusion=("dequant_swiglu_quant",))
     late = evaluate_serial_split(f0, geometry, fusion=("dequant_swiglu_quant",), readiness={"gate_up": 3})
-    assert late.gap_ms == 3 and late.total_ms == baseline.total_ms + 3
-    n0 = pipe._subgraph(pipe.instantiated.find("N0", layer=0, role="attn_norm"))
+    # gate_up's dynamic quant does not share that readiness, so it runs
+    # inside the wait and only the residual slack is idle.
+    prefix = baseline.by_name("gate_up_QuantV2").duration_ms
+    assert late.gap_ms == 3 - prefix
+    assert late.total_ms == pytest.approx(baseline.total_ms + late.gap_ms, rel=1e-12)
+    n0 = pipe._subgraph(pipe.instantiated.find("layernorm", layer=1, role="attn_norm"))
     n0_fused = lower_fusion(n0.instance, n0.evaluate(geometry).operators, "add_rmsnorm_quant", supply=SUPPLY)
     assert n0_fused.fused.pipe_work("mte3") >= 2 * 64 * 8
 
@@ -505,10 +596,10 @@ def moe_model(gated=True):
 def test_f2_combines_after_experts_and_f4_gates_join_after_both():
     model = moe_model()
     pipe = pipeline(model, feature_overrides={ "multistream_shared_expert": True, "tp": 2})
-    common = pipe.instantiated.find("F4", layer=0, role="shared_ffn")
+    common = pipe.instantiated.find("shared_experts", layer=0, role="shared_ffn")
     assert dict(common.operator("shared_gate_up").theta.matrix)["N"] == 2 * 32
     assert {"shared_gate", "shared_gate_apply", "tp_allreduce"} <= { operator.name for operator in common.operators}
-    join = pipe.instantiated.find("F4", layer=0, role="join")
+    join = pipe.instantiated.find("shared_experts", layer=0, role="join")
     assert [operator.name for operator in join.operators] == ["join"]
     prediction = pipe.forward(WorkloadGeometry.homogeneous(2, 1, 16))
     rows = prediction.layers[0].rows
@@ -519,7 +610,7 @@ def test_f2_combines_after_experts_and_f4_gates_join_after_both():
 
 def test_ungated_f0_and_o0_selected_rows():
     model = make_model(plans=[dense_plan(0, ffn_activation="ungated")])
-    f0 = pipeline(model).instantiated.find("F0", layer=0, role="dense_ffn")
+    f0 = pipeline(model).instantiated.find("mlp", layer=0, role="dense_ffn")
     assert dict(f0.operator("gate_up").theta.matrix)["N"] == 128
     assert f0.template.fusions == ()
     for scope, norm_rows in (("all", 32), ("selected", 4)):
@@ -579,42 +670,68 @@ def test_dp_completion_is_true_rank_maximum():
 def a2_pipe():
     plan = dict(index=0, attention="gqa", ffn="dense", num_heads=4, num_kv_heads=2,
                 head_dim=16, intermediate_size=128, cache_kind="window_compressed", window=8, compress_ratio=4, compressor_kind="weighted_pool",
-                indexer=True, index_heads=2, index_dim=8, index_topk=4, index_kpool=1, owns_long_kv=True)
+                indexer=True, index_heads=2, index_dim=8, index_topk=4, index_kpool=1, owns_long_kv=True,
+                owns_index_k=True, index_k_owner_layer_id=0, topk_owner_layer_id=0, owns_topk=True)
     return pipeline(make_model(plans=[plan]))
 
 def test_a0_fusion_keeps_v_slice_and_recovers_supply():
     pipe = pipeline(dense_model())
     geometry = WorkloadGeometry.homogeneous(2, 4, 32)
-    instance = pipe.instantiated.find("A0", layer=0, role="attention")
+    instance = pipe.instantiated.find("gqa_attention", layer=0, role="attention")
     compiled = pipe._subgraph(instance)
     costs = compiled.evaluate(geometry).operators
     fused = lower_fusion(instance, costs, "qkv_norm_rope", supply=SUPPLY)
     kept = dict(fused.kept)
     v_bytes = 2 * 16 * 2 * 8
+    q_bytes = 4 * 16 * 2 * 8
     assert kept["value"] == v_bytes
-    assert kept["query"] == 4 * 16 * 2 * 8 and kept["key"] == v_bytes
-    assert dict(fused.fused.materialization)["value"] == v_bytes
-    assert fused.fused.pipe_work("mte3") >= v_bytes
+    assert kept["query"] == q_bytes and kept["key"] == v_bytes
+    # The independent QKV projection writes V.  The fused postprocessor only
+    # writes q/k; its logical V is still available at full width.
+    assert dict(fused.fused.materialization) == {"key": v_bytes,
+                                                 "query": q_bytes}
+    values = {value.name: value for value in fused.values}
+    assert values["value"].logical_bytes == v_bytes
+    assert values["value"].written_bytes == 0
+    assert values["query"].written_bytes == q_bytes
+    assert values["key"].written_bytes == v_bytes
+    assert dict(fused.fused.derived)["kept_bytes"] == q_bytes + 2 * v_bytes
+    assert fused.fused.pipe_work("mte3") == q_bytes + v_bytes
     for pipe, value in fused.fused.times:
         service = sum(dict(stage).get(pipe, 0) for stage in fused.fused.stage_work)
         assert float(value) == pytest.approx(service / SUPPLY.effective(pipe))
     gated = pipeline(make_model(plans=[dense_plan(0, q_output_gate=True)]))
-    gated_instance = gated.instantiated.find("A0", layer=0, role="attention")
+    gated_instance = gated.instantiated.find("gqa_attention", layer=0, role="attention")
     gated_fused = lower_fusion(gated_instance, gated._subgraph(gated_instance).evaluate(geometry).operators,
                                "qkv_norm_rope", supply=SUPPLY)
-    assert dict(gated_fused.kept)["gate"] == 8 * 4 * 16 * 2
-    assert gated_fused.fused.pipe_work("mte3") == 3072 == sum(
-        value for _, value in gated_fused.fused.materialization)
+    # qkv_projection is an independent QBMM now; qk_norm+rotary fuse to one
+    # postprocessor that physically writes q/k.  The surviving V/gate slices
+    # are logical values of that QBMM, not stores of this fused launch.
+    gate_bytes = 4 * 16 * 2 * 8
+    gated_kept = dict(gated_fused.kept)
+    assert gated_kept["gate"] == gate_bytes
+    assert gated_kept["value"] == v_bytes
+    qk_bytes = (4 * 16 + 2 * 16) * 8 * 2
+    assert gated_fused.fused.pipe_work("mte3") == qk_bytes
+    assert dict(gated_fused.fused.materialization) == {"key": v_bytes,
+                                                       "query": q_bytes}
+    gated_values = {value.name: value for value in gated_fused.values}
+    assert gated_values["gate"].logical_bytes == gate_bytes
+    assert gated_values["gate"].written_bytes == 0
+    assert gated_values["value"].logical_bytes == v_bytes
+    assert gated_values["value"].written_bytes == 0
+    assert dict(gated_fused.fused.derived)["kept_bytes"] == (
+        q_bytes + gate_bytes + 2 * v_bytes)
     recovered = lower_fusion(instance, costs, "qkv_norm_rope")
     assert recovered.fused.duration_ms == fused.fused.duration_ms
-    bad = tuple(replace(cost, times=()) if cost.name == "qkv_projection" else cost for cost in costs)
+    bad = tuple(replace(cost, times=()) if cost.name == "qk_norm" else cost for cost in costs)
     with pytest.raises(ModelingError):
         lower_fusion(instance, bad, "qkv_norm_rope")
 
 def test_a2_producers_cache_ownership_and_sharded_reductions():
     pipe = a2_pipe()
-    prolog = pipe.instantiated.find("A2", layer=0, role="attention_prolog")
-    core = pipe.instantiated.find("A2", layer=0, role="attention")
+    prolog = pipe.instantiated.find("csa_attention", layer=0, role="attention_prolog")
+    core = pipe.instantiated.find("csa_attention", layer=0, role="attention")
     assert {"q_direct", "kv_down", "kv_norm", "rotary", "kv_store"} <= { operator.name for operator in prolog.operators}
     rows = pipe.forward(WorkloadGeometry.homogeneous(2, 1, 8), fusion=False).rows
     names = [row.cost.name for row in rows]
@@ -627,28 +744,28 @@ def test_a2_producers_cache_ownership_and_sharded_reductions():
     with pytest.raises(ModelingError):
         pipe._subgraph(core).evaluate(WorkloadGeometry.homogeneous(1, 4, 0), indexed)
     a1 = pipeline(mla_model(tp=1, o_groups=4)[0])
-    assert not any(item.kind == "K0" for item in a1.instantiated.layers[0].subgraphs)
-    grouped = a1._subgraph(a1.instantiated.find("A1", layer=0)).operator("grouped_output_a").evaluate( WorkloadGeometry.homogeneous(1, 1, 1))
+    assert not any(item.kind == "kv_cache" for item in a1.instantiated.layers[0].subgraphs)
+    grouped = a1._subgraph(a1.instantiated.find("mla_attention", layer=0)).operator("grouped_output_a").evaluate( WorkloadGeometry.homogeneous(1, 1, 1))
     assert grouped.get("flops") == 2 * 4 * 256 * 64 and grouped.get("output_bytes") == 4 * 64 * 2
     gdn = dict(index=0, attention="gdn", ffn="dense", num_heads=4, num_kv_heads=2,
                head_dim=16, intermediate_size=128, linear_heads=4, linear_head_dim=8, linear_key_heads=4, linear_key_head_dim=8, linear_value_heads=4,
                conv_kernel=4)
     recurrent = pipeline(make_model(plans=[gdn]), feature_overrides={"tp": 2})
-    assert not any(item.kind == "K0" for item in recurrent.instantiated.layers[0].subgraphs)
-    assert "tp_allreduce" in {operator.name for operator in recurrent.instantiated.find( "A3", layer=0).operators}
+    assert not any(item.kind == "kv_cache" for item in recurrent.instantiated.layers[0].subgraphs)
+    assert "tp_allreduce" in {operator.name for operator in recurrent.instantiated.find( "gdn_linear_attn", layer=0).operators}
     experts = pipeline(moe_model(), feature_overrides={"tp": 4, "ep": 2, "etp": 2})
-    f3 = experts.instantiated.find("F3", layer=0)
+    f3 = experts.instantiated.find("routed_experts", layer=0)
     assert "etp_allreduce" in {operator.name for operator in f3.operators}
     geometry = WorkloadGeometry.homogeneous(4, 1, 4)
     grouped = experts._subgraph(f3).operator("expert_gate_up").evaluate(geometry)
     activation = experts._subgraph(f3).operator("expert_activation").evaluate(geometry)
     assert activation.get("elements") == grouped.get("moe_rows") * 16
     plain = pipeline(moe_model())
-    canonical_f3 = plain.instantiated.find("F3", layer=0)
+    canonical_f3 = plain.instantiated.find("routed_experts", layer=0)
     canonical_rows = plain._subgraph(canonical_f3).operator("expert_gate_up").evaluate(geometry)
     canonical = plain._subgraph(canonical_f3).operator("expert_activation").evaluate(geometry)
     assert canonical.get("elements") == canonical_rows.get("moe_rows") * 32 == 256
-    dispatch = experts._subgraph(experts.instantiated.find( "F2", layer=0, role="transport")).operator("dispatch").evaluate(
+    dispatch = experts._subgraph(experts.instantiated.find( "moe_token_dispatcher", layer=0, role="transport")).operator("dispatch").evaluate(
         WorkloadGeometry.homogeneous(4, 1, 4))
     assert dispatch.get("ranks") == 2 and dispatch.get("peer_bytes") == 4 * 2 * 64 * 2
 
@@ -663,9 +780,9 @@ def test_gemma_native_defaults_and_ple_structure():
     assert all(plan.head_dim == 512 for plan in model.layer_plans if not plan.window)
     assert all(plan.num_kv_heads == 2 for plan in model.layer_plans)
     pipe = pipeline(gemma4_model_spec(gemma_config()))
-    e0 = pipe.instantiated.find("E0")
+    e0 = pipe.instantiated.find("vocab_parallel_embedding")
     assert {"per_layer_model_projection", "per_layer_projection_norm", "ple_combine"} <= { operator.name for operator in e0.operators}
-    e1 = pipe.instantiated.find("E1", layer=0)
+    e1 = pipe.instantiated.find("per_layer_embedding", layer=0)
     assert {"gate_activation", "projection", "post_projection_norm", "residual_add"} <= {operator.name for operator in e1.operators}
     assert e1.template.coverage == "structural"
 
@@ -673,11 +790,11 @@ def test_r1_sources_prefill_outputs_and_mtp_state():
     plans = [dense_plan(index, residual_block_size=2) for index in range(8)]
     r1 = pipeline(make_model(plans=plans))
     prediction = r1.forward(WorkloadGeometry.homogeneous(1, 1, 8))
-    assert [r1.instantiated.find("R1", layer=index).operator("score").theta.find("slots") for index in range(8)] == [1, 1, 2, 2, 3, 3, 4, 4]
+    assert [r1.instantiated.find("attn_residual", layer=index).operator("score").theta.find("slots") for index in range(8)] == [1, 1, 2, 2, 3, 3, 4, 4]
     assert prediction.layers[-1].state_out.residual.retained == (0, 1, 2, 3)
     second = r1.forward(WorkloadGeometry.homogeneous(1, 1, 9), prediction.state_out)
     assert second.layers[0].state_in.residual.retained == ()
-    assert "norm" in {operator.name for operator in r1.instantiated.find("R1", layer=6).operators}
+    assert "norm" in {operator.name for operator in r1.instantiated.find("attn_residual", layer=6).operators}
     out = pipeline(dense_model(), feature_overrides={"final_norm_scope": "selected"})
     chunks = WorkloadGeometry((RequestGeometry(4, 0, phase="prefill"),), phase="prefill")
     first = out.forward(chunks, emit_mask=(False,), fusion=False).rows
@@ -770,9 +887,9 @@ def test_gemma4_per_layer_attention_and_ple_width():
     assert [(plan.head_dim, plan.num_kv_heads) for plan in model.layer_plans] == [ (16, 2), (32, 1)] * 3
     assert [plan.kv_owner_layer_id for plan in model.layer_plans] == [0, 1, 2, 3, 2, 3]
     pipe = pipeline(model)
-    assert pipe.instantiated.find("A0", layer=0, role="attention").operator( "qkv_projection").theta.find("k_eq_v") == 0
-    assert pipe.instantiated.find("A0", layer=1, role="attention").operator( "qkv_projection").theta.find("k_eq_v") == 1
-    ple = pipe.instantiated.find("E1", layer=0, role="ple")
+    assert pipe.instantiated.find_attention(0, role="attention").operator( "qkv_projection").theta.find("k_eq_v") == 0
+    assert pipe.instantiated.find_attention(1, role="attention").operator( "qkv_projection").theta.find("k_eq_v") == 1
+    ple = pipe.instantiated.find("per_layer_embedding", layer=0, role="ple")
     assert dict(ple.operator("projection").theta.matrix) == {"K": 32, "N": 64}
 
 def test_pp_transfer_only_at_stage_cut_and_invalid_tp_rejected():
@@ -783,16 +900,69 @@ def test_pp_transfer_only_at_stage_cut_and_invalid_tp_rejected():
     assert len(transfers) == 1 and transfers[0].layer == 1
     assert transfers[0].cost.family == "p2p"
     assert all("stage_transfer" not in {operator.name for operator in instance.operators}
-               for layer in pipe.instantiated.layers for instance in layer.subgraphs if instance.kind == "K0")
+               for layer in pipe.instantiated.layers for instance in layer.subgraphs if instance.kind == "kv_cache")
     plans3 = [dense_plan(0, owns_long_kv=True), dense_plan(1, kv_owner_layer_id=0),
               dense_plan(2, kv_owner_layer_id=0)]
     multicast = pipeline(make_model(plans=plans3, layers=3), feature_overrides={"pp": 3})
     transfer = next(instance.operator("stage_transfer") for layer in multicast.instantiated.layers
-                    for instance in layer.subgraphs if instance.kind == "K0"
+                    for instance in layer.subgraphs if instance.kind == "kv_cache"
                     and "stage_transfer" in {operator.name for operator in instance.operators})
     assert transfer.theta.find("destination_stages") == (1, 2)
     predicted = multicast.forward(WorkloadGeometry.homogeneous(1, 1, 31), fusion=False)
-    assert sum(row.cost.pipe_work("link") for row in predicted.rows if row.kind == "K0") == 2 * 128
+    assert sum(row.cost.pipe_work("link") for row in predicted.rows if row.kind == "kv_cache") == 2 * 128
     invalid = make_model(plans=[dense_plan(0, num_heads=10, num_kv_heads=1)], num_heads=10, num_kv_heads=1, hidden_size=160)
     with pytest.raises(ModelingError):
         pipeline(invalid, feature_overrides={"tp": 3})
+
+
+def test_r31_non_spec_runner_physical_select_is_not_emit_filtered():
+    """R31 L1634-1643 physically samples every scheduled request.
+
+    The emitted/committed count is separate: an all-false emit mask still
+    computes the O0 logits for the scheduled requests, then discards them.
+    The scope-selected/no-source models below remain the genuine negative.
+    """
+    model = dense_model()
+    base = features(model)
+    meta = tuple(sorted({
+        **dict(base.metadata),
+        "image_id": (
+            "sha256:9e869e8148467296f56d1001b0dac4fea893c841ac7d0a03d4e824a233c2ffea"),
+        "model_identifier": "qwen3_5",
+    }.items()))
+    source = assemble_model(model, supply=SUPPLY, policy=POLICY,
+                            features=replace(base, metadata=meta))
+    chunks = WorkloadGeometry(
+        (RequestGeometry(4, 0, phase="prefill"),
+         RequestGeometry(2, 0, phase="prefill")), phase="prefill")
+    for mask in ((True, False), (False, False)):
+        rows = source.forward(chunks, emit_mask=mask, fusion=False).rows
+        hidden = [row for row in rows if row.cost.name == "hidden_select"]
+        head = [row for row in rows if row.cost.name == "lm_head"]
+        assert len(hidden) == 1 and len(head) == 1
+        assert head[0].padded_tokens == 2
+        prepare = hidden[0].native_occurrence["prepare"]
+        assert prepare["match"]["selected_rows"] == 2
+        assert prepare["observed"]["current_producing_rows"] == 6
+    single = source.forward(
+        WorkloadGeometry((RequestGeometry(4, 0, phase="prefill"),),
+                         phase="prefill"), emit_mask=(False,), fusion=False).rows
+    single_hidden = next(row for row in single
+                         if row.cost.name == "hidden_select")
+    single_prepare = single_hidden.native_occurrence["prepare"]
+    assert single_prepare["match"]["selected_rows"] == 1
+    assert single_prepare["observed"]["current_producing_rows"] == 4
+    verify = WorkloadGeometry(
+        (RequestGeometry(3, 2, phase="verify"),), phase="verify")
+    checked = source.forward(verify, emit_mask=(True,), fusion=False,
+                             acceptance=(2, 2)).rows
+    assert not any(row.cost.name == "hidden_select" for row in checked)
+    padded = WorkloadGeometry(
+        (RequestGeometry(4, 0, phase="prefill"),), phase="prefill",
+        physical_tokens=8)
+    padded_rows = source.forward(padded, emit_mask=(True,), fusion=False).rows
+    assert not any(row.cost.name == "hidden_select" for row in padded_rows)
+    plain = pipeline(dense_model())
+    none = plain.forward(chunks, emit_mask=(False, False), fusion=False).rows
+    assert not any(row.cost.name in {"hidden_select", "lm_head", "sampling"}
+                   for row in none)

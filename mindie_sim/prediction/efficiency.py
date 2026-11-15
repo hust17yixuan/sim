@@ -1,12 +1,13 @@
 """Whole-network MFU/MBU efficiency analysis, target roofline fitting, and SLA scaling solver.
 
 [Role] Compute four-dimensional operator and network efficiency (Cube_MFU,
-  Vec_MFU, MBU, Link_Util, CV_Overlap), fit multi-pipe roofline targets, and
-  solve SLA-constrained throughput under counterfactual hardware scaling.
+  Vec_MFU, MBU, Link_Util, CV_Overlap), export per-pipe nominal work bounds,
+  evaluate fixed-plan resource/capacity counterfactuals, and solve SLA
+  throughput under counterfactual hardware scaling.
 [Invariants] Physical FLOPs, vector OPs, HBM bytes, and link bytes are conserved
-  from lowered operators and executed resource service. At 1.0x scaling, scaled
-  hardware and multi-pipe roofline decomposition reproduce baseline simulator
-  latency with 0.00% drift.
+  from lowered operators and executed resource service. At 1.0x scaling the same
+  plan reproduces baseline simulator latency; target-efficiency step latency is
+  a labeled per-pipe work lower bound, never a rescheduled graph.
 [Timeouts & Locks] Pure in-memory arithmetic and bounded DAG evaluation; no I/O,
   subprocesses, sleeps, or device locks.
 [Side-Effect Policy] Input cases and operator reports are never mutated; scaling
@@ -35,8 +36,8 @@ from .scheduler import DraftPolicy
 from .structure import parse_case
 
 _STRIP_METADATA_KEYS = frozenset({"structure_subgraph_memberships", "structure_subgraph_entries", "structure_subgraphs", "graph_segment", "fusion_group_key", "topk_ids_producer", "payload_producer", "input_conversion_subgraphs", "inverse_index_producer", "topk_weights_producer"})
-_HBM_ROLES = frozenset({"hbm", "mte2", "mte2_aic", "mte2_aiv", "mte3", "l2"})
-_CUBE_ROLES = frozenset({"cube", "mte1", "fixpipe", "mte1_l0a", "mte1_l0b", "aic"})
+_HBM_ROLES = frozenset({"hbm", "memory", "gm_hbm_cacheline_128b"})
+_CUBE_ROLES = frozenset({"cube", "aic"})
 _VEC_ROLES = frozenset({"vector", "vbitsort32", "scalar_store_issue", "ub_copy", "aiv", "reg_issue_slots", "reg_alu_lanes", "reg_special_lanes", "reg_reduce_lanes", "reg_shuffle_lanes", "reg_data_writes", "reg_ub_accesses", "reg_ub_stores"})
 _DTYPE_ALIASES = {"bfloat16": "bf16", "float16": "fp16", "float32": "fp32", "fp8_e4m3": "fp8", "fp8_e5m2": "fp8"}
 _BOUNDS = ("memory_bound", "cube_bound", "vector_bound", "link_bound", "launch_bound")
@@ -96,10 +97,11 @@ def _resolve_link_peak_bw_bytes_per_ms(case: CaseSpec, scope: str) -> float:
 
 
 def _role_scale_factor(role: str, *, hbm_bw_scale: float, cube_flops_scale: float, vector_ops_scale: float, link_bw_scale: float) -> float:
+    """Scale only the named physical supply; MTE/L2/copy stay independent unless explicitly coupled."""
     r = str(role or "").strip()
-    if r in _HBM_ROLES or r.startswith(("hbm", "mte2", "mte3", "l2")):
+    if r in _HBM_ROLES or r.startswith(("hbm", "gm_hbm")):
         return hbm_bw_scale
-    if r in _CUBE_ROLES or r.startswith(("cube", "mte1", "fixpipe", "aic")):
+    if r in _CUBE_ROLES or r.startswith("cube"):
         return cube_flops_scale
     if r in _VEC_ROLES or r.startswith(("vector", "vreg_", "sreg_", "reg_", "ub_", "aiv")):
         return vector_ops_scale
@@ -164,15 +166,42 @@ def _operator_invocation_bounds(op: Mapping[str, Any], row: Mapping[str, Any], p
                 inv_map = dict(d.kernel_invocations)
                 for cls_name in (c for c in classes if c in inv_map):
                     startup_ms, minimum_ms = max(startup_ms, float(inv_map[cls_name].startup_ms)), max(minimum_ms, float(inv_map[cls_name].minimum_ms))
-    reg_fixed_ms = 0.0
-    for reg in basis.get("service_regimes", ()):
+    return min(startup_ms, duration_ms), min(minimum_ms, duration_ms)
+
+
+def diagnostic_legacy_invocation_bounds(basis: Mapping[str, Any]) -> dict[str, Any]:
+    """Explicit diagnostic replay of archived service-regime floors.
+
+    Never called by the ordinary analysis path.  The returned fixed/minimum
+    values retain the source rule id and are marked ``production_prediction``
+    false so legacy whole-call floors cannot silently re-enter timing.
+    """
+    fixed_ms, minimum_ms, sources = 0.0, 0.0, []
+    for reg in basis.get("service_regimes", ()) or ():
         queries, resp = reg.get("queries", {}), reg.get("response", {})
         if (queries.get("observable_response") or queries.get("joint_native_service")) and float(resp.get("fixed_us", 0.0) or 0.0) > 0:
+            sources.append(str(reg.get("rule_id") or reg.get("id") or "service_regime"))
             if resp.get("terms") or resp.get("services"):
-                reg_fixed_ms = max(reg_fixed_ms, float(resp["fixed_us"]) / 1000.0)
+                fixed_ms = max(fixed_ms, float(resp["fixed_us"]) / 1000.0)
             else:
                 minimum_ms = max(minimum_ms, float(resp["fixed_us"]) / 1000.0)
-    return min(max(startup_ms, reg_fixed_ms), duration_ms), min(minimum_ms, duration_ms)
+    return {"fixed_ms": fixed_ms, "minimum_ms": minimum_ms,
+            "source_rule_ids": sources, "production_prediction": False}
+
+
+def legacy_service_regime_diagnostics(case: CaseSpec | Mapping[str, Any]) -> dict[str, Any] | None:
+    """Expose archived service-regime rules as diagnostic-only, never as production price."""
+    parsed = parse_case(case)
+    metadata = dict(parsed.runtime.metadata)
+    existing = metadata.get("legacy_service_regime_diagnostics")
+    if isinstance(existing, Mapping):
+        return deepcopy(dict(existing))
+    rules = list(parsed.runtime.kernels.get("service_regimes", ()) or ())
+    if not rules:
+        return None
+    return {"production_prediction": False, "scaled": False,
+            "source": "runtime.kernels.service_regimes",
+            "rules": deepcopy(rules)}
 
 
 def analyze_operator_row(row: Mapping[str, Any], case: CaseSpec | Mapping[str, Any], *, peaks: Mapping[str, Any] | None = None, observed_duration_ms: float | None = None, pmu: Mapping[str, float] | None = None) -> dict[str, Any]:
@@ -258,7 +287,7 @@ def analyze_operator_row(row: Mapping[str, Any], case: CaseSpec | Mapping[str, A
     }
 
 
-def _lower_and_run_graph(case: CaseSpec, *, phase: str, tokens: int, context: int, sequences: int, scope: str, run_graph: bool = True, lowered_graphs: Any | None = None) -> tuple[Any, CaseSpec, dict[str, Any] | None]:
+def _lower_and_run_graph(case: CaseSpec, *, phase: str, tokens: int, context: int, sequences: int, scope: str, run_graph: bool = True, lowered_graphs: Any | None = None, include_submission: bool = False, overlap_async_scheduler: bool = False) -> tuple[Any, CaseSpec, dict[str, Any] | None]:
     graphs = lowered_graphs if lowered_graphs is not None else target_graphs(case, phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope)
     eff_case, has_kg = consume_target_declaration(case, graphs), any("device_kernel_group" in dict(op.metadata) for op in graphs[0])
     if not (run_graph or has_kg):
@@ -267,7 +296,13 @@ def _lower_and_run_graph(case: CaseSpec, *, phase: str, tokens: int, context: in
     sg = (TargetGraphSet({0: graphs[0]}, kernels=graphs.effective_kernels, selection=graphs.default_selection) if isinstance(graphs, TargetGraphSet) else {0: graphs[0]}) if (len(graphs) > 1 and not has_kg and not eff_case.runtime.parallel.ep_spans_dp) else graphs
     sg_map = {r: tuple(replace(op, metadata=tuple((k, v) for k, v in op.metadata if k not in _STRIP_METADATA_KEYS)) for op in ops) for r, ops in sg.items()}
     sg = TargetGraphSet(sg_map, kernels=sg.effective_kernels, selection=sg.default_selection) if isinstance(sg, TargetGraphSet) else sg_map
-    return graphs, eff_case, graph_costs(eff_case, sg, external_inputs=ext_in, include_submission=False, isolated=False)
+    sched_ms = float(eff_case.runtime.submission.get("scheduler_ms", 0.0) or 0.0)
+    overlap = bool(overlap_async_scheduler and include_submission and phase == "decode" and eff_case.runtime.async_scheduling and sched_ms > 0.0)
+    run_case = replace(eff_case, runtime=replace(eff_case.runtime, submission={**eff_case.runtime.submission, "scheduler_ms": 0.0})) if overlap else eff_case
+    report = graph_costs(run_case, sg, external_inputs=ext_in, include_submission=include_submission, isolated=False)
+    if overlap:
+        report = {**report, "duration_ms": max(float(report["duration_ms"]), sched_ms)}
+    return graphs, eff_case, report
 
 
 def _fast_operator_and_graph_reports(case: CaseSpec, *, phase: str, tokens: int, context: int, sequences: int, scope: str, run_graph: bool = True, precomputed_graph: tuple[Any, CaseSpec, dict[str, Any]] | None = None) -> tuple[dict[str, Any], dict[str, Any] | None]:
@@ -309,6 +344,448 @@ def _fast_operator_and_graph_reports(case: CaseSpec, *, phase: str, tokens: int,
                     r["total_ms"] = r["duration_ms"] * r["occurrences"]
             op_rep["operator_sum_ms"] = sum(r["total_ms"] for r in op_rep["operators"])
     return op_rep, graph_rep
+
+
+
+_RESOURCE_SCALE_ALIASES = {
+    "hbm": "hbm_bw_scale", "hbm_bw": "hbm_bw_scale", "hbm_bandwidth": "hbm_bw_scale",
+    "hbm_bw_scale": "hbm_bw_scale",
+    "cube": "cube_flops_scale", "cube_flops": "cube_flops_scale", "cube_flops_scale": "cube_flops_scale",
+    "vector": "vector_ops_scale", "vector_ops": "vector_ops_scale", "vector_ops_scale": "vector_ops_scale",
+    "link": "link_bw_scale", "link_bw": "link_bw_scale", "link_bw_scale": "link_bw_scale",
+    "hbm_capacity": "hbm_capacity_scale", "capacity": "hbm_capacity_scale", "hbm_capacity_scale": "hbm_capacity_scale",
+}
+
+
+def _resource_role(name: str) -> str:
+    text = str(name or "")
+    if text.startswith(("memory@", "gm_hbm")):
+        return "hbm"
+    if text.startswith("mte2"):
+        return "mte2"
+    if text.startswith("mte3"):
+        return "mte3"
+    if text.startswith(("l2@", "l2")):
+        return "l2"
+    if text.startswith(("matrix@", "mte1", "fixpipe")):
+        return "cube"
+    if text.startswith(("vector@", "vreg_", "sreg_", "reg_", "ub_", "scalar_", "pipe_v_", "vbitsort", "aiv")):
+        return "vector"
+    if text.startswith("link") or ":switch_plane" in text:
+        return "link"
+    return "other"
+
+
+def _interval_union_ms(intervals: Sequence[tuple[float, float]]) -> tuple[float, list[tuple[float, float]]]:
+    merged: list[tuple[float, float]] = []
+    for start, end in sorted((float(a), float(b)) for a, b in intervals if float(b) > float(a)):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return sum(end - start for start, end in merged), merged
+
+
+def _critical_path_work(graph_report: Mapping[str, Any], operator_rows: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any] | None:
+    """Longest dependency path over per-operator service work, never over total duration shares."""
+    timeline = [dict(row) for row in graph_report.get("timeline", ()) or ()]
+    if not timeline:
+        return None
+    service = {}
+    for row in operator_rows or ():
+        op = row.get("operator") if isinstance(row.get("operator"), Mapping) else row
+        op_id = str(op.get("op_id") or row.get("op_id") or "")
+        count = max(1, int(row.get("occurrences", 1) or 1))
+        raw_total = float(row.get("total_ms", 0.0) or 0.0)
+        duration = float(row.get("duration_ms", raw_total / count if raw_total else 0.0) or 0.0)
+        if op_id:
+            service[op_id] = duration
+    nodes = {str(row["id"]): row for row in timeline}
+    successors: dict[str, list[str]] = defaultdict(list)
+    waiting = {key: 0 for key in nodes}
+    for key, row in nodes.items():
+        preds = list(dict.fromkeys(str(dep) for dep in row.get("predecessors", ()) if str(dep) in nodes))
+        waiting[key] = len(preds)
+        for dep in preds:
+            successors[dep].append(key)
+    ready = [key for key, count in waiting.items() if count == 0]
+    ends: dict[str, float] = {}
+    parent: dict[str, str | None] = {}
+    isolated_basis, elapsed_fallback, service_matches = False, 0, 0
+    while ready:
+        key = ready.pop()
+        row = nodes[key]
+        preds = list(dict.fromkeys(str(dep) for dep in row.get("predecessors", ()) if str(dep) in nodes))
+        best = max(preds, key=lambda dep: ends[dep], default=None)
+        parent[key] = best
+        raw_isolated = row.get("isolated_ms")
+        op_id = str(row.get("op_id", ""))
+        if raw_isolated is not None:
+            cost, isolated_basis = max(0.0, float(raw_isolated)), True
+            service_matches += 1
+        elif op_id in service:
+            cost, service_matches = max(0.0, service[op_id]), service_matches + 1
+        else:
+            cost, elapsed_fallback = max(0.0, float(row.get("elapsed_ms", 0.0) or 0.0)), elapsed_fallback + 1
+        ends[key] = (ends[best] if best is not None else 0.0) + cost
+        for successor in successors.get(key, ()):
+            waiting[successor] -= 1
+            if waiting[successor] == 0:
+                ready.append(successor)
+    if len(ends) != len(nodes):
+        raise ValueError("graph_attribution_dependency_cycle")
+    leaf = max(ends, key=ends.__getitem__) if ends else None
+    path, cursor = [], leaf
+    while cursor is not None:
+        path.append(cursor)
+        cursor = parent.get(cursor)
+    path.reverse()
+    if isolated_basis:
+        basis = "isolated_costs_with_data_stream_and_collective_dependencies"
+        if elapsed_fallback:
+            basis = "isolated_costs_with_elapsed_fallback_for_unmapped_rows"
+    elif elapsed_fallback:
+        basis = "operator_service_durations_with_elapsed_fallback_for_unmapped_rows" if service_matches else "elapsed_timeline_path_includes_resource_queue"
+    else:
+        basis = "operator_service_durations_with_data_stream_and_collective_dependencies"
+    return {"work_path_ms": ends[leaf] if leaf is not None else 0.0,
+            "operators": path, "basis": basis, "service_matched_nodes": service_matches,
+            "elapsed_fallback_nodes": elapsed_fallback,
+            "interpretation": "dependency_path_over_work_not_a_wall_clock_saving"}
+
+
+def attribute_program(graph_report: Mapping[str, Any] | None, operator_rows: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
+    """Separate isolated work, active presence, per-resource busy, span and work path.
+
+    Ready-to-complete intervals prove an operator is in flight; they do not prove
+    service busy or dependency wait.  Per-resource busy times overlap and are not
+    summed into a total-duration percentage, and no pipe occupancy is inferred
+    from span.
+    """
+    if not graph_report:
+        return {"schema": "mindie-sim.attribution/1", "timeline_available": False,
+                "span_ms": None, "work_ms": None, "busy_ms": None, "wait_ms": None,
+                "resource_service": [], "service_utilization_by_role": {},
+                "critical_path": None,
+                "notes": ["operator_report_without_graph_report_has_no_wall_clock_attribution"]}
+    span = max(0.0, float(graph_report.get("duration_ms", 0.0) or 0.0))
+    timeline = list(graph_report.get("timeline", ()) or ())
+    intervals = [(float(row.get("ready_ms", 0.0) or 0.0), float(row.get("complete_ms", 0.0) or 0.0)) for row in timeline]
+    active_ms, merged = _interval_union_ms(intervals)
+    work_ms, work_occ = None, 0
+    physical = {field: 0.0 for field in ("flops", "vector_ops", "hbm_bytes", "link_bytes")}
+    source_rows = list(operator_rows or ())
+    from_graph = not source_rows and isinstance(graph_report.get("isolated"), Mapping)
+    if from_graph:
+        source_rows = list(graph_report["isolated"].get("operators") or ())
+    if source_rows:
+        work_ms, work_occ = 0.0, 0
+        for row in source_rows:
+            op = row.get("operator") if isinstance(row.get("operator"), Mapping) else row
+            count = max(1, int(row.get("occurrences", 1) or 1))
+            raw_total = float(row.get("total_ms", 0.0) or 0.0)
+            work_ms += raw_total if raw_total else float(row.get("duration_ms", 0.0) or 0.0) * count
+            work_occ += count
+            for field in physical:
+                physical[field] += float(op.get(field, 0.0) or 0.0) * count
+    elif graph_report.get("isolated"):
+        work_ms = float(graph_report["isolated"].get("operator_sum_ms", 0.0) or 0.0)
+        work_occ = int(graph_report.get("operator_occurrences", 0) or 0)
+    resources, by_role = [], {}
+    for raw in graph_report.get("resources", ()) or ():
+        name = str(raw.get("resource", ""))
+        busy = max(0.0, float(raw.get("busy_ms", 0.0) or 0.0))
+        bound = max(0.0, float(raw.get("capacity_bound_ms", 0.0) or 0.0))
+        role = _resource_role(name)
+        item = {"resource": name, "role": role, "unit": raw.get("unit"),
+                "work": float(raw.get("work", 0.0) or 0.0),
+                "capacity_per_ms": float(raw.get("capacity_per_ms", 0.0) or 0.0),
+                "capacity_bound_ms": bound, "busy_ms": busy,
+                "busy_share_of_span": busy / span if span > 0 else None,
+                "idle_ms": max(0.0, span - busy) if timeline else None}
+        resources.append(item)
+        group = by_role.setdefault(role, {"resource_count": 0, "busy_sum_over_resources_ms": 0.0, "busy_max_ms": 0.0,
+                                          "capacity_bound_sum_ms": 0.0, "max_busy_share_of_span": 0.0,
+                                          "busy_sum_interpretation": "sum_over_resources_not_wall_time"})
+        group["resource_count"] += 1
+        group["busy_sum_over_resources_ms"] += busy
+        group["busy_max_ms"] = max(group["busy_max_ms"], busy)
+        group["capacity_bound_sum_ms"] += bound
+        if span > 0:
+            group["max_busy_share_of_span"] = max(group["max_busy_share_of_span"], busy / span)
+    resources.sort(key=lambda row: row["capacity_bound_ms"], reverse=True)
+    utilization = {role: row["max_busy_share_of_span"] for role, row in sorted(by_role.items())}
+    return {
+        "schema": "mindie-sim.attribution/1",
+        "timeline_available": bool(timeline),
+        "boundary": graph_report.get("boundary", "device_graph"),
+        "scope": {"work": "supplied_operator_rows", "active": "graph_timeline_all_evaluated_replicas",
+                  "busy": "per_resource_engine_busy_only", "span": "graph_complete_ms",
+                  "critical_path": "supplied_work_with_timeline_dependencies"},
+        "work_ms": work_ms, "work_occurrences": work_occ,
+        "physical_work": physical if source_rows else None,
+        "work_basis": ("sum_of_operator_service_spans_with_invariant_physical_work" if source_rows and not from_graph else
+                       "graph_isolated_operator_rows" if from_graph else
+                       "graph_isolated_operator_sum" if graph_report.get("isolated") else None),
+        "active_span_ms": active_ms if timeline else None,
+        "active_share_of_span": active_ms / span if timeline and span > 0 else None,
+        "unaccounted_active_gap_ms": max(0.0, span - active_ms) if timeline else None,
+        "busy_ms": None,
+        "busy_basis": "no_whole_graph_service_interval_union_available_per_resource_busy_kept",
+        "service_busy_union_ms": None,
+        "wait_ms": None,
+        "wait_basis": "service_start_end_or_pmu_required_not_inferable_from_ready_complete",
+        "span_ms": span,
+        "complete_ms": float(graph_report.get("complete_ms", span) or 0.0),
+        "active_intervals": len(merged),
+        "resource_service": resources,
+        "service_utilization_by_role": utilization,
+        "by_role": by_role,
+        "critical_path": _critical_path_work(graph_report, operator_rows),
+        "notes": [
+            "work_ms is isolated service work and may exceed span_ms when resources overlap",
+            "active_span_ms is the union of ready-to-complete operator intervals; it proves presence, not service busy",
+            "busy_ms is not published because per-resource Engine busy intervals are not a whole-graph union",
+            "per-resource busy_ms and idle_ms are retained; they are not additive across overlapping resources",
+            "wait_ms is not inferable from ready-to-complete intervals and stays None without service start/end or PMU evidence",
+            "service_utilization_by_role is engine busy/span and is not a nominal MFU/MBU denominator",
+            "mte2, mte3 and l2 are reported as their own roles, never folded into hbm",
+        ],
+    }
+
+
+def prepare_fixed_plan(case: CaseSpec | Mapping[str, Any], *, phase: str = "decode", tokens: int = 1, context: int = 4096, sequences: int = 1, scope: str = "body") -> dict[str, Any]:
+    """Lower a target program once so baseline and counterfactual share one plan."""
+    _validate_geometry(phase, tokens, context, sequences, scope)
+    parsed = parse_case(case)
+    graphs = target_graphs(parsed, phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope)
+    return {"graphs": graphs, "case": parsed, "selection": "baseline_case",
+            "geometry": {"phase": phase, "tokens": tokens, "context": context, "sequences": sequences, "scope": scope}}
+
+
+def decode_query_tokens(case: CaseSpec | Mapping[str, Any], output_budget: int) -> int:
+    """Actual decode query tokens, including the selected draft proposal once."""
+    parsed = parse_case(case)
+    request = RequestSpec(request_id="capacity", prompt_tokens=1,
+                          output_tokens=max(1, int(output_budget)), arrival_ms=0.0)
+    policy = DraftPolicy.for_request(parsed, request)
+    return max(1, 1 + int(policy.proposal))
+
+
+def stage_hbm_bytes(case: CaseSpec) -> list[float]:
+    """Per-stage HBM supply from the actual stage/rank placement, not a global minimum."""
+    p = case.runtime.parallel
+    width, pp = p.tp * p.pcp, max(1, int(p.pp))
+    dies = case.machine.dies
+    result = []
+    for stage in range(pp):
+        stage_dies = [die for replica in range(max(1, int(p.dp)))
+                      for die in dies[(replica * pp + stage) * width:(replica * pp + stage + 1) * width]]
+        result.append(min((float(die.hbm_bytes) for die in stage_dies), default=min(float(d.hbm_bytes) for d in dies)))
+    return result
+
+
+def capacity_feedback(case: CaseSpec | Mapping[str, Any], *, phase: str = "decode", tokens: int = 1, context: int = 4096, sequences: int = 1, scope: str = "body", output_budget: int = 1024, emitted_tokens_per_seq: float | None = None) -> dict[str, Any]:
+    """Report HBM/KV capacity from one shared per-rank window projection.
+
+    The requested candidate's executing window and its complete-service
+    lifecycle both come from :func:`capacity_window`.  Active-window headroom is
+    labelled separately from the complete simultaneous peak; downstream
+    guardrails must use the latter.
+    """
+    _validate_geometry(phase, tokens, context, sequences, scope)
+    if isinstance(output_budget, bool) or not isinstance(output_budget, int) or output_budget < 0:
+        raise ValueError(f"output_budget_must_be_nonnegative_int:{output_budget}")
+    parsed = parse_case(case)
+    current = capacity_window(
+        parsed, phase=phase, context=context, tokens_per_seq=tokens,
+        sequences=sequences, output_budget=output_budget,
+        emitted_tokens_per_seq=emitted_tokens_per_seq)
+    kv_ctx, kv_tok = context, tokens
+    b_sync = _vram_max_sequences_per_dp(parsed, context=kv_ctx, tokens_per_seq=kv_tok, output_budget=output_budget, emitted_tokens_per_seq=emitted_tokens_per_seq, async_scheduling=False, phase=phase)
+    b_async = _vram_max_sequences_per_dp(parsed, context=kv_ctx, tokens_per_seq=kv_tok, output_budget=output_budget, emitted_tokens_per_seq=emitted_tokens_per_seq, async_scheduling=True, phase=phase)
+    b_configured = b_async if parsed.runtime.async_scheduling else b_sync
+    if phase == "prefill":
+        life_ctx = context + tokens
+        decode_q, decode_emit = _resolve_speculative_tokens(
+            parsed, output_budget=output_budget, tokens_per_seq=None,
+            emitted_tokens_per_seq=None)
+        lifecycle = capacity_window(
+            parsed, phase="decode", context=life_ctx, tokens_per_seq=decode_q,
+            sequences=sequences, output_budget=output_budget,
+            emitted_tokens_per_seq=decode_emit)
+        life_sync = _vram_max_sequences_per_dp(parsed, context=life_ctx, tokens_per_seq=decode_q,
+                                                output_budget=output_budget, emitted_tokens_per_seq=decode_emit,
+                                                async_scheduling=False, phase="decode")
+        life_async = _vram_max_sequences_per_dp(parsed, context=life_ctx, tokens_per_seq=decode_q,
+                                                 output_budget=output_budget, emitted_tokens_per_seq=decode_emit,
+                                                 async_scheduling=True, phase="decode")
+        life_configured = life_async if parsed.runtime.async_scheduling else life_sync
+    else:
+        lifecycle = current
+        life_sync, life_async, life_configured = b_sync, b_async, b_configured
+
+    def _legacy_stages(window: Mapping[str, Any]) -> list[dict[str, Any]]:
+        count = max(1, int(window.get("sequences") or 1))
+        rows = []
+        for row in window.get("stages", ()):
+            active = float(row.get("active_kv_bytes", 0.0) or 0.0)
+            peak = float(row.get("peak_bytes", 0.0) or 0.0)
+            external = float(row.get("external_held_bytes", 0.0) or 0.0)
+            rows.append({
+                "stage": int(row["stage"]),
+                "available_bytes": round(float(row.get("supply_bytes", 0.0) or 0.0), 3),
+                "kv_bytes_per_sequence": round(active / count, 3),
+                "headroom_bytes": round(float(row.get("active_headroom_bytes", 0.0) or 0.0), 3),
+                "used_bytes": round(float(row.get("fixed_bytes", 0.0) or 0.0) + external + active, 3),
+                "hbm_bytes_per_die": round(float(row.get("hbm_bytes_per_die", 0.0) or 0.0), 3),
+                "hbm_utilization_ratio": round(float(row.get("hbm_utilization_ratio", 0.0) or 0.0), 9),
+                "workspace_bytes": round(float(row.get("workspace_bytes", 0.0) or 0.0), 3),
+                "external_held_bytes": round(external, 3),
+                "active_kv_bytes": round(active, 3),
+                "retiring_kv_bytes": round(float(row.get("retiring_kv_bytes", 0.0) or 0.0), 3),
+                "peak_bytes": round(peak, 3),
+                "full_headroom_bytes": round(float(row.get("headroom_bytes", 0.0) or 0.0), 3),
+            })
+        return rows
+
+    stages = _legacy_stages(current)
+    life_stages = _legacy_stages(lifecycle)
+    active_headroom = float(current["active_headroom_bytes"])
+    lifecycle_headroom = float(lifecycle["headroom_bytes"])
+    joint_headroom = min(active_headroom, lifecycle_headroom)
+    joint_sync, joint_async = min(b_sync, life_sync), min(b_async, life_async)
+    joint_configured = joint_async if parsed.runtime.async_scheduling else joint_sync
+    hbm_by_stage = [float(row["hbm_bytes_per_die"]) for row in current["stages"]]
+    return {
+        "available_kv_capacity_bytes_per_die": round(min((float(row["supply_bytes"]) for row in current["stages"]), default=0.0), 3),
+        "hbm_bytes_per_die": round(min((float(row["hbm_bytes_per_die"]) for row in current["stages"]), default=0.0), 3),
+        "hbm_bytes_per_stage": [round(value, 3) for value in hbm_by_stage],
+        "weight_bytes_per_die": round(float(current.get("weight_bytes_per_die", 0.0) or 0.0), 3),
+        "workspace_bytes": round(float(current.get("workspace_bytes", 0.0) or 0.0), 3),
+        "kv_bytes_per_sequence": round(max((float(row["active_kv_bytes"]) / max(1, int(current["sequences"])) for row in current["stages"]), default=0.0), 3),
+        "capacity_headroom_bytes": round(active_headroom, 3),
+        "capacity_headroom_basis": "active_window_kv_only_after_workspace_and_fixed_reserve",
+        "hbm_utilization_ratio": round(max((float(row["hbm_utilization_ratio"]) for row in current["stages"]), default=0.0), 9),
+        "b_vram_max_sync": int(b_sync), "b_vram_max_async": int(b_async), "b_vram_max_configured": int(b_configured),
+        "b_vram_max_lifecycle_sync": int(life_sync), "b_vram_max_lifecycle_async": int(life_async),
+        "b_vram_max_joint_sync": int(joint_sync), "b_vram_max_joint_async": int(joint_async),
+        "capacity_by_stage": stages, "capacity_by_stage_lifecycle": life_stages,
+        "lifecycle_kv_bytes_per_sequence": round(max((float(row["active_kv_bytes"]) / max(1, int(lifecycle["sequences"])) for row in lifecycle["stages"]), default=0.0), 3),
+        "lifecycle_capacity_headroom_bytes": round(lifecycle_headroom, 3),
+        "joint_capacity_headroom_bytes": round(joint_headroom, 3),
+        "lifecycle_capacity_window": "complete_output" if phase == "prefill" else "decode_step",
+        "capacity_window": current,
+        "lifecycle_capacity_window_facts": lifecycle,
+        "is_vram_feasible": bool(b_configured >= sequences and active_headroom >= -1e-6),
+        "is_lifecycle_feasible": bool(life_configured >= sequences and lifecycle_headroom >= -1e-6),
+        "is_joint_feasible": bool(joint_configured >= sequences and joint_headroom >= -1e-6),
+    }
+
+
+def evaluate_fixed_plan(case: CaseSpec | Mapping[str, Any], *, plan: Mapping[str, Any] | None = None, phase: str = "decode", tokens: int = 1, context: int = 4096, sequences: int = 1, scope: str = "body",
+                        hbm_bw_scale: float = 1.0, cube_flops_scale: float = 1.0, vector_ops_scale: float = 1.0, link_bw_scale: float = 1.0, hbm_capacity_scale: float = 1.0,
+                        include_submission: bool = False, overlap_async_scheduler: bool = False,
+                        include_capacity: bool = False, output_budget: int = 1024, emitted_tokens_per_seq: float | None = None) -> dict[str, Any]:
+    """Evaluate one already-selected target program, optionally under one hardware/capacity change.
+
+    Baseline and counterfactual callers can prepare the plan once and pass it here;
+    only requested rates/capacity change, while graph work, dispatch, streams and
+    state feedback are re-solved by the ordinary engine. When ``plan`` is supplied
+    its recorded geometry is authoritative.
+    """
+    parsed = parse_case(case)
+    if plan is not None:
+        plan = dict(plan)
+        geometry = dict(plan.get("geometry") or {})
+        phase, tokens, context = geometry.get("phase", phase), geometry.get("tokens", tokens), geometry.get("context", context)
+        sequences, scope = geometry.get("sequences", sequences), geometry.get("scope", scope)
+    else:
+        geometry = {"phase": phase, "tokens": tokens, "context": context, "sequences": sequences, "scope": scope}
+        plan = prepare_fixed_plan(parsed, **geometry)
+    _validate_geometry(phase, tokens, context, sequences, scope)
+    scaled = scale_case_hardware(parsed, hbm_bw_scale=hbm_bw_scale, cube_flops_scale=cube_flops_scale, vector_ops_scale=vector_ops_scale, link_bw_scale=link_bw_scale, hbm_capacity_scale=hbm_capacity_scale)
+    graphs, eff_case, report = _lower_and_run_graph(scaled, phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope, run_graph=True, lowered_graphs=plan["graphs"], include_submission=include_submission, overlap_async_scheduler=overlap_async_scheduler)
+    analysis = analyze_network_efficiency(scaled, phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope, _precomputed_graph=(graphs, eff_case, report))
+    analysis["plan"] = {
+        "mode": "fixed", "selection": plan.get("selection", "baseline_case"),
+        "geometry": geometry, "replicas": list(graphs),
+        "scales": {name: float(value) for name, value in zip(_SCALE_KEYS, (hbm_bw_scale, cube_flops_scale, vector_ops_scale, link_bw_scale, hbm_capacity_scale))},
+        "policy": "same_lowered_program_only_requested_hardware_or_capacity_changes",
+        "include_submission": bool(include_submission), "overlap_async_scheduler": bool(overlap_async_scheduler),
+    }
+    if include_capacity or hbm_capacity_scale != 1.0:
+        analysis["capacity"] = capacity_feedback(scaled, phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope, output_budget=output_budget, emitted_tokens_per_seq=emitted_tokens_per_seq)
+    return analysis
+
+
+def evaluate_resource_counterfactual(case: CaseSpec | Mapping[str, Any], *, resource: str, factor: float, phase: str = "decode", tokens: int = 1, context: int = 4096, sequences: int = 1, scope: str = "body",
+                                     plan: Mapping[str, Any] | None = None, include_submission: bool = False, overlap_async_scheduler: bool = False,
+                                     include_capacity: bool = True, output_budget: int = 1024, emitted_tokens_per_seq: float | None = None) -> dict[str, Any]:
+    """Change one hardware rate or capacity and re-evaluate the same program; never rescale a graph by isolated sums."""
+    resource_name = str(resource or "").strip().lower()
+    if resource_name in {"nominal_rate", "effective_rate", "service_rate", "nominal_multiplier"}:
+        raise ValueError("service_rate_counterfactual_requires_t06_normalized_service_api_not_a_private_price_model")
+    canonical = _RESOURCE_SCALE_ALIASES.get(resource_name)
+    if canonical is None:
+        raise ValueError(f"unsupported_counterfactual_resource:{resource}")
+    _check_pos_float("resource_factor", factor)
+    if plan is not None:
+        plan = dict(plan)
+        geometry = dict(plan.get("geometry") or {"phase": phase, "tokens": tokens, "context": context, "sequences": sequences, "scope": scope})
+    else:
+        geometry = {"phase": phase, "tokens": tokens, "context": context, "sequences": sequences, "scope": scope}
+        plan = prepare_fixed_plan(case, **geometry)
+    common = dict(plan=plan, include_submission=include_submission, overlap_async_scheduler=overlap_async_scheduler, include_capacity=include_capacity, output_budget=output_budget, emitted_tokens_per_seq=emitted_tokens_per_seq, **geometry)
+    base = evaluate_fixed_plan(case, **common)
+    changed = evaluate_fixed_plan(case, **common, **{canonical: factor})
+    work_fields = ("total_flops", "total_vector_ops", "total_hbm_bytes", "total_link_bytes")
+    work = {field: {"baseline": float(base.get(field, 0.0) or 0.0), "counterfactual": float(changed.get(field, 0.0) or 0.0),
+                    "delta_ratio": (float(changed.get(field, 0.0) or 0.0) - float(base.get(field, 0.0) or 0.0)) / max(float(base.get(field, 0.0) or 0.0), 1e-12)}
+            for field in work_fields}
+    work_conserved = all(abs(row["delta_ratio"]) <= 1e-9 for row in work.values())
+    base_by_key, changed_by_key = {}, {}
+    for target, source in ((base_by_key, base), (changed_by_key, changed)):
+        for op in source.get("operators", ()):
+            key = (str(op.get("op_id", "")), int(op.get("stage", 0) or 0), int(op.get("layer", 0) or 0))
+            item = target.setdefault(key, {"op_id": key[0], "family": op.get("family", ""), "recipe": op.get("recipe", ""), "duration_ms": 0.0, "occurrences": 0, "dominant_bound": op.get("dominant_bound")})
+            item["duration_ms"] += float(op.get("duration_ms", 0.0) or 0.0)
+            item["occurrences"] += int(op.get("occurrences", 1) or 1)
+    changed_ops = []
+    for key, item in changed_by_key.items():
+        old = base_by_key.get(key)
+        if old is None or abs(item["duration_ms"] - old["duration_ms"]) <= 1e-12:
+            continue
+        changed_ops.append({**item, "baseline_duration_ms": old["duration_ms"], "delta_ms": item["duration_ms"] - old["duration_ms"],
+                            "delta_pct": (item["duration_ms"] - old["duration_ms"]) / max(old["duration_ms"], 1e-12) * 100.0})
+    changed_ops.sort(key=lambda row: -abs(row["delta_ms"]))
+    def _argmax_role(analysis: Mapping[str, Any]) -> str | None:
+        utilization = dict((analysis.get("attribution") or {}).get("service_utilization_by_role") or {})
+        return max(utilization, key=utilization.__getitem__) if utilization else None
+    base_step, changed_step = float(base.get("graph_duration_ms", 0.0) or 0.0), float(changed.get("graph_duration_ms", 0.0) or 0.0)
+    graphs = plan.get("graphs")
+    replicas = sorted(graphs) if isinstance(graphs, Mapping) else list(range(len(graphs))) if isinstance(graphs, (tuple, list)) else []
+    return {
+        "schema": "mindie-sim.resource-counterfactual/1",
+        "plan": {"mode": "fixed", "selection": plan.get("selection", "baseline_case"), "geometry": geometry,
+                 "replicas": replicas, "policy": "same_lowered_program_only_requested_hardware_or_capacity_changes"},
+        "intervention": {"resource": str(resource), "scale_key": canonical, "factor": float(factor),
+                         "kind": "declared_hardware_peak_or_capacity_multiplier",
+                         "semantics": "hardware_rate_or_capacity_multiplier_applied_before_common_program_evaluation",
+                         "calibrated_service_boundary": "effective_or_nominal_service_rate_changes_are_owned_by_the_T06_normalized_service_api"},
+        "baseline": {key: base.get(key) for key in ("schema", "geometry", "graph_duration_ms", "operator_sum_ms", "network_cube_mfu", "network_vec_mfu", "network_mbu", "network_link_util", "network_roofline_efficiency", "attribution", "capacity", "plan", "legacy_service_regime_diagnostics")},
+        "counterfactual": {key: changed.get(key) for key in ("schema", "geometry", "graph_duration_ms", "operator_sum_ms", "network_cube_mfu", "network_vec_mfu", "network_mbu", "network_link_util", "network_roofline_efficiency", "attribution", "capacity", "plan", "legacy_service_regime_diagnostics")},
+        "delta": {"step_ms": changed_step - base_step, "step_pct": (changed_step - base_step) / max(base_step, 1e-12) * 100.0,
+                  "operator_sum_ms": float(changed.get("operator_sum_ms", 0.0) or 0.0) - float(base.get("operator_sum_ms", 0.0) or 0.0),
+                  "dominant_bottleneck": {"baseline": _argmax_role(base), "counterfactual": _argmax_role(changed)}},
+        "work_conservation": {"conserved": work_conserved, "fields": work,
+                              "scope": "pure_rate_or_capacity_control_with_unchanged_access_and_state",
+                              "interpretation": ("only pure rate/capacity controls with unchanged access and state require issued work to stay equal; "
+                                                 "capacity-induced cache hits, eviction or state traffic must be re-evaluated and reported separately")},
+        "changed_operators": changed_ops[:12],
+        "capacity_feedback": {"baseline": base.get("capacity"), "counterfactual": changed.get("capacity")},
+        "evaluation_consistency": {"same_plan": True, "same_common_evaluator": True, "baseline_step_ms": base_step},
+    }
 
 
 def analyze_network_efficiency(
@@ -357,13 +834,22 @@ def analyze_network_efficiency(
         bound_g[x["dominant_bound"]].append(x)
         kind_g[x["operator_kind"]].append(x)
 
+    attribution = attribute_program(graph_report, analyzed_ops)
+    nominal = {"cube_mfu": tot_cube_id / safe_graph_ms, "vec_mfu": tot_vec_id / safe_graph_ms,
+               "mbu": tot_hbm_id / safe_graph_ms, "link_util": tot_link_id / safe_graph_ms,
+               "roofline_efficiency": tot_roof_id / safe_graph_ms,
+               "denominator": "graph_span_ms", "semantics": "nominal_peak_relative_work_over_span"}
     return {
         "schema": "mindie-sim.efficiency/1", "geometry": {"phase": phase, "tokens": tokens, "context": context, "sequences": sequences, "scope": scope},
         "total_flops": tot_flops, "total_vector_ops": tot_vec_ops, "total_hbm_bytes": tot_hbm_b, "total_link_bytes": tot_link_b,
         "total_cube_ideal_ms": tot_cube_id, "total_vec_ideal_ms": tot_vec_id, "total_hbm_ideal_ms": tot_hbm_id, "total_link_ideal_ms": tot_link_id,
         "total_roofline_ideal_ms": tot_roof_id, "operator_serial_roofline_ideal_ms": serial_roof_id, "operator_sum_ms": operator_sum_ms, "graph_duration_ms": graph_duration_ms,
-        "network_cube_mfu": tot_cube_id / safe_graph_ms, "network_vec_mfu": tot_vec_id / safe_graph_ms, "network_mbu": tot_hbm_id / safe_graph_ms,
-        "network_link_util": tot_link_id / safe_graph_ms, "network_roofline_efficiency": tot_roof_id / safe_graph_ms,
+        "network_cube_mfu": nominal["cube_mfu"], "network_vec_mfu": nominal["vec_mfu"], "network_mbu": nominal["mbu"],
+        "network_link_util": nominal["link_util"], "network_roofline_efficiency": nominal["roofline_efficiency"],
+        "nominal": nominal, "effective_service_utilization": dict(attribution.get("service_utilization_by_role") or {}),
+        "attribution": attribution,
+        **({"legacy_service_regime_diagnostics": diagnostics}
+           if (diagnostics := legacy_service_regime_diagnostics(parsed)) is not None else {}),
         "operator_serial_roofline_efficiency": serial_roof_id / max(operator_sum_ms, 1e-12), "network_cv_overlap": network_cv_overlap,
         "breakdown_by_family": sorted([{"family": f, "recipe": r, **_agg(items)} for (f, r), items in fam_g.items()], key=lambda r: -r["total_ms"]),
         "breakdown_by_bound": {b: _agg(bound_g.get(b, ())) for b in _BOUNDS}, "breakdown_by_kind": {k: _agg(kind_g.get(k, ())) for k in _KINDS}, "operators": analyzed_ops,
@@ -394,27 +880,35 @@ def evaluate_target_efficiency(
             _validate_efficiency_param(k, v)
         t_fixed = float(ovr["fixed_launch_us"]) / 1000.0 if "fixed_launch_us" in ovr else float(fixed_launch_us) / 1000.0 if fixed_launch_us is not None else float(op["fixed_ms"])
         t_min = float(op.get("minimum_ms", 0.0) or 0.0)
-        t_link_req = (op["t_link_ideal_ms"] / float(eta_link)) if eta_link is not None else (op["duration_ms"] if op["link_bytes"] > 0 and op["hbm_bytes"] == 0 and op["flops"] == 0 and op["vector_ops"] == 0 else op["t_link_ideal_ms"] / 0.75)
-        inclusive_pipe_ms = max(op["t_hbm_ideal_ms"] / eta_hbm, op["t_cube_ideal_ms"] / eta_cube, op["t_vec_ideal_ms"] / eta_vec, t_link_req)
+        t_link_req = (op["t_link_ideal_ms"] / float(eta_link)) if eta_link is not None else float(op["t_link_ideal_ms"])
+        pipe_req = {"hbm": (op["t_hbm_ideal_ms"] / eta_hbm) if op["hbm_bytes"] > 0 else 0.0,
+                    "cube": (op["t_cube_ideal_ms"] / eta_cube) if op["flops"] > 0 else 0.0,
+                    "vec": (op["t_vec_ideal_ms"] / eta_vec) if op["vector_ops"] > 0 else 0.0,
+                    "link": t_link_req if op["link_bytes"] > 0 else 0.0}
+        inclusive_pipe_ms = max(pipe_req.values(), default=0.0)
         raw_t = max(t_min, t_fixed + op["roofline_ideal_ms"], inclusive_pipe_ms) if op["roofline_ideal_ms"] > 0 else max(t_min, op["duration_ms"])
         eval_ms = max(t_min, min(op["duration_ms"], raw_t)) if mode == "clamp_to_target" else raw_t
         cur_tot, tgt_tot, safe_eval, safe_svc = op["total_ms"], eval_ms * op["occurrences"], max(eval_ms, 1e-12), max(eval_ms - t_fixed, 1e-12)
         evaluated_ops.append({
             **op, "actual_mbu": op["mbu"], "actual_cube_mfu": op["cube_mfu"], "actual_vec_mfu": op["vec_mfu"],
             "current_duration_ms": op["duration_ms"], "raw_target_duration_ms": raw_t, "target_duration_ms": eval_ms,
-            "current_total_ms": cur_tot, "target_total_ms": tgt_tot, "gap_ms": cur_tot - tgt_tot,
+            "current_total_ms": cur_tot, "target_total_ms": tgt_tot, "gap_ms": cur_tot - tgt_tot, "target_pipe_requirement_ms": pipe_req,
             "target_mbu": (op["t_hbm_ideal_ms"] / safe_eval) if op["hbm_bytes"] > 0 else None, "service_only_target_mbu": (op["t_hbm_ideal_ms"] / safe_svc) if op["hbm_bytes"] > 0 else None,
             "target_cube_mfu": (op["t_cube_ideal_ms"] / safe_eval) if op["flops"] > 0 else None, "target_vec_mfu": (op["t_vec_ideal_ms"] / safe_eval) if op["vector_ops"] > 0 else None,
         })
 
     cur_sum, tgt_sum, cur_step = base["operator_sum_ms"], sum(x["target_total_ms"] for x in evaluated_ops), base["graph_duration_ms"]
-    tgt_step = cur_step * ((tgt_sum / cur_sum) if cur_sum > 0 else 1.0)
+    pipe_totals = {pipe: sum(x["target_pipe_requirement_ms"][pipe] * x["occurrences"] for x in evaluated_ops) for pipe in ("hbm", "cube", "vec", "link")}
+    pipe_bound = max(pipe_totals.values(), default=0.0)
+    tgt_step = min(cur_step, pipe_bound) if pipe_bound > 0.0 else cur_step
     saved_ms, safe_tgt = cur_step - tgt_step, max(tgt_step, 1e-12)
     speedup = cur_step / safe_tgt
     return {
         "mode": mode, "targets": {"target_mbu": target_mbu, "target_cube_mfu": target_cube_mfu, "target_vec_mfu": target_vec_mfu, "target_link_util": target_link_util, "fixed_launch_us": fixed_launch_us},
-        "current_step_duration_ms": cur_step, "target_step_duration_ms": tgt_step, "current_operator_sum_ms": cur_sum, "target_operator_sum_ms": tgt_sum,
-        "saved_ms": saved_ms, "speedup_ratio": speedup, "step_speedup": speedup, "speedup_pct": (speedup - 1.0) * 100.0,
+        "current_step_duration_ms": cur_step, "target_step_duration_ms": tgt_step, "target_step_basis": "per_pipe_work_lower_bound_not_rescheduled_graph",
+        "target_step_is_lower_bound": True, "target_pipe_totals_ms": pipe_totals,
+        "current_operator_sum_ms": cur_sum, "target_operator_sum_ms": tgt_sum,
+        "saved_ms": saved_ms, "speedup_ratio": speedup, "step_speedup": speedup, "step_speedup_is_bound": True, "speedup_pct": (speedup - 1.0) * 100.0,
         "latency_reduction_pct": (saved_ms / max(cur_step, 1e-12)) * 100.0, "current_network_mbu": base["network_mbu"], "target_network_mbu": base["total_hbm_ideal_ms"] / safe_tgt,
         "current_network_cube_mfu": base["network_cube_mfu"], "target_network_cube_mfu": base["total_cube_ideal_ms"] / safe_tgt,
         "current_network_vec_mfu": base["network_vec_mfu"], "target_network_vec_mfu": base["total_vec_ideal_ms"] / safe_tgt,
@@ -427,24 +921,29 @@ def _operator_fit_signature(op: Mapping[str, Any]) -> str:
     return json.dumps({"op_id": op.get("op_id", ""), "family": op.get("family", ""), "recipe": op.get("recipe", ""), "dtype": op.get("dtype", ""), "local_shape": list(op.get("local_shape") or ()), "flops": round(float(op.get("flops", 0.0)), 6), "vector_ops": round(float(op.get("vector_ops", 0.0)), 6), "hbm_bytes": round(float(op.get("hbm_bytes", 0.0)), 6), "link_bytes": round(float(op.get("link_bytes", 0.0)), 6)}, sort_keys=True, separators=(",", ":"))
 
 
-def _decompose_operator_pipes(op: Mapping[str, Any]) -> dict[str, float]:
-    """Decompose an operator's baseline variable duration across active physical pipes."""
+def _decompose_operator_pipes(op: Mapping[str, Any]) -> dict[str, Any]:
+    """Export per-pipe work/nominal bounds without identifying a bottleneck from total duration."""
     t_base, t_min = float(op["duration_ms"]), float(op.get("minimum_ms", 0.0) or 0.0)
     t_fixed = min(max(float(op["fixed_ms"]), t_min), t_base)
-    delta_t, ideals = max(0.0, t_base - t_fixed), {"hbm": float(op["t_hbm_ideal_ms"]), "cube": float(op["t_cube_ideal_ms"]), "vec": float(op["t_vec_ideal_ms"]), "link": float(op["t_link_ideal_ms"])}
-    max_id = max(ideals.values())
-    if max_id <= 0.0 or delta_t <= 0.0:
-        return {"fixed_ms": t_base, "minimum_ms": t_min, "t_hbm_eff_ms": 0.0, "t_cube_eff_ms": 0.0, "t_vec_eff_ms": 0.0, "t_link_eff_ms": 0.0, "effective_mbu": 0.0, "effective_cube_mfu": 0.0, "effective_vec_mfu": 0.0, "effective_link_util": 0.0}
-    dom, eta_dom, def_etas, eff_t, eff_e = max(ideals, key=ideals.__getitem__), _clamp(max_id / delta_t, 1e-4, 1.0), {"hbm": 0.80, "cube": 0.75, "vec": 0.65, "link": 0.75}, {}, {}
-    for p, t_id in ideals.items():
-        if t_id <= 0.0:
-            eff_t[p], eff_e[p] = 0.0, 0.0
-        elif p == dom:
-            eff_t[p], eff_e[p] = delta_t, eta_dom
-        else:
-            eff_t[p] = min(delta_t, max(t_id, t_id / _clamp(max(eta_dom, def_etas[p]), 1e-4, 1.0)))
-            eff_e[p] = _clamp(t_id / max(eff_t[p], 1e-12), 1e-4, 1.0)
-    return {"fixed_ms": t_fixed, "minimum_ms": t_min, "t_hbm_eff_ms": eff_t["hbm"], "t_cube_eff_ms": eff_t["cube"], "t_vec_eff_ms": eff_t["vec"], "t_link_eff_ms": eff_t["link"], "effective_mbu": eff_e["hbm"], "effective_cube_mfu": eff_e["cube"], "effective_vec_mfu": eff_e["vec"], "effective_link_util": eff_e["link"]}
+    service_ms = max(0.0, t_base - t_fixed)
+    ideals = {"hbm": float(op["t_hbm_ideal_ms"]), "cube": float(op["t_cube_ideal_ms"]),
+              "vec": float(op["t_vec_ideal_ms"]), "link": float(op["t_link_ideal_ms"])}
+    active = {pipe: value for pipe, value in ideals.items() if value > 0.0}
+    nominal_lower = {pipe: (value / service_ms if service_ms > 0.0 else None) for pipe, value in ideals.items()}
+    return {
+        "fixed_ms": t_fixed, "minimum_ms": t_min, "service_ms": service_ms,
+        "work_ideal_ms": ideals, "roofline_ideal_ms": max(active.values(), default=0.0),
+        "nominal_work_lower_bound_utilization": nominal_lower,
+        "candidate_pipes": sorted(active),
+        "bottleneck_pipe": None,
+        "bottleneck_identified": False,
+        "bottleneck_evidence": None,
+        "identification": "total_duration_does_not_identify_pipe_bottleneck",
+        "unidentified_pipes": sorted(active),
+        "t_hbm_eff_ms": None, "t_cube_eff_ms": None, "t_vec_eff_ms": None, "t_link_eff_ms": None,
+        "effective_mbu": None, "effective_cube_mfu": None,
+        "effective_vec_mfu": None, "effective_link_util": None,
+    }
 
 
 def fit_case_roofline_regimes(case: CaseSpec | Mapping[str, Any], *, phase: str = "decode", tokens: int = 1, context: int = 4096, sequences: int = 1, scope: str = "body", observed_durations_ms: Mapping[str, float] | None = None, baseline_analysis: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -456,8 +955,23 @@ def fit_case_roofline_regimes(case: CaseSpec | Mapping[str, Any], *, phase: str 
         by_key[sig_key] = dec
         by_recipe[f"{op['family']}:{op['recipe']}"].append(dec)
         fitted_ops.append({"signature_key": sig_key, "op_id": op["op_id"], "family": op["family"], "recipe": op["recipe"], "operator_kind": op["operator_kind"], "dominant_bound": op["dominant_bound"], "occurrences": op["occurrences"], "duration_ms": op["duration_ms"], "fixed_us": dec["fixed_ms"] * 1000.0, **dec})
-    summaries = [{"family": rk.split(":", 1)[0], "recipe": rk.split(":", 1)[1], "fixed_us": sum(x["fixed_ms"] for x in items) / len(items) * 1000.0, "effective_mbu": max(x["effective_mbu"] for x in items), "effective_cube_mfu": max(x["effective_cube_mfu"] for x in items), "effective_vec_mfu": max(x["effective_vec_mfu"] for x in items), "effective_link_util": max(x["effective_link_util"] for x in items)} for rk, items in sorted(by_recipe.items())]
-    return {"schema": "mindie-sim.roofline-fit/1", "geometry": base["geometry"], "fitted_regimes": summaries, "operators": fitted_ops, "by_key": by_key}
+    summaries = []
+    for rk, items in sorted(by_recipe.items()):
+        summaries.append({
+            "family": rk.split(":", 1)[0], "recipe": rk.split(":", 1)[1],
+            "fixed_us": sum(x["fixed_ms"] for x in items) / len(items) * 1000.0,
+            "candidate_pipes": sorted({pipe for x in items for pipe in x["candidate_pipes"]}),
+            "nominal_work_lower_bound_utilization": {
+                pipe: max((x["nominal_work_lower_bound_utilization"].get(pipe) or 0.0) for x in items)
+                for pipe in ("hbm", "cube", "vec", "link")
+            },
+            "bottleneck_pipe": None, "bottleneck_identified": False,
+            "identification": "total_duration_does_not_identify_pipe_bottleneck",
+            "effective_mbu": None, "effective_cube_mfu": None,
+            "effective_vec_mfu": None, "effective_link_util": None,
+        })
+    return {"schema": "mindie-sim.roofline-fit/1", "geometry": base["geometry"], "fitted_regimes": summaries, "operators": fitted_ops, "by_key": by_key,
+            "identification_scope": "total_duration_exports_nominal_work_bounds_but_does_not_identify_pipe_bottleneck"}
 
 
 def fit_efficiency_targets(case: CaseSpec | Mapping[str, Any], **kwargs: Any) -> dict[str, Any]:
@@ -466,38 +980,6 @@ def fit_efficiency_targets(case: CaseSpec | Mapping[str, Any], **kwargs: Any) ->
     return {**evaluate_target_efficiency(case, baseline_analysis=base, **kwargs), "baseline_analysis": base, "fitted_roofline_regimes": fit_case_roofline_regimes(case, baseline_analysis=base)["fitted_regimes"]}
 
 
-def _scale_service_regimes(regimes: Sequence[Mapping[str, Any]], *, mode_to_role: Mapping[str, str], hbm_bw_scale: float, cube_flops_scale: float, vector_ops_scale: float, link_bw_scale: float) -> list[dict[str, Any]]:
-    """Scale regime rate guards and explicitly work-parameterized response terms."""
-    kw, scaled = dict(hbm_bw_scale=hbm_bw_scale, cube_flops_scale=cube_flops_scale, vector_ops_scale=vector_ops_scale, link_bw_scale=link_bw_scale), []
-    for raw in regimes:
-        rule = deepcopy(dict(raw))
-        match = rule.get("match", {})
-        for k in list(match.keys()):
-            if k.startswith("physical_rates.resources."):
-                match[k] = float(match[k]) * _role_scale_factor(k.split(".")[-1], **kw)
-            elif k.startswith("physical_rates.compute_peaks."):
-                match[k] = float(match[k]) * cube_flops_scale
-            elif k.startswith("physical_rates.service_modes.") and isinstance(match[k], (list, tuple)) and len(match[k]) == 2:
-                m_name = k.split(".")[-1]
-                match[k] = [match[k][0], float(match[k][1]) * _role_scale_factor(str(match[k][0] or mode_to_role.get(m_name, m_name)), **kw)]
-            elif k == "transport" and isinstance(match[k], Mapping):
-                for lnk in match[k].get("links", ()):
-                    for lk in ("capacity_bytes_per_ms", "switch_capacity_bytes_per_ms"):
-                        if lnk.get(lk) is not None:
-                            lnk[lk] = float(lnk[lk]) * link_bw_scale
-        resp, coords = rule.get("response", {}), rule.get("coordinates", {})
-        if resp.get("kind", "affine") == "affine" and resp.get("terms"):
-            for term in resp["terms"]:
-                c_path = str((coords.get(term.get("coordinate")) or {}).get("path", "")) if not term.get("scale_with") else ""
-                if c_path.startswith("work."):
-                    term["us_per_unit"] = float(term["us_per_unit"]) / _role_scale_factor(c_path.split(".", 1)[1], **kw)
-        elif resp.get("kind") == "piecewise_linear" and "knots" in resp:
-            c_path = str((coords.get(resp.get("coordinate")) or {}).get("path", ""))
-            if c_path.startswith("work."):
-                sf = _role_scale_factor(c_path.split(".", 1)[1], **kw)
-                resp["knots"] = [[x, float(y) / sf] for x, y in resp["knots"]]
-        scaled.append(rule)
-    return scaled
 
 
 def scale_case_hardware(case: CaseSpec | Mapping[str, Any], *, hbm_bw_scale: float = 1.0, cube_flops_scale: float = 1.0, vector_ops_scale: float = 1.0, link_bw_scale: float = 1.0, hbm_capacity_scale: float = 1.0, baseline_analysis: Mapping[str, Any] | None = None) -> CaseSpec:
@@ -508,7 +990,8 @@ def scale_case_hardware(case: CaseSpec | Mapping[str, Any], *, hbm_bw_scale: flo
     if (hbm_bw_scale, cube_flops_scale, vector_ops_scale, link_bw_scale, hbm_capacity_scale) == (1.0, 1.0, 1.0, 1.0, 1.0):
         return parsed
     kw = dict(hbm_bw_scale=hbm_bw_scale, cube_flops_scale=cube_flops_scale, vector_ops_scale=vector_ops_scale, link_bw_scale=link_bw_scale)
-    mode_to_role, machine_dict = {m_name: m_role for die in parsed.machine.dies for m_name, (m_role, _) in die.service_modes}, deepcopy(parsed.machine.to_dict())
+    mode_to_role = {m_name: m_role for die in parsed.machine.dies for m_name, (m_role, _) in die.service_modes}
+    machine_dict = deepcopy(parsed.machine.to_dict())
     for die, dev_dict in zip(parsed.machine.dies, machine_dict["devices"]):
         ins_map = dev_dict.get("compute_arch", {}).get("instruction_services", {})
         svc_role = {sn: (ss["scale_with"]["resource"] if isinstance(ss.get("scale_with"), Mapping) else str(ss.get("resource") or ss.get("owner_axis") or sn)) for sn, ss in ins_map.items()}
@@ -532,51 +1015,240 @@ def scale_case_hardware(case: CaseSpec | Mapping[str, Any], *, hbm_bw_scale: flo
             if lnk.get(lk) is not None:
                 lnk[lk] = float(lnk[lk]) * link_bw_scale
     new_kernels = deepcopy(parsed.runtime.kernels)
-    if "service_regimes" in new_kernels:
-        new_kernels["service_regimes"] = _scale_service_regimes(new_kernels["service_regimes"], mode_to_role=mode_to_role, **kw)
-    return replace(parsed, machine=Hardware.from_mapping(machine_dict), runtime=replace(parsed.runtime, kernels=new_kernels))
+    legacy_rules = list(new_kernels.get("service_regimes", ()) or ())
+    metadata = dict(parsed.runtime.metadata)
+    if legacy_rules:
+        metadata["legacy_service_regime_diagnostics"] = {
+            "production_prediction": False, "scaled": False,
+            "source": "runtime.kernels.service_regimes",
+            "rules": deepcopy(legacy_rules),
+        }
+    return replace(parsed, machine=Hardware.from_mapping(machine_dict),
+                   runtime=replace(parsed.runtime, kernels=new_kernels,
+                                   metadata=tuple(sorted(metadata.items()))))
+
+
+def _stage_rank_capacity_facts(memory: Memory) -> list[dict[str, Any]]:
+    """Read the T08 per-rank supply from ``rank_capacity_plans``/``to_dict``.
+
+    ``headroom_bytes`` is the AllocationPlan supply after resident weights,
+    workspace, temporary representation, reserves and any live selected/shared/
+    grant allocations.  It is therefore the same bound the T08 admission ledger
+    checks, not a second private allocator.
+    """
+    case, p = memory.case, memory.case.runtime.parallel
+    dies, width = case.machine.dies, max(1, int(p.tp) * int(p.pcp))
+    rows: list[dict[str, Any]] = []
+    for replica in range(int(p.dp)):
+        physical = memory.physical_usage(replica)["hbm_bytes_per_stage_rank"]
+        for stage in range(int(p.pp)):
+            for rank, plan in enumerate(memory.rank_capacity_plans(
+                    replica, stage, include_cache=False)):
+                report = plan.to_dict()
+                allocations = {str(item["name"]): float(item["bytes"])
+                               for item in report.get("allocations", ())}
+                index = (replica * int(p.pp) + stage) * width + rank
+                in_plan = (allocations.get("selected_plan", 0.0)
+                           + allocations.get("shared_pages", 0.0)
+                           + allocations.get("grants", 0.0))
+                occupied = float(physical[stage][rank]) if rank < len(physical[stage]) else 0.0
+                external_held = max(0.0, occupied - in_plan)
+                rows.append({
+                    "replica": replica, "stage": stage, "rank": rank,
+                    "basis": str(report.get("basis", "per_rank_stage_physical_allocations")),
+                    "capacity_bytes": float(report.get("capacity_bytes") or 0.0),
+                    "fixed_bytes": float(report.get("peak_bytes") or 0.0),
+                    "external_held_bytes": round(external_held, 3),
+                    "supply_bytes": round(float(report.get("headroom_bytes") or 0.0)
+                                          - external_held, 3),
+                    "workspace_bytes": allocations.get("activation_workspace", 0.0),
+                    "fixed_allocations": allocations,
+                    "hbm_bytes_per_die": (float(dies[index].hbm_bytes)
+                                          if index < len(dies) else 0.0),
+                })
+    return rows
+
+
+def capacity_window(
+    case: CaseSpec | Mapping[str, Any], *, phase: str = "decode", context: int = 4096,
+    tokens_per_seq: int = 1, sequences: int = 1, output_budget: int = 1024,
+    emitted_tokens_per_seq: float | None = None, async_scheduling: bool | None = None,
+    hbm_capacity_scale: float = 1.0, memory: Memory | None = None,
+) -> dict[str, Any]:
+    """Project one candidate B onto T08's per-rank supply and the real KV windows.
+
+    The returned record binds the stage context/query/emitted facts used by the
+    latency, SLA, capacity, counterfactual, advise, guardrail, topology and PD
+    consumers.  ``supply_bytes`` is already net of weights, workspace and fixed
+    reserve; ``active_kv_bytes`` is the executing window, ``retiring_kv_bytes``
+    the delayed-release hold, and ``peak_bytes`` the largest simultaneous
+    occupancy.  ``active_headroom_bytes`` is retained only as an explicitly
+    labelled active-window value, never as the complete-service headroom.
+    """
+    if phase not in {"decode", "prefill"}:
+        raise ValueError(f"capacity_window_phase_invalid:{phase}")
+    if isinstance(context, bool) or not isinstance(context, int) or context < 0:
+        raise ValueError(f"capacity_window_context_invalid:{context}")
+    if isinstance(tokens_per_seq, bool) or not isinstance(tokens_per_seq, int) or tokens_per_seq < 1:
+        raise ValueError(f"capacity_window_tokens_per_seq_invalid:{tokens_per_seq}")
+    if isinstance(sequences, bool) or not isinstance(sequences, int) or sequences < 1:
+        raise ValueError(f"capacity_window_sequences_invalid:{sequences}")
+    if isinstance(output_budget, bool) or not isinstance(output_budget, int) or output_budget < 0:
+        raise ValueError(f"capacity_window_output_budget_invalid:{output_budget}")
+    base_case = (replace(case, runtime=replace(case.runtime, async_scheduling=bool(async_scheduling)))
+                 if async_scheduling is not None else case)
+    if not isinstance(base_case, CaseSpec):
+        base_case = parse_case(base_case)
+    scaled = (scale_case_hardware(base_case, hbm_capacity_scale=hbm_capacity_scale)
+              if hbm_capacity_scale != 1.0 else base_case)
+    q_tokens, b = max(1, int(tokens_per_seq)), int(sequences)
+    workspace_tokens = max(1, b * q_tokens)
+    ledger = memory if memory is not None else Memory(scaled, workspace_tokens=workspace_tokens)
+    if memory is not None and int(memory.case.runtime.parallel.pp) != int(scaled.runtime.parallel.pp):
+        raise ValueError("capacity_window_ledger_stage_mismatch")
+    prefill = phase == "prefill"
+    output_eff = 0 if prefill else max(0, int(output_budget))
+    if prefill:
+        emit_tokens = float(q_tokens)
+        delayed_steps = 0
+        lookahead_tokens = 0
+        steps_per_wave = 1
+        retiring_waves = 0
+        staggered_delayed_b = 0
+        wave_delayed_b = 0
+        active_tokens = context + q_tokens
+        retiring_tokens = active_tokens
+        wave_tokens = active_tokens
+    else:
+        emit_tokens = (float(q_tokens) if emitted_tokens_per_seq is None
+                       else max(1e-6, float(emitted_tokens_per_seq)))
+        delayed_steps = max(0, int(ledger.async_delayed_release_steps))
+        lookahead_tokens = max(0, int(ledger.async_in_flight_lookahead_steps)) * q_tokens
+        steps_per_wave = max(1, math.ceil(max(1, output_eff) / emit_tokens))
+        retiring_waves = (max(1, math.ceil(delayed_steps / steps_per_wave))
+                          if delayed_steps > 0 else 0)
+        active_tokens = max(1, context + max(q_tokens, output_eff) + lookahead_tokens)
+        retiring_tokens = max(1, context + max(q_tokens, output_eff))
+        wave_tokens = max(1, context + min(
+            max(q_tokens, output_eff), max(1, delayed_steps) * q_tokens) + lookahead_tokens)
+        staggered_delayed_b = 0
+        wave_delayed_b = 0
+        if b >= 2 and delayed_steps > 0 and output_eff > 0:
+            staggered_delayed_b = max(1, math.ceil(b * delayed_steps / steps_per_wave))
+            wave_delayed_b = retiring_waves * b
+    kv_active = [float(value) for value in ledger.cache_bytes(active_tokens, padded=True)]
+    kv_retiring = ([float(value) for value in ledger.cache_bytes(retiring_tokens, padded=True)]
+                   if delayed_steps > 0 else [0.0] * len(kv_active))
+    kv_wave = ([float(value) for value in ledger.cache_bytes(wave_tokens, padded=True)]
+               if delayed_steps > 0 else list(kv_active))
+    rows = _stage_rank_capacity_facts(ledger)
+    for row in rows:
+        stage = int(row["stage"])
+        active = b * kv_active[stage]
+        retiring = staggered_delayed_b * kv_retiring[stage]
+        batch_wave = b * kv_wave[stage]
+        wave_retiring = wave_delayed_b * kv_retiring[stage]
+        peak = max(active + retiring, batch_wave + wave_retiring)
+        used = float(row["fixed_bytes"]) + float(row["external_held_bytes"]) + peak
+        row.update({
+            "active_kv_bytes": round(active, 3),
+            "retiring_kv_bytes": round(retiring, 3),
+            "batch_wave_kv_bytes": round(batch_wave, 3),
+            "wave_retiring_kv_bytes": round(wave_retiring, 3),
+            "peak_kv_bytes": round(peak, 3),
+            "headroom_bytes": round(float(row["supply_bytes"]) - peak, 3),
+            "active_headroom_bytes": round(float(row["supply_bytes"]) - active, 3),
+            "used_bytes": round(used, 3),
+            "hbm_utilization_ratio": round(max(0.0, min(1.0, (
+                used) / max(float(row["hbm_bytes_per_die"]), 1e-12))), 9),
+        })
+    stages: list[dict[str, Any]] = []
+    for stage_index in range(int(scaled.runtime.parallel.pp)):
+        stage_rows = [row for row in rows if int(row["stage"]) == stage_index]
+        if not stage_rows:
+            continue
+        active = max(float(row["active_kv_bytes"]) for row in stage_rows)
+        retiring = max(float(row["retiring_kv_bytes"]) for row in stage_rows)
+        batch_wave = max(float(row["batch_wave_kv_bytes"]) for row in stage_rows)
+        wave_retiring = max(float(row["wave_retiring_kv_bytes"]) for row in stage_rows)
+        peak = max(float(row["peak_kv_bytes"]) for row in stage_rows)
+        supply = min(float(row["supply_bytes"]) for row in stage_rows)
+        headroom = min(float(row["headroom_bytes"]) for row in stage_rows)
+        stages.append({
+            "stage": stage_index,
+            "supply_bytes": round(supply, 3),
+            "capacity_bytes": round(max(float(row["capacity_bytes"]) for row in stage_rows), 3),
+            "fixed_bytes": round(max(float(row["fixed_bytes"]) for row in stage_rows), 3),
+            "external_held_bytes": round(max(float(row["external_held_bytes"]) for row in stage_rows), 3),
+            "workspace_bytes": round(max(float(row["workspace_bytes"]) for row in stage_rows), 3),
+            "active_kv_bytes": round(active, 3),
+            "retiring_kv_bytes": round(retiring, 3),
+            "batch_wave_kv_bytes": round(batch_wave, 3),
+            "wave_retiring_kv_bytes": round(wave_retiring, 3),
+            "peak_bytes": round(peak, 3),
+            "used_bytes": round(max(float(row["used_bytes"]) for row in stage_rows), 3),
+            "headroom_bytes": round(headroom, 3),
+            "active_headroom_bytes": round(min(float(row["active_headroom_bytes"]) for row in stage_rows), 3),
+            "hbm_bytes_per_die": round(min(float(row["hbm_bytes_per_die"]) for row in stage_rows), 3),
+            "hbm_utilization_ratio": round(max(float(row["hbm_utilization_ratio"]) for row in stage_rows), 9),
+        })
+    fits = bool(rows) and all(float(row["peak_kv_bytes"]) <=
+                              float(row["supply_bytes"]) + max(1e-9, abs(float(row["supply_bytes"])) * 1e-12)
+                              for row in rows)
+    return {
+        "schema": "mindie-sim.capacity-window/1",
+        "phase": phase, "context_tokens": int(context),
+        "query_tokens_per_sequence": q_tokens, "emitted_tokens_per_sequence": emit_tokens,
+        "output_budget": int(output_budget), "sequences": b,
+        "async_scheduling": bool(scaled.runtime.async_scheduling),
+        "hbm_capacity_scale": float(hbm_capacity_scale),
+        "window": {
+            "active_tokens_per_sequence": int(active_tokens),
+            "retiring_tokens_per_sequence": int(retiring_tokens),
+            "wave_tokens_per_sequence": int(wave_tokens),
+            "lookahead_tokens": int(lookahead_tokens),
+            "delayed_release_steps": int(delayed_steps),
+            "steps_per_wave": int(steps_per_wave),
+            "retiring_waves": int(retiring_waves),
+            "staggered_delayed_sequences": int(staggered_delayed_b),
+            "wave_delayed_sequences": int(wave_delayed_b),
+        },
+        "supply_bytes": round(min((float(row["supply_bytes"]) for row in rows), default=0.0), 3),
+        "fixed_bytes": round(max((float(row["fixed_bytes"]) for row in rows), default=0.0), 3),
+        "external_held_bytes": round(max((float(row["external_held_bytes"]) for row in rows), default=0.0), 3),
+        "workspace_bytes": round(max((float(row["workspace_bytes"]) for row in rows), default=0.0), 3),
+        "weight_bytes_per_die": round(max((
+            float(row["fixed_allocations"].get("weights", 0.0)) for row in rows), default=0.0), 3),
+        "active_kv_bytes": round(max((float(row["active_kv_bytes"]) for row in rows), default=0.0), 3),
+        "retiring_kv_bytes": round(max((float(row["retiring_kv_bytes"]) for row in rows), default=0.0), 3),
+        "batch_wave_kv_bytes": round(max((float(row["batch_wave_kv_bytes"]) for row in rows), default=0.0), 3),
+        "wave_retiring_kv_bytes": round(max((float(row["wave_retiring_kv_bytes"]) for row in rows), default=0.0), 3),
+        "peak_bytes": round(max((float(row["peak_kv_bytes"]) for row in rows), default=0.0), 3),
+        "headroom_bytes": round(min((float(row["headroom_bytes"]) for row in rows), default=0.0), 3),
+        "active_headroom_bytes": round(min((float(row["active_headroom_bytes"]) for row in rows), default=0.0), 3),
+        "stages": stages, "stage_rank": rows, "fits": fits,
+    }
 
 
 def _vram_max_sequences_per_dp(
     case: CaseSpec, *, context: int, tokens_per_seq: int, output_budget: int,
     hbm_capacity_scale: float = 1.0, emitted_tokens_per_seq: float | None = None,
     async_scheduling: bool | None = None, phase: str = "decode",
+    memory: Memory | None = None,
 ) -> int:
-    """Solve max concurrent sequences per DP replica jointly with workspace, KV, and async delayed release."""
+    """Solve max concurrent sequences per DP replica with the shared capacity window."""
     base_case = replace(case, runtime=replace(case.runtime, async_scheduling=bool(async_scheduling))) if async_scheduling is not None else case
     scaled = scale_case_hardware(base_case, hbm_capacity_scale=hbm_capacity_scale) if hbm_capacity_scale != 1.0 else base_case
     q_tokens = max(1, int(tokens_per_seq))
-    emit_tokens = float(q_tokens) if emitted_tokens_per_seq is None else max(1e-6, float(emitted_tokens_per_seq))
     rt_cap = min(int(scaled.runtime.max_num_seqs), max(1, int(scaled.runtime.max_num_batched_tokens) // q_tokens))
-    probe_mem = Memory(scaled, workspace_tokens=q_tokens)
-    # Prefill KV is the prompt only (context + q_tokens): no decode output and no async lookahead waves.
-    output_budget_eff, lookahead_tokens = (0, 0) if phase == "prefill" else (output_budget, probe_mem.async_in_flight_lookahead_steps * q_tokens)
-    delayed_steps = probe_mem.async_delayed_release_steps
-    steps_per_wave = max(1, math.ceil(max(1, output_budget_eff) / emit_tokens))
-    retiring_waves = max(1, math.ceil(delayed_steps / steps_per_wave)) if delayed_steps > 0 else 0
-    seq_len_active = max(1, context + max(q_tokens, output_budget_eff) + lookahead_tokens)
-    seq_len_retiring = max(1, context + max(q_tokens, output_budget_eff))
-    seq_len_wave = max(1, context + min(max(q_tokens, output_budget_eff), max(1, delayed_steps) * q_tokens) + lookahead_tokens)
-    kv_active = probe_mem.cache_bytes(seq_len_active, padded=True)
-    kv_retiring = probe_mem.cache_bytes(seq_len_retiring, padded=True)
-    kv_wave = probe_mem.cache_bytes(seq_len_wave, padded=True)
 
     def fits(b: int) -> bool:
-        mem = Memory(scaled, workspace_tokens=b * q_tokens)
-        if b >= 2 and delayed_steps > 0 and output_budget_eff > 0:
-            staggered_delayed_b = max(1, math.ceil(b * delayed_steps / steps_per_wave))
-            wave_delayed_b = retiring_waves * b
-            return all(
-                min(mem.capacity[r][st] for r in range(len(mem.capacity))) >= max(
-                    b * kv_active[st] + staggered_delayed_b * kv_retiring[st],
-                    b * kv_wave[st] + wave_delayed_b * kv_retiring[st],
-                )
-                for st in range(len(kv_active))
-            )
-        return all(
-            min(mem.capacity[r][st] for r in range(len(mem.capacity))) >= b * kv_active[st]
-            for st in range(len(kv_active))
-        )
+        return capacity_window(
+            scaled, phase=phase, context=context, tokens_per_seq=q_tokens,
+            sequences=b, output_budget=output_budget,
+            emitted_tokens_per_seq=emitted_tokens_per_seq,
+            async_scheduling=None, memory=memory,
+        )["fits"]
 
     if not fits(1):
         return 0
@@ -618,6 +1290,12 @@ def _resolve_speculative_tokens(case: CaseSpec, *, output_budget: int, tokens_pe
     return resolved_q, (min(float(resolved_q), float(policy_mean)) if (policy_proposal > 0 and resolved_q > 1) else float(resolved_q))
 
 
+def select_jointly_feasible_candidate(records: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | None:
+    """Return the highest-B candidate that passed both SLA and capacity in its own evaluation."""
+    feasible = [record for record in records if record and bool(record.get("feasible"))]
+    return max(feasible, key=lambda record: int(record["b"])) if feasible else None
+
+
 def solve_hardware_sla_throughput(
     case: CaseSpec | Mapping[str, Any], *, sla_ms: float = 30.0, context: int = 126000, tokens_per_seq: int | None = None,
     emitted_tokens_per_seq: float | None = None, max_sequences_per_dp: int = 256, phase: str = "decode", scope: str = "body",
@@ -635,6 +1313,12 @@ def solve_hardware_sla_throughput(
 
     parsed = parse_case(case)
     q_tokens, emit_tokens = _resolve_speculative_tokens(parsed, output_budget=output_budget, tokens_per_seq=tokens_per_seq, emitted_tokens_per_seq=emitted_tokens_per_seq)
+    # A prefill step processes its query; the following decode step commits its
+    # own accepted tokens.  Keep both quantities: the lifecycle capacity must
+    # use the decode commit, never the prompt-processing volume.
+    decode_q_tokens, decode_emit_tokens = _resolve_speculative_tokens(
+        parsed, output_budget=output_budget, tokens_per_seq=None,
+        emitted_tokens_per_seq=None)
     _validate_geometry(phase, q_tokens, context, 1, scope)
     rt_max_b = min(int(parsed.runtime.max_num_seqs), max(1, int(parsed.runtime.max_num_batched_tokens) // q_tokens))
     if phase == "decode" and parsed.runtime.graph_capture_mode == "full" and parsed.runtime.graph_capture_keys and dict(parsed.runtime.metadata).get("captured_execution_mode") == "FULL_DECODE_ONLY":
@@ -671,10 +1355,14 @@ def solve_hardware_sla_throughput(
 
     def get_analysis(s_key: tuple[float, ...], b: int) -> dict[str, Any]:
         if (s_key, b) not in analysis_cache:
-            if s_key == (1.0, 1.0, 1.0, 1.0, 1.0) and b == 1 and b1_analysis is not None and b1_analysis.get("geometry", {}).get("tokens") == q_tokens:
-                analysis_cache[s_key, b] = dict(b1_analysis)
-            else:
-                analysis_cache[s_key, b] = analyze_network_efficiency(get_scaled(s_key), phase=phase, tokens=q_tokens, context=context, sequences=b, scope=scope, run_graph=True, _precomputed_graph=get_bundle(s_key, b))
+            # ``b1_analysis`` is retained only for API compatibility.  It does not
+            # carry the case plan/boundary identity needed to prove the same input,
+            # so it may never replace an execution evaluated here.  The graph cache
+            # above is the only reuse boundary.
+            analysis_cache[s_key, b] = analyze_network_efficiency(
+                get_scaled(s_key), phase=phase, tokens=q_tokens, context=context,
+                sequences=b, scope=scope, run_graph=True,
+                _precomputed_graph=get_bundle(s_key, b))
         return analysis_cache[s_key, b]
 
     def eval_at(scen: Mapping[str, Any], s_key: tuple[float, ...], b: int, *, full: bool = False) -> dict[str, Any]:
@@ -689,17 +1377,28 @@ def solve_hardware_sla_throughput(
                 target_vec_mfu=float(scen.get("target_vec_mfu", target_vec_mfu)), target_link_util=scen.get("target_link_util"), baseline_analysis=ans,
             )
             step = float(ev["target_step_duration_ms"])
-            return {"step_ms": step, "operator_sum_ms": float(ev["target_operator_sum_ms"]), "network_mbu": float(ev["target_network_mbu"]), "network_cube_mfu": float(ev["target_network_cube_mfu"]), "network_vec_mfu": float(ev["target_network_vec_mfu"]), "network_link_util": ans["total_link_ideal_ms"] / max(step, 1e-12), "network_roofline_efficiency": float(ev["target_network_roofline_efficiency"]), "bottleneck_shares": shares}
-        return {"step_ms": float(ans["graph_duration_ms"]), "operator_sum_ms": float(ans["operator_sum_ms"]), "network_mbu": float(ans["network_mbu"]), "network_cube_mfu": float(ans["network_cube_mfu"]), "network_vec_mfu": float(ans["network_vec_mfu"]), "network_link_util": float(ans["network_link_util"]), "network_roofline_efficiency": float(ans["network_roofline_efficiency"]), "bottleneck_shares": shares}
+            return {"step_ms": step, "step_basis": "target_pipe_work_lower_bound", "step_is_lower_bound": True, "operator_sum_ms": float(ev["target_operator_sum_ms"]), "target_pipe_totals_ms": dict(ev.get("target_pipe_totals_ms") or {}), "network_mbu": float(ev["target_network_mbu"]), "network_cube_mfu": float(ev["target_network_cube_mfu"]), "network_vec_mfu": float(ev["target_network_vec_mfu"]), "network_link_util": ans["total_link_ideal_ms"] / max(step, 1e-12), "network_roofline_efficiency": float(ev["target_network_roofline_efficiency"]), "bottleneck_shares": shares}
+        return {"step_ms": float(ans["graph_duration_ms"]), "step_basis": "graph_evaluation", "step_is_lower_bound": False, "operator_sum_ms": float(ans["operator_sum_ms"]), "network_mbu": float(ans["network_mbu"]), "network_cube_mfu": float(ans["network_cube_mfu"]), "network_vec_mfu": float(ans["network_vec_mfu"]), "network_link_util": float(ans["network_link_util"]), "network_roofline_efficiency": float(ans["network_roofline_efficiency"]), "bottleneck_shares": shares}
 
     base_b_hint, domain_cap, domain_reason = 1, b_max, None
 
-    def try_step_ok(scen: Mapping[str, Any], s_key: tuple[float, ...], b: int) -> bool:
+    def try_step_ok(scen: Mapping[str, Any], s_key: tuple[float, ...], b: int, *, seen: set[int] | None = None,
+                    checks: dict[int, dict[str, Any]] | None = None, capacity_max: int | None = None) -> bool:
         nonlocal domain_cap, domain_reason
+        if seen is not None:
+            seen.add(int(b))
         if b > domain_cap:
             return False
         try:
-            return eval_at(scen, s_key, b, full=False)["step_ms"] <= sla_ms
+            step = float(eval_at(scen, s_key, b, full=False)["step_ms"])
+            capacity_pass = bool(capacity_max is None or b <= capacity_max)
+            record = {"b": int(b), "step_ms": step,
+                      "sla": {"limit_ms": float(sla_ms), "pass": step <= sla_ms},
+                      "capacity": {"b_vram_max": int(capacity_max or 0), "pass": capacity_pass},
+                      "feasible": bool(step <= sla_ms and capacity_pass)}
+            if checks is not None:
+                checks[int(b)] = record
+            return bool(record["sla"]["pass"])
         except ModelingError as exc:
             if b <= 1:
                 raise
@@ -716,20 +1415,176 @@ def solve_hardware_sla_throughput(
             if parsed.runtime.memory:
                 b_cfg = _vram_max_sequences_per_dp(parsed, context=context, tokens_per_seq=q_tokens, output_budget=output_budget, hbm_capacity_scale=s_key[4], emitted_tokens_per_seq=emit_tokens, phase=phase)
             vram_by_cap[s_key[4]] = (b_cfg, b_sync, b_async)
-        (b_vram, b_vram_sync, b_vram_async), b1_ms = vram_by_cap[s_key[4]], eval_at(scen, s_key, 1, full=False)["step_ms"]
+        (b_vram, b_vram_sync, b_vram_async) = vram_by_cap[s_key[4]]
+        if phase == "prefill":
+            life_ctx = context + q_tokens
+            verify_tokens = decode_q_tokens
+            b_life_sync = _vram_max_sequences_per_dp(parsed, context=life_ctx, tokens_per_seq=verify_tokens,
+                                                      output_budget=output_budget, hbm_capacity_scale=s_key[4],
+                                                      emitted_tokens_per_seq=decode_emit_tokens, async_scheduling=False, phase="decode")
+            b_life_async = _vram_max_sequences_per_dp(parsed, context=life_ctx, tokens_per_seq=verify_tokens,
+                                                       output_budget=output_budget, hbm_capacity_scale=s_key[4],
+                                                       emitted_tokens_per_seq=decode_emit_tokens, async_scheduling=True, phase="decode")
+            b_lifecycle = b_life_async if parsed.runtime.async_scheduling else b_life_sync
+        else:
+            life_ctx = context
+            verify_tokens = q_tokens
+            b_life_sync, b_life_async, b_lifecycle = b_vram_sync, b_vram_async, b_vram
+        b_joint = min(b_vram, b_lifecycle)
+
+        window_cache: dict[int, tuple[dict[str, Any], dict[str, Any]]] = {}
+
+        def candidate_windows(b: int) -> tuple[dict[str, Any], dict[str, Any]]:
+            if b in window_cache:
+                return window_cache[b]
+            current_window = capacity_window(
+                parsed, phase=phase, context=context, tokens_per_seq=q_tokens,
+                sequences=b, output_budget=output_budget,
+                emitted_tokens_per_seq=emit_tokens, hbm_capacity_scale=s_key[4])
+            if phase == "decode":
+                lifecycle_window = current_window
+            else:
+                lifecycle_window = capacity_window(
+                    parsed, phase="decode", context=life_ctx, tokens_per_seq=verify_tokens,
+                    sequences=b, output_budget=output_budget,
+                    emitted_tokens_per_seq=decode_emit_tokens,
+                    hbm_capacity_scale=s_key[4])
+            window_cache[b] = (current_window, lifecycle_window)
+            return current_window, lifecycle_window
+
+        b1_ms = float(get_bundle(s_key, 1)[2]["duration_ms"])
+        candidate_checks: dict[int, dict[str, Any]] = {
+            1: {"b": 1, "step_ms": b1_ms,
+                "sla": {"limit_ms": float(sla_ms), "pass": b1_ms <= sla_ms},
+                "capacity": {"b_vram_max": int(b_joint), "pass": b_joint >= 1},
+                "feasible": bool(b1_ms <= sla_ms and b_joint >= 1)}}
+        evaluated_b: set[int] = set(candidate_checks)
         eff_max = min(b_max, domain_cap)
+        bucket_keys = sorted({int(key) for key in (getattr(parsed.runtime, "graph_capture_keys", ()) or ())}
+                             | {int(key) for key in (getattr(parsed.runtime, "piecewise_capture_keys", ()) or ())})
+
+        def candidate_record(b: int, evaluation: Mapping[str, Any]) -> dict[str, Any]:
+            sla_pass = float(evaluation["step_ms"]) <= sla_ms
+            capacity_pass = b <= b_joint
+            current_window, lifecycle_window = candidate_windows(int(b))
+            return {
+                "b": int(b), "step_ms": float(evaluation["step_ms"]),
+                "step_basis": evaluation.get("step_basis", "graph_evaluation"),
+                "input_boundary": {"phase": phase, "tokens": q_tokens, "context": context,
+                                   "sequences": int(b), "scope": scope,
+                                   "output_budget": output_budget,
+                                   "emitted_tokens_per_seq": emit_tokens,
+                                   "prefill_tokens_per_seq": q_tokens if phase == "prefill" else None,
+                                   "decode_context_tokens": life_ctx,
+                                   "decode_query_tokens": verify_tokens,
+                                   "decode_emitted_tokens_per_seq": (
+                                       decode_emit_tokens if phase == "prefill" else emit_tokens)},
+                "hardware": {"scenario_id": scen.get("id", "custom"),
+                             "scales": dict(zip(_SCALE_KEYS, s_key))},
+                "plan": {"kind": "target_graphs", "selection": "case_lowering"},
+                "sla": {"limit_ms": float(sla_ms), "pass": bool(sla_pass)},
+                "capacity": {"b_vram_max": int(b_joint), "b_vram_current": int(b_vram),
+                             "b_vram_lifecycle": int(b_lifecycle), "pass": bool(capacity_pass),
+                             "supply_bytes": current_window["supply_bytes"],
+                             "active_kv_bytes": current_window["active_kv_bytes"],
+                             "retiring_kv_bytes": current_window["retiring_kv_bytes"],
+                             "workspace_bytes": current_window["workspace_bytes"],
+                             "peak_bytes": current_window["peak_bytes"],
+                             "headroom_bytes": current_window["headroom_bytes"],
+                             "lifecycle_headroom_bytes": lifecycle_window["headroom_bytes"]},
+                "service_lifecycle": {
+                    "phase": "decode", "context_tokens": life_ctx,
+                    "query_tokens_per_sequence": verify_tokens,
+                    "emitted_tokens_per_sequence": (
+                        decode_emit_tokens if phase == "prefill" else emit_tokens),
+                    "capacity": {
+                        "supply_bytes": lifecycle_window["supply_bytes"],
+                        "active_kv_bytes": lifecycle_window["active_kv_bytes"],
+                        "retiring_kv_bytes": lifecycle_window["retiring_kv_bytes"],
+                        "workspace_bytes": lifecycle_window["workspace_bytes"],
+                        "peak_bytes": lifecycle_window["peak_bytes"],
+                        "headroom_bytes": lifecycle_window["headroom_bytes"],
+                        "fits": lifecycle_window["fits"],
+                    },
+                },
+                "feasible": bool(sla_pass and capacity_pass),
+                "source": "full_graph_reevaluation",
+                "network_mbu": evaluation.get("network_mbu"), "network_cube_mfu": evaluation.get("network_cube_mfu"),
+                "network_vec_mfu": evaluation.get("network_vec_mfu"), "network_link_util": evaluation.get("network_link_util"),
+                "network_roofline_efficiency": evaluation.get("network_roofline_efficiency"),
+                "bottleneck_shares": dict(evaluation.get("bottleneck_shares") or {}),
+            }
+
+        if scen.get("target_mbu") is not None:
+            actual_scen = {key: value for key, value in scen.items() if key != "target_mbu"}
+            actual = eval_at(actual_scen, s_key, 1, full=True)
+            bound = eval_at(scen, s_key, 1, full=True)
+            capacity_feasible = b_joint >= 1
+            target_current_window, target_lifecycle_window = candidate_windows(1)
+            return {
+                "scenario_id": scen.get("id", "custom"), "label": scen.get("label", scen.get("id", "custom")), "scales": dict(zip(_SCALE_KEYS, s_key)),
+                "b_sla": 0, "b_vram_max": b_vram, "b_vram_max_joint": b_joint,
+                "b_vram_max_lifecycle_sync": b_life_sync, "b_vram_max_lifecycle_async": b_life_async,
+                "b_vram_max_sync": b_vram_sync, "b_vram_max_async": b_vram_async,
+                "prefill_tokens_per_seq": q_tokens if phase == "prefill" else None,
+                "decode_emitted_tokens_per_seq": decode_emit_tokens if phase == "prefill" else emit_tokens,
+                "emitted_tokens_per_seq": emit_tokens,
+                "capacity_window": target_current_window,
+                "lifecycle_capacity_window": target_lifecycle_window,
+                "delta_b_vram_from_disabling_async": max(0, b_vram_sync - b_vram_async), "hbm_bound": bool(b_joint < 1),
+                "b_feasible": 0, "domain_max_b": domain_cap, "domain_limit_reason": domain_reason,
+                "sla_feasible": False, "latency_sla_feasible": False, "capacity_feasible": capacity_feasible,
+                "jointly_feasible": False, "feasible": False,
+                "feasibility_status": "target_bound_only_unverified",
+                "b_sla_lower_bound": 0, "b_sla_is_proven_max": False,
+                "latency_candidate": None, "feasible_candidate": None,
+                "search": {"method": "target_pipe_work_bound_not_a_feasibility_candidate",
+                           "monotonicity_assumed": False, "non_monotonic_dispatch_detected": False,
+                           "non_monotonic_dispatch_check": "not_applicable_target_bound",
+                           "bounded_dispatch_probes": [], "bounded_search_exhaustive": False,
+                           "evaluated_candidates": [1], "b_sla_is_proven_max": False,
+                           "candidate_step_source": "none", "lower_bound_can_prove_feasibility": False},
+                "total_concurrency": 0, "total_feasible_concurrency": 0,
+                "step_basis": "graph_evaluation_at_b1_reference", "step_is_lower_bound": False,
+                "step_ms_at_b1": actual["step_ms"], "tps_at_b1": (dp * emit_tokens * 1000.0) / actual["step_ms"],
+                "step_ms_at_sla": actual["step_ms"], "tps_at_sla": 0.0,
+                "target_bound_step_ms_at_b1": bound["step_ms"], "target_bound_is_lower_bound": True,
+                "target_bound_pipe_totals_ms": bound.get("target_pipe_totals_ms"),
+                "target_bound_operator_sum_ms": bound.get("operator_sum_ms"),
+                "target_step_tps_at_sla": 0.0,
+                "step_ms_feasible": None, "tps_feasible": 0.0,
+                "feasible_network_mbu": None, "feasible_network_cube_mfu": None,
+                "feasible_network_vec_mfu": None, "feasible_network_link_util": None,
+                "feasible_network_roofline_efficiency": None, "feasible_bottleneck_shares": None,
+                "network_source": "latency_reference_not_feasible",
+                "network_mbu": actual["network_mbu"], "network_mbu_at_sla": actual["network_mbu"],
+                "network_cube_mfu": actual["network_cube_mfu"], "network_cube_mfu_at_sla": actual["network_cube_mfu"],
+                "network_vec_mfu": actual["network_vec_mfu"], "network_vec_mfu_at_sla": actual["network_vec_mfu"],
+                "network_link_util": actual["network_link_util"], "network_roofline_efficiency": actual["network_roofline_efficiency"],
+                "bottleneck_shares": actual["bottleneck_shares"],
+            }
+
+        bounded_probes = []
         if b1_ms > sla_ms:
-            b_sla, eval_sla = 0, eval_at(scen, s_key, 1, full=True)
-        elif eff_max > 1 and (b1_ms * 3.0 <= sla_ms or base_b_hint == eff_max) and try_step_ok(scen, s_key, eff_max):
+            probe_ceiling = min(eff_max, 4)
+            probe_results = {probe: try_step_ok(scen, s_key, probe, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint) for probe in range(2, probe_ceiling + 1)}
+            bounded_probes = list(probe_results)
+            feasible_above = [probe for probe, ok in probe_results.items() if ok]
+            if feasible_above:
+                b_sla = max(feasible_above)
+                eval_sla = eval_at(scen, s_key, b_sla, full=True)
+            else:
+                b_sla, eval_sla = 0, eval_at(scen, s_key, 1, full=True)
+        elif eff_max > 1 and (b1_ms * 3.0 <= sla_ms or base_b_hint == eff_max) and try_step_ok(scen, s_key, eff_max, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint):
             b_sla, eval_sla = eff_max, eval_at(scen, s_key, eff_max, full=True)
         else:
             eff_max = min(b_max, domain_cap)
             start_b = max(2, min(eff_max, base_b_hint)) if (base_b_hint > 1 and all(x >= 1.0 for x in s_key[:4])) else 2
             low, high, probe = 1, eff_max, min(eff_max, start_b)
-            if probe > 2 and not try_step_ok(scen, s_key, probe):
+            if probe > 2 and not try_step_ok(scen, s_key, probe, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint):
                 high, probe = min(high, domain_cap, probe - 1), 2
             while probe <= high:
-                if try_step_ok(scen, s_key, probe):
+                if try_step_ok(scen, s_key, probe, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint):
                     low = probe
                     if probe == high:
                         break
@@ -740,29 +1595,129 @@ def solve_hardware_sla_throughput(
             best_b, lo_i, hi_i = low, low + 1, min(high, domain_cap)
             while lo_i <= hi_i:
                 mid = (lo_i + hi_i) // 2
-                best_b, lo_i, hi_i = (mid, mid + 1, hi_i) if try_step_ok(scen, s_key, mid) else (best_b, lo_i, min(hi_i, domain_cap, mid - 1))
-            while best_b > 1 and eval_at(scen, s_key, best_b)["step_ms"] > sla_ms:
+                best_b, lo_i, hi_i = (mid, mid + 1, hi_i) if try_step_ok(scen, s_key, mid, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint) else (best_b, lo_i, min(hi_i, domain_cap, mid - 1))
+            while best_b > 1 and not try_step_ok(scen, s_key, best_b, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint):
                 best_b -= 1
-            b_sla = best_b if eval_at(scen, s_key, best_b)["step_ms"] <= sla_ms else 0
+            b_sla = best_b if try_step_ok(scen, s_key, best_b, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint) else 0
             eval_sla = eval_at(scen, s_key, max(1, b_sla), full=True)
+
+        if b_sla > 0 and b_sla < min(b_max, domain_cap) and bucket_keys:
+            ceiling = min(min(b_max, domain_cap), b_sla + 3)
+            probe_results = {probe: try_step_ok(scen, s_key, probe, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint) for probe in range(b_sla + 1, ceiling + 1)}
+            bounded_probes.extend(probe_results)
+            feasible_above = [probe for probe, ok in probe_results.items() if ok]
+            if feasible_above:
+                b_sla = max(feasible_above)
+                eval_sla = eval_at(scen, s_key, b_sla, full=True)
+        if b_sla > 0:
+            evaluated_b.add(b_sla)
         if scen.get("id") == "baseline" and b_sla > 0:
             base_b_hint = b_sla
-        b_feas = min(b_sla, b_vram)
-        ev_feas = eval_at(scen, s_key, b_feas, full=True) if (b_feas > 0 and b_feas != b_sla) else eval_sla
+
+        # Probe the capacity ceiling and the latency best as actual candidates even
+        # when neither was reached by the binary path; all checks share this set.
+        for probe in sorted({b_vram, b_sla}):
+            if 0 < probe <= min(b_max, domain_cap) and probe not in candidate_checks:
+                step = float(eval_at(scen, s_key, probe, full=False)["step_ms"])
+                candidate_checks[probe] = {
+                    "b": int(probe), "step_ms": step,
+                    "sla": {"limit_ms": float(sla_ms), "pass": step <= sla_ms},
+                    "capacity": {"b_vram_max": int(b_joint), "b_vram_current": int(b_vram),
+                                 "b_vram_lifecycle": int(b_lifecycle), "pass": probe <= b_joint},
+                    "feasible": bool(step <= sla_ms and probe <= b_joint)}
+                evaluated_b.add(probe)
+        latency_candidate = candidate_record(b_sla, eval_sla) if b_sla > 0 else None
+        feasible_check = select_jointly_feasible_candidate(list(candidate_checks.values()))
+        b_feas = int(feasible_check["b"]) if feasible_check is not None else 0
+        feasible_ev = eval_at(scen, s_key, b_feas, full=True) if b_feas > 0 else None
+        feasible_candidate = (candidate_record(b_feas, feasible_ev)
+                              if feasible_ev is not None else None)
+        if feasible_candidate is not None and not feasible_candidate["feasible"]:
+            feasible_candidate = None
+            b_feas = 0
+        capacity_feasible = b_joint >= 1
+        latency_sla_feasible = bool(latency_candidate is not None and latency_candidate["sla"]["pass"])
+        jointly_feasible = feasible_candidate is not None
+        exhaustive = set(range(1, min(b_max, domain_cap) + 1)) <= set(candidate_checks)
+        if domain_cap < 1:
+            feasibility_status = "domain_infeasible"
+        elif not capacity_feasible:
+            feasibility_status = "capacity_infeasible"
+        elif jointly_feasible:
+            feasibility_status = "feasible" if b_sla <= b_feas else "feasible_capacity_limited"
+        elif latency_candidate is not None:
+            feasibility_status = ("no_jointly_feasible_candidate_in_evaluated_domain" if exhaustive
+                                  else "no_feasible_candidate_in_bounded_search")
+        else:
+            feasibility_status = ("sla_infeasible_within_evaluated_domain" if exhaustive
+                                  else "no_feasible_candidate_in_bounded_search")
         tps_sla = (b_sla * dp * emit_tokens * 1000.0) / eval_sla["step_ms"] if b_sla > 0 else 0.0
+        tps_feas = (b_feas * dp * emit_tokens * 1000.0) / feasible_ev["step_ms"] if jointly_feasible and feasible_ev is not None else 0.0
+        step_basis = eval_sla.get("step_basis", "graph_evaluation") if b_sla > 0 else "graph_evaluation_at_b1_reference"
+        output_network = feasible_ev if (jointly_feasible and feasible_ev is not None) else eval_sla
+        output_network_source = "feasible_candidate" if jointly_feasible else "latency_candidate_not_feasible"
+        selected_b = b_feas if b_feas > 0 else (b_sla if b_sla > 0 else 1)
+        selected_current_window, selected_lifecycle_window = candidate_windows(selected_b)
         return {
             "scenario_id": scen.get("id", "custom"), "label": scen.get("label", scen.get("id", "custom")), "scales": dict(zip(_SCALE_KEYS, s_key)),
-            "b_sla": b_sla, "b_vram_max": b_vram, "b_vram_max_sync": b_vram_sync, "b_vram_max_async": b_vram_async,
-            "delta_b_vram_from_disabling_async": max(0, b_vram_sync - b_vram_async), "hbm_bound": bool(b_vram < b_sla),
+            "b_sla": b_sla, "b_vram_max": b_vram, "b_vram_max_joint": b_joint,
+            "b_vram_max_lifecycle_sync": b_life_sync, "b_vram_max_lifecycle_async": b_life_async,
+            "b_vram_max_sync": b_vram_sync, "b_vram_max_async": b_vram_async,
+            "prefill_tokens_per_seq": q_tokens if phase == "prefill" else None,
+            "decode_emitted_tokens_per_seq": decode_emit_tokens if phase == "prefill" else emit_tokens,
+            "emitted_tokens_per_seq": emit_tokens,
+            "capacity_window": selected_current_window,
+            "lifecycle_capacity_window": selected_lifecycle_window,
+            "joint_capacity": {
+                "sequences": selected_b,
+                "current_supply_bytes": selected_current_window["supply_bytes"],
+                "current_active_kv_bytes": selected_current_window["active_kv_bytes"],
+                "current_retiring_kv_bytes": selected_current_window["retiring_kv_bytes"],
+                "current_workspace_bytes": selected_current_window["workspace_bytes"],
+                "current_peak_bytes": selected_current_window["peak_bytes"],
+                "current_headroom_bytes": selected_current_window["headroom_bytes"],
+                "lifecycle_supply_bytes": selected_lifecycle_window["supply_bytes"],
+                "lifecycle_active_kv_bytes": selected_lifecycle_window["active_kv_bytes"],
+                "lifecycle_retiring_kv_bytes": selected_lifecycle_window["retiring_kv_bytes"],
+                "lifecycle_workspace_bytes": selected_lifecycle_window["workspace_bytes"],
+                "lifecycle_peak_bytes": selected_lifecycle_window["peak_bytes"],
+                "lifecycle_headroom_bytes": selected_lifecycle_window["headroom_bytes"],
+                "fits": bool(selected_current_window["fits"] and selected_lifecycle_window["fits"]),
+            },
+            "delta_b_vram_from_disabling_async": max(0, b_vram_sync - b_vram_async), "hbm_bound": bool(b_joint < b_sla),
             "b_feasible": b_feas, "domain_max_b": domain_cap, "domain_limit_reason": domain_reason,
+            "sla_feasible": jointly_feasible, "latency_sla_feasible": latency_sla_feasible,
+            "capacity_feasible": capacity_feasible, "jointly_feasible": jointly_feasible, "feasible": jointly_feasible,
+            "feasibility_status": feasibility_status,
+            "b_sla_lower_bound": b_sla, "b_sla_is_proven_max": False,
+            "latency_candidate": latency_candidate, "feasible_candidate": feasible_candidate,
+            "search": {"method": "exponential_probe_plus_binary_under_monotone_assumption",
+                       "monotonicity_assumed": True, "non_monotonic_dispatch_detected": bool(
+                           latency_candidate is not None and latency_candidate["capacity"]["pass"] is False and b1_ms > sla_ms),
+                       "non_monotonic_dispatch_check": "bounded_bucket_probe" if bucket_keys else "not_applicable_no_capture_buckets",
+                       "bounded_dispatch_probes": bounded_probes, "bounded_search_exhaustive": bool(exhaustive),
+                       "evaluated_candidates": sorted(evaluated_b), "b_sla_is_proven_max": False,
+                       "candidate_step_source": "full_graph_reevaluation" if jointly_feasible else "none",
+                       "lower_bound_can_prove_feasibility": False},
             "total_concurrency": b_sla * dp, "total_feasible_concurrency": b_feas * dp,
-            "step_ms_at_b1": b1_ms, "tps_at_b1": (dp * emit_tokens * 1000.0) / b1_ms, "step_ms_at_sla": eval_sla["step_ms"], "tps_at_sla": tps_sla,
+            "step_basis": step_basis, "step_is_lower_bound": False,
+            "step_ms_at_b1": b1_ms, "tps_at_b1": (dp * emit_tokens * 1000.0) / b1_ms,
+            "step_ms_at_sla": eval_sla["step_ms"], "tps_at_sla": tps_sla,
             "target_step_tps_at_sla": (b_sla * dp * q_tokens * 1000.0) / eval_sla["step_ms"] if b_sla > 0 else 0.0,
-            "step_ms_feasible": ev_feas["step_ms"], "tps_feasible": (b_feas * dp * emit_tokens * 1000.0) / ev_feas["step_ms"] if b_feas > 0 else 0.0,
-            "network_mbu": eval_sla["network_mbu"], "network_mbu_at_sla": eval_sla["network_mbu"], "network_cube_mfu": eval_sla["network_cube_mfu"],
-            "network_cube_mfu_at_sla": eval_sla["network_cube_mfu"], "network_vec_mfu": eval_sla["network_vec_mfu"],
-            "network_vec_mfu_at_sla": eval_sla["network_vec_mfu"], "network_link_util": eval_sla["network_link_util"],
-            "network_roofline_efficiency": eval_sla["network_roofline_efficiency"], "bottleneck_shares": eval_sla["bottleneck_shares"],
+            "step_ms_feasible": feasible_candidate["step_ms"] if jointly_feasible and feasible_candidate is not None else None,
+            "tps_feasible": tps_feas,
+            "feasible_network_mbu": feasible_candidate["network_mbu"] if jointly_feasible and feasible_candidate is not None else None,
+            "feasible_network_cube_mfu": feasible_candidate["network_cube_mfu"] if jointly_feasible and feasible_candidate is not None else None,
+            "feasible_network_vec_mfu": feasible_candidate["network_vec_mfu"] if jointly_feasible and feasible_candidate is not None else None,
+            "feasible_network_link_util": feasible_candidate["network_link_util"] if jointly_feasible and feasible_candidate is not None else None,
+            "feasible_network_roofline_efficiency": feasible_candidate["network_roofline_efficiency"] if jointly_feasible and feasible_candidate is not None else None,
+            "feasible_bottleneck_shares": feasible_candidate["bottleneck_shares"] if jointly_feasible and feasible_candidate is not None else None,
+            "network_source": output_network_source,
+            "network_mbu": output_network["network_mbu"], "network_mbu_at_sla": eval_sla["network_mbu"],
+            "network_cube_mfu": output_network["network_cube_mfu"], "network_cube_mfu_at_sla": eval_sla["network_cube_mfu"],
+            "network_vec_mfu": output_network["network_vec_mfu"], "network_vec_mfu_at_sla": eval_sla["network_vec_mfu"],
+            "network_link_util": output_network["network_link_util"], "network_roofline_efficiency": output_network["network_roofline_efficiency"],
+            "bottleneck_shares": output_network["bottleneck_shares"],
         }
 
     results = [solve_one(scen) for scen in scenario_list]
@@ -772,19 +1727,64 @@ def solve_hardware_sla_throughput(
         eff_tps, eff_feas = (row["tps_at_sla"] if base_r["tps_at_sla"] > 0 else row["tps_at_b1"]), (row["tps_feasible"] if base_r["tps_feasible"] > 0 else row["tps_at_b1"])
         row["tps_gain_vs_baseline"], row["tps_feasible_gain_vs_baseline"], row["concurrency_gain_vs_baseline"] = ((eff_tps / base_tps) if base_tps > 0 else 1.0), ((eff_feas / base_feas_tps) if base_feas_tps > 0 else 1.0), ((row["b_sla"] / base_b) if base_r["b_sla"] > 0 else (base_r["step_ms_at_b1"] / row["step_ms_at_b1"]))
     mem_async_b1 = Memory(replace(parsed, runtime=replace(parsed.runtime, async_scheduling=True)), workspace_tokens=q_tokens)
-    seq_sync_len = max(1, context + max(q_tokens, output_budget))
-    seq_async_len = max(1, seq_sync_len + mem_async_b1.async_in_flight_lookahead_steps * q_tokens)
+    prefill = phase == "prefill"
+    lifecycle_query = decode_q_tokens if prefill else q_tokens
+    lifecycle_emit = decode_emit_tokens if prefill else emit_tokens
+    seq_sync_len = max(1, (context + q_tokens) if prefill else (context + max(q_tokens, output_budget)))
+    seq_lifecycle_len = max(1, (context + q_tokens + max(lifecycle_query, output_budget)) if prefill else seq_sync_len)
+    seq_async_len = max(1, seq_lifecycle_len + mem_async_b1.async_in_flight_lookahead_steps * lifecycle_query)
+    if prefill:
+        life_ctx = context + q_tokens
+        life_sync = _vram_max_sequences_per_dp(parsed, context=life_ctx, tokens_per_seq=lifecycle_query,
+                                                output_budget=output_budget, emitted_tokens_per_seq=lifecycle_emit,
+                                                async_scheduling=False, phase="decode")
+        life_async = _vram_max_sequences_per_dp(parsed, context=life_ctx, tokens_per_seq=lifecycle_query,
+                                                 output_budget=output_budget, emitted_tokens_per_seq=lifecycle_emit,
+                                                 async_scheduling=True, phase="decode")
+    else:
+        life_ctx = context
+        life_sync, life_async = base_r["b_vram_max_sync"], base_r["b_vram_max_async"]
+    capacity_window_b1 = capacity_window(
+        parsed, phase=phase, context=context, tokens_per_seq=q_tokens, sequences=1,
+        output_budget=output_budget, emitted_tokens_per_seq=emit_tokens)
+    lifecycle_capacity_window_b1 = capacity_window(
+        parsed, phase="decode", context=life_ctx, tokens_per_seq=lifecycle_query, sequences=1,
+        output_budget=output_budget, emitted_tokens_per_seq=lifecycle_emit)
     async_mem_summary = {
         "configured_async_scheduling": bool(parsed.runtime.async_scheduling),
+        "capacity_window": "prefill_prompt_only" if prefill else "decode_step",
+        "lifecycle_window": "prefix_query_plus_output_budget" if prefill else "decode_step",
+        "prefill_tokens_per_seq": q_tokens if prefill else None,
+        "decode_emitted_tokens_per_seq": lifecycle_emit,
         "b_vram_max_sync": base_r["b_vram_max_sync"],
         "b_vram_max_async": base_r["b_vram_max_async"],
+        "b_vram_max_lifecycle_sync": int(life_sync),
+        "b_vram_max_lifecycle_async": int(life_async),
+        "b_vram_max_joint_sync": int(min(base_r["b_vram_max_sync"], life_sync)),
+        "b_vram_max_joint_async": int(min(base_r["b_vram_max_async"], life_async)),
         "delta_b_vram_from_disabling_async": base_r["delta_b_vram_from_disabling_async"],
         "delayed_release_steps_async": mem_async_b1.async_delayed_release_steps,
-        "in_flight_lookahead_tokens_async": mem_async_b1.async_in_flight_lookahead_steps * q_tokens,
-        "kv_bytes_per_seq_sync_per_stage": list(mem_async_b1.cache_bytes(seq_sync_len, padded=True)),
-        "kv_bytes_per_seq_async_per_stage": list(mem_async_b1.cache_bytes(seq_async_len, padded=True)),
-        "async_workspace_overhead_bytes_at_b1_per_stage": list(mem_async_b1.async_workspace),
+        "in_flight_lookahead_tokens_async": mem_async_b1.async_in_flight_lookahead_steps * lifecycle_query,
+        "kv_bytes_per_seq_sync_per_stage": [float(value) for value in mem_async_b1.cache_bytes(seq_sync_len, padded=True)],
+        "kv_bytes_per_seq_lifecycle_per_stage": [float(value) for value in mem_async_b1.cache_bytes(seq_lifecycle_len, padded=True)],
+        "kv_bytes_per_seq_async_per_stage": [float(value) for value in mem_async_b1.cache_bytes(seq_async_len, padded=True)],
+        "async_workspace_overhead_bytes_at_b1_per_stage": [float(value) for value in mem_async_b1.async_workspace],
+        "capacity_window_b1": capacity_window_b1,
+        "lifecycle_capacity_window_b1": lifecycle_capacity_window_b1,
+        "joint_capacity_b1": {
+            "supply_bytes": min(capacity_window_b1["supply_bytes"], lifecycle_capacity_window_b1["supply_bytes"]),
+            "active_kv_bytes": capacity_window_b1["active_kv_bytes"],
+            "retiring_kv_bytes": lifecycle_capacity_window_b1["retiring_kv_bytes"],
+            "workspace_bytes": max(capacity_window_b1["workspace_bytes"], lifecycle_capacity_window_b1["workspace_bytes"]),
+            "peak_bytes": max(capacity_window_b1["peak_bytes"], lifecycle_capacity_window_b1["peak_bytes"]),
+            "headroom_bytes": min(capacity_window_b1["headroom_bytes"], lifecycle_capacity_window_b1["headroom_bytes"]),
+            "fits": bool(capacity_window_b1["fits"] and lifecycle_capacity_window_b1["fits"]),
+        },
         "hbm_bound_at_baseline": bool(base_r["b_vram_max"] < base_r["b_sla"]),
         "disabling_async_unlocks_concurrency": bool(base_r["b_vram_max_sync"] > base_r["b_vram_max_async"] and base_r["b_vram_max_async"] < base_r["b_sla"]),
     }
-    return {"schema": "mindie-sim.hardware-sla/1", "sla_ms": sla_ms, "context": context, "phase": phase, "scope": scope, "timing_boundary": "target_body_only" if scope == "body" else "full_model_step", "tokens_per_seq": q_tokens, "emitted_tokens_per_seq": emit_tokens, "dp": dp, "max_sequences_per_dp": b_max, "async_scheduling_memory": async_mem_summary, "scenarios": results}
+    return {"schema": "mindie-sim.hardware-sla/1", "sla_ms": sla_ms, "context": context, "phase": phase, "scope": scope, "timing_boundary": "target_body_only" if scope == "body" else "full_model_step", "tokens_per_seq": q_tokens, "emitted_tokens_per_seq": emit_tokens, "prefill_tokens_per_seq": q_tokens if prefill else None, "decode_emitted_tokens_per_seq": decode_emit_tokens, "dp": dp, "max_sequences_per_dp": b_max,
+            "solver": {"monotonicity_assumed": True, "b_sla_is_proven_max": False,
+                       "bounded_non_monotonic_dispatch_probe": True,
+                       "status_interpretation": "feasible_candidate_found_or_explicit_sla_capacity_domain_infeasibility"},
+            "async_scheduling_memory": async_mem_summary, "scenarios": results}

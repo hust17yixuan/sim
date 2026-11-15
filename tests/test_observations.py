@@ -1,4 +1,5 @@
 """Actual capture parsing, exact primitive reuse and independent validation."""
+import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 import json
 from pathlib import Path
 import statistics

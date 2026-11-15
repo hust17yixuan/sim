@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from mindie_sim.schema.invocation import InvocationTiming
+from mindie_sim.schema.invocation import FloorConstraint, InvocationTiming
 
 from .engine import Engine, Event
 from .program import Program
@@ -30,14 +30,22 @@ class InvocationProgram:
 
     body: Program
     timing: InvocationTiming
+    #: Independently provenanced merged floors; empty keeps legacy timing only.
+    constraints: tuple[FloorConstraint, ...] = ()
 
     def __post_init__(self):
         if not isinstance(self.timing, InvocationTiming):
             raise TypeError("invocation_program_requires_invocation_timing")
+        constraints = tuple(self.constraints)
+        if not all(isinstance(item, FloorConstraint) for item in constraints):
+            raise TypeError("invocation_program_requires_floor_constraints")
+        object.__setattr__(self, "constraints", constraints)
 
     def start(self, engine: Engine, name: str, ready: Event, *, owner: str = "") -> Event:
-        startup_ms = self.timing.startup_ms
-        minimum_ms = self.timing.minimum_ms
+        startup_ms = max((self.timing.startup_ms, *(item.startup_ms
+                          for item in self.constraints)), default=self.timing.startup_ms)
+        minimum_ms = max((self.timing.minimum_ms, *(item.minimum_ms
+                          for item in self.constraints)), default=self.timing.minimum_ms)
         if startup_ms == 0 and ready.done:
             body = self.body.start(engine, name + ":body", ready, owner=owner)
             if minimum_ms == 0:

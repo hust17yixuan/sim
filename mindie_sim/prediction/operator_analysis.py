@@ -16,47 +16,107 @@ from mindie_sim.coverage import model_coverage
 from .cost import CostModel
 from .cohort_traffic import bind_cohort_traffic
 from .execution import CollectiveParticipant, Execution
-from .structure import parse_case
+from .structure import parse_case, parse_model
 from .body_defaults import (TargetGraphSet, TargetOperators, consume_target_declaration,
                             effective_body_declaration)
 from .graph import annotate_geometry
 
 
+def _selected_group(case, selected_replica=None, cohort=None):
+    from mindie_sim.prediction.dispatch import cohorts
+    groups = [tuple(group) for group in cohorts(case.runtime.parallel)]
+    if cohort is not None:
+        selected = tuple(int(value) for value in cohort)
+        if selected not in groups:
+            raise ValueError("target_graphs_cohort_is_not_a_declared_participant_group")
+        return selected
+    if selected_replica is not None:
+        replica = int(selected_replica)
+        group = next((group for group in groups if replica in group), None)
+        if group is None:
+            raise ValueError("target_graphs_selected_replica_out_of_range")
+        return group
+    if not groups:
+        raise ValueError("target_graphs_requires_a_participant_group")
+    return groups[0]
+
+
+def _group_sequences(sequences, group, parallel):
+    if type(sequences) is int:
+        return sequences
+    values = tuple(sequences)
+    if len(values) == len(group):
+        return values
+    if len(values) == parallel.dp:
+        return tuple(values[replica] for replica in group)
+    raise ValueError("cohort_sequences_require_positive_scalar_or_complete_nonnegative_counts")
+
+
+class ModelGraphSet(dict):
+    """Replica graph mapping from the same Frontend.program occurrences.
+
+    The mapping keeps the existing ``TargetOperators`` tuple contract; the
+    attached programs are the authoritative work/ports for model consumers.
+    """
+
+    def __init__(self, values, *, programs, kernels, selection):
+        self.programs = dict(programs)
+        self.ports = {replica: program.ports
+                      for replica, program in self.programs.items()}
+        super().__init__((replica, TargetOperators._with_declaration(
+            ops, kernels, selection)) for replica, ops in values.items())
+
+    def program(self, replica=0):
+        return self.programs[replica]
+
+
 def target_operators(case, *, phase, tokens, context=0, sequences=1, scope="body",
                      media_tokens_per_sequence=None, resource_fusion=True,
-                     draft_prepare=False, apply_body_defaults=True):
+                     draft_prepare=False, apply_body_defaults=True,
+                     routing_views=None, physical_rank=None, query_position=None,
+                     selected_replica=None, cohort=None, pure_model=False):
     from mindie_sim.schema.workload import RequestView
     from .dispatch import cohorts
 
-    case = parse_case(case)
+    case = parse_model(case) if pure_model else parse_case(case)
     _check_geometry(phase, tokens, sequences, context, scope)
     case, selection = effective_body_declaration(
         case, phase, tokens=tokens, scope=scope, enabled=apply_body_defaults)
     _check_draft_preparation(case, phase, scope, draft_prepare)
+    group = _selected_group(case, selected_replica, cohort)
+    sequences = _group_sequences(sequences, group, case.runtime.parallel)
+    selected = (int(selected_replica) if selected_replica is not None
+                else group[0])
+    view_count = (int(sequences) if type(sequences) is int else
+                  int(sequences[group.index(selected)]))
     views = tuple(RequestView(f"analysis{index}", tokens, context, scope == "model", phase,
-                              draft_prepare=draft_prepare) for index in range(sequences))
+                              draft_prepare=draft_prepare)
+                  for index in range(max(0, view_count)))
     case = _media_case(case, views, scope, media_tokens_per_sequence)
-    participants = cohorts(case.runtime.parallel)[0]
-    if (len(participants) > 1
+    if (len(group) > 1
             and case.runtime.kernels.get("sequence_parallel")):
         # A single rank cannot resolve cross-DP SP without the complete
-        # cohort's query totals. ``target_graphs`` already binds that
-        # geometry; keep this one-rank operator view on its first replica.
-        # ``case`` and ``selection`` already carry the body defaults resolved
-        # above. Re-applying them here would start a second declaration and
-        # overwrite the caller-visible selection with a preserved-explicit
-        # record. Delegate only the cohort graph binding.
+        # cohort's query totals. Delegate only the cohort graph binding.
         graphs = target_graphs(
             case, phase=phase, tokens=tokens, context=context,
             sequences=sequences, scope=scope,
             media_tokens_per_sequence=media_tokens_per_sequence,
             resource_fusion=resource_fusion, draft_prepare=draft_prepare,
-            apply_body_defaults=False,
+            apply_body_defaults=False, routing_views=routing_views,
+            physical_rank=physical_rank, query_position=query_position,
+            selected_replica=selected_replica, cohort=group,
         )
-        result = tuple(op for op in graphs[participants[0]] if op.family != "barrier")
+        selected = (int(selected_replica) if selected_replica is not None
+                    else group[0])
+        result = tuple(op for op in graphs[selected] if op.family != "barrier")
         return (TargetOperators(result, kernels=case.runtime.kernels, selection=selection)
                 if scope == "body" else result)
-    result = tuple(op for op in _target_ops(case, views, scope, resource_fusion=resource_fusion)
+    replica = selected
+    physical = _physical_rank_for(case, replica)
+    result = tuple(op for op in _target_ops(
+        case, views, scope, resource_fusion=resource_fusion,
+        routing_views=routing_views, physical_rank=physical,
+        query_position=query_position, replica=replica)
                    if op.family != "barrier")
     return (TargetOperators(result, kernels=case.runtime.kernels, selection=selection)
             if scope == "body" else result)
@@ -94,21 +154,37 @@ def _check_draft_preparation(case, phase, scope, enabled):
 
 
 def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
-                cohort_tokens=None, phase=None, replica=0):
+                cohort_tokens=None, phase=None, replica=0, active_rows=None,
+                source_rows_by_replica=None, routing_global_tokens=None,
+                routing_views=None, physical_rank=None, query_position=None,
+                model_programs=None):
     from mindie_sim.schema.workload import IterationPlan
     from .attention import AttentionPolicy
     from .frontend import Frontend
+    from .subgraphs.instantiate import FeatureConfig
     from .transforms import lower_implementations
     from .implementation_selection import resolve, annotate
 
-    frontend = Frontend(attention_policy=AttentionPolicy(**case.runtime.attention_policy))
+    features = FeatureConfig.from_runtime(
+        case.runtime, case.model, machine=case.machine)
+    frontend = Frontend(
+        attention_policy=AttentionPolicy(**case.runtime.attention_policy),
+        features=features)
     global_tokens = (cohort_tokens if cohort_tokens is not None else
                      sum(v.q_len + v.draft_proposal_tokens for v in global_views)
                      if global_views is not None else None)
     if scope == "model":
-        work = frontend(IterationPlan(views), case.model, case.runtime, case.machine,
-                        global_tokens=global_tokens, global_views=global_views,
-                        resource_fusion=resource_fusion, replica=replica)
+        program = frontend.program(
+            IterationPlan(views), case.model, case.runtime, case.machine,
+            assembly="model", global_tokens=global_tokens,
+            global_views=global_views, resource_fusion=resource_fusion,
+            replica=replica, source_rows_by_replica=source_rows_by_replica,
+            routing_global_tokens=routing_global_tokens,
+            routing_views=routing_views, physical_rank=physical_rank,
+            query_position=query_position)
+        if model_programs is not None:
+            model_programs[replica] = program
+        work = program.work
         result, aliases = [], {}
         for op in work.ops:
             dependencies = tuple(dict.fromkeys(
@@ -139,21 +215,36 @@ def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
     )
     ops, _ = frontend.body(case.model, case.runtime, local, ready="analysis_input",
                           tokens=local_tokens, mode=views[0].phase if views else phase,
-                          global_tokens=body_global_tokens, replica=replica)
+                          global_tokens=body_global_tokens, replica=replica,
+                          source_rows_by_replica=source_rows_by_replica,
+                          routing_global_tokens=routing_global_tokens,
+                          routing_views=routing_views,
+                          physical_rank=physical_rank,
+                          query_position=query_position)
     # Source lowerings consume the same active/storage distinction as the
     # model path, including MC2's mask over padded graph inputs.
-    ops = annotate_geometry(ops, active_rows=sum(v.q_len for v in views),
+    logical_rows = (sum(v.logical_q_len for v in views) if active_rows is None
+                    else int(active_rows))
+    ops = annotate_geometry(ops, active_rows=logical_rows,
                             physical_rows=padded_tokens)
-    ops = frontend.graph.apply(lower_implementations(
-        ops, case.runtime, case.model.activation_dtype, resource_fusion=False,
-        local_tokens=local_tokens), replay_scope, case.runtime)
-    if resource_fusion:
-        from .native_fusion import lower_native_fusions
-        ops = lower_native_fusions(ops, case.runtime, local_tokens=local_tokens)
-    ops = annotate_geometry(ops, active_rows=sum(v.q_len for v in views),
-                            physical_rows=padded_tokens)
-    return annotate(tuple(replace(op, metadata=op.metadata + (("graph_replay_scope", replay_scope),))
-                          for op in ops), selections)
+    from .implementation_selection import LoweringRegion, lower_regions
+
+    logical_rows = (sum(v.logical_q_len for v in views) if active_rows is None
+                    else int(active_rows))
+    # T11 owns representation insertion, the post-insertion partition and
+    # capture inheritance.  The independent body entry consumes the same
+    # lower_regions result as the model path; no pre-insertion graph partition
+    # or old-family suffix is used here.
+    region = LoweringRegion(
+        tuple(ops), case.runtime, case.model.activation_dtype, local_tokens,
+        selections=tuple(selections or ()))
+    lowered, _ = lower_regions(
+        [region], graph=frontend.graph, replay_scope=replay_scope,
+        runtime=case.runtime, resource_fusion=resource_fusion)
+    lowered = annotate_geometry(lowered, active_rows=logical_rows,
+                                physical_rows=padded_tokens)
+    return tuple(replace(op, metadata=op.metadata + (
+        ("graph_replay_scope", replay_scope),)) for op in lowered)
 
 
 def _media_case(case, views, scope, media_tokens):
@@ -174,46 +265,163 @@ def _media_case(case, views, scope, media_tokens):
     return replace(case, runtime=replace(case.runtime, metadata=tuple(metadata.items())))
 
 
+def graph_padded_idle(case, phase: str, counts) -> bool:
+    """Whether a genuine declared graph protocol physically pads zero lanes.
+
+    This is source/runtime selection, not a caller flag: full decode capture
+    with declared keys (or an explicit piecewise capture) runs captured graph
+    rows even when the logical lane count is zero.  Eager/none keeps zero work.
+    """
+    if (phase != "decode" or not counts
+            or not any(int(v) > 0 for v in counts.values())
+            or all(int(v) > 0 for v in counts.values())):
+        return False
+    runtime = case.runtime
+    if str(runtime.graph_mode).lower() in {"none", "off", "eager", "disabled", "auto"}:
+        return False
+    if runtime.deepep_high_throughput:
+        return False
+    full = (str(runtime.graph_capture_mode).lower() == "full"
+            and not runtime.invalid_full_modes)
+    keys = ((runtime.graph_capture_keys or runtime.graph_buckets)
+            if full else runtime.piecewise_capture_keys)
+    return bool(keys)
+
+
+def _physical_rank_for(case, replica):
+    from .topology import Topology
+    try:
+        return Topology(case.machine, case.runtime.parallel).ranks(replica, 0)[0]
+    except Exception:
+        return None
+
+
+def _routing_views_for(value, replica):
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        return value.get(replica)
+    return value
+
+
 def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
                   media_tokens_per_sequence=None, resource_fusion=True,
-                  draft_prepare=False, apply_body_defaults=True):
-    """One DP cohort; scalar sequences repeat, lists declare every replica."""
+                  draft_prepare=False, apply_body_defaults=True,
+                  padded_idle=False, routing_views=None, physical_rank=None,
+                  query_position=None, selected_replica=None, cohort=None,
+                  pure_model=False):
+    """One DP cohort; scalar sequences repeat, lists declare every replica.
+
+    ``padded_idle`` retains the declared physical capture rows for a replica
+    whose logical sequence count is zero.  The logical ledger stays empty; the
+    physical padding view launches the actual graph bucket and EP kernel
+    participation without inventing a logical request.
+    """
     from mindie_sim.schema.workload import RequestView
     from .dispatch import cohorts
 
-    case = parse_case(case)
+    case = parse_model(case) if pure_model else parse_case(case)
     _check_geometry(phase, tokens, 1, context, scope)
     case, selection = effective_body_declaration(
         case, phase, tokens=tokens, scope=scope, enabled=apply_body_defaults)
     _check_draft_preparation(case, phase, scope, draft_prepare)
-    participants = cohorts(case.runtime.parallel)[0]
+    participants = _selected_group(case, selected_replica, cohort)
+    sequences = _group_sequences(sequences, participants, case.runtime.parallel)
     counts = cohort_sequence_counts(sequences, participants)
-    views = {r: tuple(RequestView(
-        f"analysis{r}:{i}", tokens, context, scope == "model", phase, draft_prepare=draft_prepare,
-    ) for i in range(counts[r])) for r in participants}
-    case = _media_case(case, tuple(v for group in views.values() for v in group),
+    pad_idle = padded_idle or graph_padded_idle(case, phase, counts)
+    logical_views = {}
+    views = {}
+    for replica in participants:
+        count = counts[replica]
+        logical_views[replica] = tuple(RequestView(
+            f"analysis{replica}:{i}", tokens, context, scope == "model",
+            phase, draft_prepare=draft_prepare,
+        ) for i in range(count))
+        if count == 0 and pad_idle:
+            # A physical graph row is not a logical request.  A zero-length
+            # padded view lets GraphPolicy select the declared capture bucket;
+            # the frontend then lowers that many physical rows while the
+            # logical ledger remains zero.
+            from .graph import GraphPolicy
+            probe = RequestView(
+                f"analysis{replica}:bucket_probe", 0, context, False, phase,
+                padding=True, draft_verify=False, draft_prepare=False,
+            )
+            bucket, _replay = GraphPolicy().select(
+                (probe,), case.runtime)
+            physical = int(bucket or 0)
+            views[replica] = ((RequestView(
+                f"analysis{replica}:padding", physical, context, False, phase,
+                padding=True, draft_verify=False, draft_prepare=False,
+            ),) if physical else ())
+        else:
+            views[replica] = logical_views[replica]
+    active_rows_by_replica = {
+        replica: sum(v.q_len for v in logical_views[replica])
+        for replica in participants
+    }
+    case = _media_case(case, tuple(v for group in logical_views.values() for v in group),
                        scope, media_tokens_per_sequence)
-    global_views = tuple(v for group in views.values() for v in group) if len(views) > 1 else None
+    global_views = (tuple(v for group in logical_views.values() for v in group)
+                    if len(logical_views) > 1 else None)
     padded_cohort = None
     sp_padding = case.runtime.kernels.get("sequence_parallel", {}).get("padding")
-    if len(views) > 1 and (case.runtime.routing.get("policy") == "balanced"
-                           or sp_padding == "right_to_tp"):
+    if len(logical_views) > 1 and (case.runtime.routing.get("policy") == "balanced"
+                                   or sp_padding == "right_to_tp"):
         from .balanced_routing import cohort_padded_tokens
-        padded_cohort = cohort_padded_tokens(views.values(), case.runtime)
+        padded_cohort = cohort_padded_tokens(logical_views.values(), case.runtime)
+    # The ordinary selector consumes the source rows each physical EP rank
+    # actually owns.  With SP, valid_per_tp is that exact ownership; flattening
+    # the DP replicas gives the EP-rank vector.  Without SP the vector remains
+    # DP-scoped and the lowering keeps its declared uniform peer policy.
+    source_rows_by_replica = tuple(
+        active_rows_by_replica[p] for p in participants)
+    routing_global_tokens = (
+        padded_cohort if padded_cohort is not None
+        else (sum(active_rows_by_replica.values())
+              if global_views is not None else None))
+    if len(participants) > 1 and "sequence_parallel" in case.runtime.kernels:
+        from .sequence_parallel import select as select_sp
+        total_global = sum(active_rows_by_replica.values())
+        physical_rows = []
+        for replica in participants:
+            plan = select_sp(
+                case.runtime, case.model, logical_views[replica],
+                tokens=active_rows_by_replica[replica],
+                global_tokens=total_global)
+            if plan is not None:
+                physical_rows.extend(plan.valid_per_tp)
+        if physical_rows:
+            source_rows_by_replica = tuple(physical_rows)
+    explicit_routing = any(
+        isinstance(item, Mapping) and any(key in item for key in (
+            "requests", "request_views", "expert_placement", "source_owners",
+            "source_owner", "query_position"))
+        for item in (case.runtime.routing.get("realizations") or ()))
     uniform_replicas = (
-        len(set(counts.values())) <= 1
+        scope != "model"
+        and len(set(counts.values())) <= 1
         and case.runtime.routing.get("policy") != "balanced"
+        and not explicit_routing
         and not any(
             isinstance(item, Mapping) and "replica" in item
             for item in (case.runtime.routing.get("realizations") or ())
         )
     )
+    model_programs = {}
     if uniform_replicas and participants:
         first_r = participants[0]
         base_ops = _target_ops(
             case, views[first_r], scope, global_views=global_views,
             resource_fusion=resource_fusion, cohort_tokens=padded_cohort,
             phase=phase, replica=first_r,
+            active_rows=active_rows_by_replica[first_r],
+            source_rows_by_replica=source_rows_by_replica,
+            routing_global_tokens=routing_global_tokens,
+            routing_views=_routing_views_for(routing_views, first_r),
+            physical_rank=_physical_rank_for(case, first_r),
+            query_position=query_position,
+            model_programs=model_programs,
         )
         raw_graphs = {first_r: base_ops}
         for r in participants[1:]:
@@ -226,12 +434,82 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
         raw_graphs = {
             r: _target_ops(case, group, scope, global_views=global_views,
                            resource_fusion=resource_fusion, cohort_tokens=padded_cohort,
-                           phase=phase, replica=r)
+                           phase=phase, replica=r,
+                           active_rows=active_rows_by_replica[r],
+                           source_rows_by_replica=source_rows_by_replica,
+                           routing_global_tokens=routing_global_tokens,
+                           routing_views=_routing_views_for(routing_views, r),
+                           physical_rank=_physical_rank_for(case, r),
+                           query_position=query_position,
+                           model_programs=model_programs)
             for r, group in views.items()
         }
     graphs = bind_cohort_traffic(case, raw_graphs)
-    return (TargetGraphSet(graphs, kernels=case.runtime.kernels, selection=selection)
-            if scope == "body" else graphs)
+    if scope == "body":
+        return TargetGraphSet(graphs, kernels=case.runtime.kernels,
+                              selection=selection)
+    return ModelGraphSet(graphs, programs=model_programs,
+                         kernels=case.runtime.kernels, selection=selection)
+
+
+def model_graphs(value, *, phase, tokens, context=0, sequences=1, scope="model",
+                 selected_replica=0, cohort=None, **options):
+    """Target graphs for a pure model declaration without a workload.
+
+    The declaration supplies model/runtime/machine (or hardware); query
+    geometry is explicit.  No RequestSpec, SLO, scheduler or fabricated
+    workload is created.  Returns the existing named ``TargetGraphSet`` for
+    body scope and the replica mapping for model scope.
+    """
+    return target_graphs(
+        value, phase=phase, tokens=tokens, context=context, sequences=sequences,
+        scope=scope, selected_replica=selected_replica, cohort=cohort,
+        pure_model=True, **options)
+
+
+def model_program(value, *, phase, tokens, context=0, sequences=1,
+                  assembly="model", selected_replica=0, cohort=None,
+                  apply_body_defaults=False, **options):
+    """Assemble a pure-model forward through the existing ``Frontend.program``.
+
+    This consumes explicit RequestView geometry and the selected runtime/model
+    plan; it does not create a workload, service scheduler, or device state.
+    The returned ``ModelProgram`` keeps typed ports, occurrence triggers,
+    replay scope and named outputs for model/body consumers.
+    """
+    from mindie_sim.schema.workload import IterationPlan, RequestView
+    from .attention import AttentionPolicy
+    from .frontend import Frontend
+    from .subgraphs.instantiate import FeatureConfig
+
+    case = parse_model(value)
+    _check_geometry(phase, tokens, 1, context, "model")
+    case, _selection = effective_body_declaration(
+        case, phase, tokens=tokens, scope="model", enabled=apply_body_defaults)
+    participants = _selected_group(case, selected_replica, cohort)
+    counts = cohort_sequence_counts(sequences, participants)
+    selected = (int(selected_replica) if selected_replica is not None
+                else participants[0])
+    views_by_replica = {
+        replica: tuple(RequestView(f"model{replica}:{index}", tokens, context, True,
+                                   phase) for index in range(counts[replica]))
+        for replica in participants
+    }
+    plan = IterationPlan(views_by_replica[selected])
+    global_views = (tuple(view for replica in participants
+                          for view in views_by_replica[replica])
+                    if len(participants) > 1 else None)
+    features = FeatureConfig.from_runtime(case.runtime, case.model,
+                                           machine=case.machine)
+    frontend = Frontend(
+        attention_policy=AttentionPolicy(**case.runtime.attention_policy),
+        features=features)
+    program = frontend.program(
+        plan, case.model, case.runtime, case.machine, assembly=assembly,
+        global_views=global_views,
+        global_tokens=(sum(v.q_len for v in global_views) if global_views else None),
+        replica=selected, **options)
+    return program
 
 
 def physical_signature(op):
@@ -305,11 +583,12 @@ def cohort_operator_costs(case, ops, *, recipes, primitives=None,
                           replay_scope="none", input_ready_ms=0):
     """Isolate one complete transport cohort, attributing wire to source ranks."""
     execution = Execution(case, CostModel(case, primitives), recipes=recipes)
-    engine, participants, identities = execution.engine, [], {}
+    engine, participants, identities, replica_scopes = execution.engine, [], {}, {}
     for replica, original in ops.items():
         identities[replica] = physical_id(original)
         op, recipe = execution.prepare(original, replica)
         scope = replay_scope[replica] if isinstance(replay_scope, Mapping) else replay_scope
+        replica_scopes[replica] = scope
         context = execution._context(op, replica, scope, recipe=recipe)
         ready = engine.submit(f"r{replica}:input", release=input_ready_ms)
         participants.append(CollectiveParticipant(
@@ -323,8 +602,11 @@ def cohort_operator_costs(case, ops, *, recipes, primitives=None,
     duration = max(item.completion.time for item in participants) - input_ready_ms
     for item in participants:
         context = item.context
+        transport = execution.transport_options_for(
+            context.op, item.replica, replica_scopes.get(item.replica, "none"))
         accounting = execution.topology.accounting(
-            context.op, item.replica, volume=context.native_work.get("link", 0))
+            context.op, item.replica, volume=context.native_work.get("link", 0),
+            transport=transport)
         for resource, amount in accounting.wire_by_resource.items():
             attributed[resource] = attributed.get(resource, 0) + amount
         row = _cost_row(
@@ -482,7 +764,19 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
         context = execution._context(op, replica, replay_scope, recipe=recipe)
         engine = execution.engine
         ready = engine.submit("input_ready", release=input_ready_ms)
-        complete = execution.lower_program(context, recipe).start(engine, "operator", ready)
+        program = execution.lower_program(context, recipe)
+        from .piecewise.compiler import NativeProgram
+        if isinstance(program, NativeProgram):
+            # An isolated native call still uses its declared physical rank
+            # ports; it is the same launch view, not an unbound synthetic one.
+            rank_index = execution.participant_rank_index(replica, op.stage)
+            complete = execution.start_native_participant_with_handles(
+                program, "operator", ready, rank_index=rank_index,
+                resource_names=execution.native_resource_names(
+                    context, program, rank=rank_index, replica=replica),
+                transport=execution.native_transport(op, replica))[0]
+        else:
+            complete = program.start(engine, "operator", ready)
         engine.advance(horizon=input_ready_ms)
         early_service = {key: value for key, value in engine.serviced.items() if value}
         engine.advance(until=(complete,))
@@ -494,7 +788,9 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
                 input_ready_ms=input_ready_ms, serviced=engine.serviced,
                 early_service=early_service),
             **({"communication": _communication_description(execution.topology.accounting(
-                op, replica, volume=context.native_work["link"]), recipe)}
+                op, replica, volume=context.native_work["link"],
+                transport=execution.transport_options_for(
+                    op, replica, replay_scope)), recipe)}
                if context.native_work.get("link") else {}),
         })
     return {

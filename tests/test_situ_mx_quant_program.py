@@ -288,7 +288,10 @@ def test_declared_device_minimum_is_once_per_complete_kernel_and_excludes_host()
                             isolated=False, include_submission=True, trace_limit=200)
     assert device_only["duration_ms"] == pytest.approx(.01)
     assert submitted["duration_ms"] == pytest.approx(.017)
-    assert sum(e["task"].endswith(":minimum") for e in device_only["events"]) == 1
+    assert sum(
+        e["task"].endswith(":situ_mx_quant:complete") and e["end_ms"] == pytest.approx(.01)
+        for e in device_only["events"]
+    ) == 1
     assert device_only["execution"]["serviced"] == plain["execution"]["serviced"]
     assert submitted["execution"]["serviced"]["host@r0:s0"] == .007
 

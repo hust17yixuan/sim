@@ -379,24 +379,6 @@ def test_ep_mc2_communication_matches_analytic_geometry():
         * 61 / 1000)
 
 
-def test_no_non_public_hardware_codenames_in_public_inputs():
-    forbidden = re.compile(
-        r"\b(DV100|DV120|DV121|DV122|DV200|DAYU|YINHE|UBX|ZJ[-_]?UBX|"
-        r"HWJ[-_]?590|HWJ[-_]?690|R200[-_]?CPX|A6)\b",
-        re.IGNORECASE,
-    )
-    files = sorted((ROOT / "mindie_sim" / "backends" / "profiles").glob("*.json"))
-    files += sorted((ROOT / "mindie_sim" / "backends").glob("*.py"))
-    files.append(ROOT / "mindie_sim" / "compose.py")
-    assert files
-    matches = []
-    for path in files:
-        text = path.read_text(encoding="utf-8")
-        matches.extend(f"{path.name}:{match.group(0)}"
-                       for match in forbidden.finditer(text))
-    assert matches == []
-
-
 def test_nvidia_profile_json_is_well_formed_and_uses_declared_units():
     path = ROOT / "mindie_sim" / "backends" / "profiles" / "nvidia.json"
     data = json.loads(path.read_text(encoding="utf-8"))

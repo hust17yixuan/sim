@@ -10,6 +10,7 @@
 from hashlib import sha256
 from functools import lru_cache
 import json
+import re
 
 
 _WORK = ("flops", "hbm_bytes", "mte2_bytes", "mte3_bytes", "vector_ops", "link_bytes")
@@ -20,12 +21,14 @@ _ANNOTATIONS = {
     "fusion_group_key", "fusion_semantic_ids", "fusion_external_outputs",
     "graph_segment",
     "gathered_slice",  # Equal-sized rank slices differ in address, not copy work.
+    "norm_gamma_role",  # Role label (attn_norm/ffn_norm); format and bytes stay hashed.
 }
 _IDENTITY = {"op_id", "deps", "layer", "stage", "requests", "notes"}
 _PRODUCER_REFERENCES = {
     "topk_ids_producer", "topk_weights_producer", "payload_producer", "inverse_index_producer",
     "activation_payload_producer", "activation_scale_producer",
 }
+_OCCURRENCE_PREFIX = re.compile(r"(?:^|(?<=[:/]))s\d+\.l\d+\.")
 
 
 def _signature(value):
@@ -33,10 +36,31 @@ def _signature(value):
     return "sha256:" + sha256(encoded.encode()).hexdigest()
 
 
-def _metadata(value, references=None):
+def _scrub_occurrence(value, occurrences):
+    if isinstance(value, str):
+        return _OCCURRENCE_PREFIX.sub(
+            lambda m: occurrences.setdefault(m.group(0), f"occ{len(occurrences)}."),
+            value,
+        )
+    if isinstance(value, (list, tuple)):
+        return [_scrub_occurrence(item, occurrences) for item in value]
+    if isinstance(value, dict):
+        items = sorted(
+            value.items(),
+            key=lambda kv: (_OCCURRENCE_PREFIX.sub("", kv[0]), kv[0]) if isinstance(kv[0], str) else ("", str(kv[0])),
+        )
+        return {
+            (_scrub_occurrence(k, occurrences) if isinstance(k, str) else k): _scrub_occurrence(v, occurrences)
+            for k, v in items
+        }
+    return value
+
+
+def _metadata(value, references=None, occurrences=None):
     if not isinstance(value, dict):
         return value
     references = {} if references is None else references
+    occurrences = {} if occurrences is None else occurrences
     result = {}
     for key, item in sorted(value.items()):
         if key in _ANNOTATIONS:
@@ -52,7 +76,9 @@ def _metadata(value, references=None):
             # Keep whether two operands alias the same producer and preserve
             # absent operands; do not erase the physical relationship itself.
             item = references.setdefault(item, f"producer:{len(references)}")
-        result[key] = _metadata(item, references) if isinstance(item, dict) else item
+        elif isinstance(item, dict):
+            item = _metadata(item, references, occurrences)
+        result[key] = _scrub_occurrence(item, occurrences)
     return result
 
 

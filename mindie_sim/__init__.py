@@ -31,6 +31,8 @@ from .custom_hardware import (
     unregister_custom_hardware_sku,
 )
 from .advise import advise_case, load_case_from_profile
+from .launch_bindings import parse_launch
+from .feature_analysis import compare_launch
 from .model_catalog import customize_model_spec
 from .prediction.afd import effective_pool_link, predict_afd, solve_afd_pareto
 from .prediction.deepep import (
@@ -58,6 +60,7 @@ from .prediction.skew_analysis import (
     analyze_moe_routing_imbalance,
     analyze_multi_dp_barrier_skew,
 )
+from .diff_trace import attribute_diff, effective_operator_rows
 from .prediction.topology_tiers import (
     EP_TIER_PRESETS,
     analyze_ep_mc2_communication,
@@ -70,9 +73,29 @@ from .sweep import (
     sweep_pd_disaggregation_ratios,
     sweep_topology_grid,
 )
+from .public import (
+    CORE_PROVIDER,
+    ENTRY_POINT_GROUP,
+    INTERFACE_VERSION,
+    ExecutionEnvironment,
+    Extension,
+    ExtensionContext,
+    ExtensionError,
+    Provider,
+    USER_PROFILE_SCHEMA,
+    UserProfile,
+    load_extensions,
+    load_user_profile,
+    simulate_aclnn_call,
+    simulate_graph,
+    simulate_model,
+    simulate_native_call,
+    simulate_operator,
+    simulate_service,
+)
 
-__version__ = "0.9.11"
-__all__ = ["predict", "predict_pd", "graph_costs", "operator_costs", "target_graphs", "target_operators", "study",
+__version__ = "0.9.12"
+__all__ = ["predict", "predict_pd", "attribute_diff", "effective_operator_rows", "graph_costs", "operator_costs", "target_graphs", "target_operators", "study",
            "call_costs", "build_call",
            "compose_case", "resolve_hardware_sku", "customize_model_spec",
            "HARDWARE_ARCHETYPE_TEMPLATES", "export_hardware_sku_template",
@@ -93,6 +116,20 @@ __all__ = ["predict", "predict_pd", "graph_costs", "operator_costs", "target_gra
            "OffloadPolicy", "prepare_expert_offload", "analyze_kv_cache_offload",
            "enumerate_parallel_candidates", "sweep_topology_grid", "sweep_pd_disaggregation_ratios",
            "compute_pareto_frontier",
+           "CORE_PROVIDER", "ENTRY_POINT_GROUP", "INTERFACE_VERSION",
+           "ExecutionEnvironment", "USER_PROFILE_SCHEMA",
+           "Extension", "ExtensionContext", "ExtensionError", "Provider", "UserProfile",
+           "load_extensions", "load_user_profile",
+           "simulate_operator", "simulate_native_call", "simulate_aclnn_call",
+           "simulate_graph", "simulate_model", "simulate_service",
            "Case", "Software", "Hardware", "Device", "Link",
            "ModelSpec", "LayerPlan", "RequestSpec", "WorkloadSpec", "SloSpec",
-           "ParallelSpec", "ModelingError"]
+           "ParallelSpec", "ModelingError", "parse_launch", "compare_launch", "opflow"]
+
+
+def __getattr__(name: str):
+    if name == "opflow":
+        import importlib
+
+        return importlib.import_module(".opflow", __name__)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

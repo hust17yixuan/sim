@@ -57,9 +57,9 @@ class Builder:
         ))
 
     def work(self, name, deps, shape, *, flops=0, vector=0, read=0, write=0,
-             family="attention", dtype=None, metadata=()):
+             family="attention", dtype=None, recipe=None, metadata=()):
         return self.add(OpSpec(
-            op_id=self.prefix + "." + name, deps=tuple(deps), recipe=name, family=family,
+            op_id=self.prefix + "." + name, deps=tuple(deps), recipe=recipe or name, family=family,
             semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
             flops=flops, vector_ops=vector, hbm_bytes=read + write,
             mte2_bytes=read, mte3_bytes=write, dtype=dtype or self.model.compute_dtype,

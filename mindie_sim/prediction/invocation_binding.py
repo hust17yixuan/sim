@@ -7,13 +7,16 @@
 [Timeouts & Locks] Linear in the finite user-declared rule list; no I/O.
 [Side-Effect Policy] Returns timing plus provenance, without changing work.
 """
-from dataclasses import replace
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 from copy import deepcopy
 import hashlib
 import json
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.invocation import FloorConstraint
 from .invocation import InvocationProgram, InvocationTiming
+from .program import Program
 from .services import ResourceService
 
 
@@ -122,11 +125,66 @@ def hardware_invocation(context, devices, *, explicit_class=None):
     return res
 
 
+@dataclass(frozen=True)
+class _FloorJoinProgram:
+    """Zero-startup invocation whose completion floor needs no second task.
+
+    The declared floor completes at ``ready + minimum`` and the invocation
+    completes at ``max(body, floor)``.  When the input is already ready that
+    instant is known at submission, so one zero-work boundary with an explicit
+    release expresses it exactly.  A not-yet-ready input keeps the general
+    ``InvocationProgram`` (startup, floor and join) unchanged.
+    """
+
+    body: Program
+    minimum_ms: float
+    #: The selection provenance is carried as data; SOL admission reads it.
+    provenance: Mapping = field(default_factory=dict)
+    #: Independently provenanced merged floors; empty keeps legacy behavior.
+    constraints: tuple[FloorConstraint, ...] = ()
+
+    def effective_minimum(self):
+        return max((self.minimum_ms, *(item.minimum_ms
+                                       for item in self.constraints)),
+                   default=self.minimum_ms)
+
+    def start(self, engine, name, ready, *, owner=""):
+        minimum = self.effective_minimum()
+        if ready.time is None:
+            return InvocationProgram(
+                self.body,
+                InvocationTiming(minimum_ms=minimum, provenance=self.provenance),
+                self.constraints,
+            ).start(engine, name, ready, owner=owner)
+        body = self.body.start(engine, name + ":body", ready, owner=owner)
+        return engine.submit(
+            name + ":complete", after=(body,),
+            release=ready.time + minimum, owner=owner,
+        )
+
+
+def _constraints(context, timing):
+    """Keep each merged source's floor and provenance separate."""
+    constraints = [FloorConstraint(timing.startup_ms, timing.minimum_ms,
+                                   timing.provenance, "invocation")]
+    minimum = float(getattr(context, "minimum_ms", 0.0) or 0.0)
+    if minimum > 0:
+        constraints.append(FloorConstraint(
+            0.0, minimum,
+            dict(getattr(context, "minimum_provenance", {}) or {}),
+            "service_regime"))
+    return tuple(constraints)
+
+
 def lower_invocation(recipe, context):
     timing = context.invocation_timing
     if timing is None:
         return recipe.lower(context)
     body = recipe.lower(replace(context, minimum_ms=0, invocation_timing=None))
-    if context.minimum_ms > timing.minimum_ms:
-        timing = replace(timing, minimum_ms=context.minimum_ms)
-    return InvocationProgram(body, timing)
+    constraints = _constraints(context, timing)
+    # Keep ``timing`` as the invocation's own declaration; the merged floor
+    # stays in ``constraints`` so its provenance is never overwritten.
+    if timing.startup_ms == 0 and timing.minimum_ms > 0:
+        return _FloorJoinProgram(body, timing.minimum_ms, timing.provenance,
+                                 constraints)
+    return InvocationProgram(body, timing, constraints)

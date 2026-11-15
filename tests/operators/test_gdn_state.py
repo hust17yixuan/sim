@@ -618,7 +618,8 @@ def test_p_slot_release_follows_vector_consumption_not_right_gm_writeback():
         produced = phase_event(engine, 0, f"p{aiv + 2}", "compute")
         published = next(
             row for row in engine.trace
-            if row["task"].endswith(f":tile0:p_publish{aiv + 2}"))
+            if row["task"].endswith((f":tile0:p_publish{aiv + 2}",
+                                     f":tile0:p_publish{aiv + 2}:publish")))
         # Separate L0C banks let both results finish while their previous P
         # consumers are active; each publication still waits its own P_FREE.
         assert produced["end_ms"] < consumed["end_ms"]
@@ -644,7 +645,8 @@ def test_d_slot_release_waits_h_alias_store_but_not_independent_final_state():
             drain = phase_event(engine, chunk, f"state{aiv}", "store")
             published = next(
                 row for row in engine.trace
-                if row["task"].endswith(f":tile{chunk}:d_publish{aiv + 2}"))
+                if row["task"].endswith((f":tile{chunk}:d_publish{aiv + 2}",
+                                         f":tile{chunk}:d_publish{aiv + 2}:publish")))
             assert published["start_ms"] >= consumed["end_ms"]
             if chunk == 0:
                 assert published["start_ms"] >= drain["end_ms"]

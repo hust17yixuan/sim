@@ -11,7 +11,7 @@ from hashlib import sha256
 import json
 from pathlib import Path
 
-import ijson
+from mindie_sim.observations.store import json_items
 
 
 BEGIN = "<!-- current-body-evidence:start -->"
@@ -51,8 +51,7 @@ def retain(source):
     # rows and small summary fields belong to this consumer. Multiple bounded
     # passes avoid materializing unrelated history in the control process.
     def items(prefix, source_path=path):
-        with source_path.open("rb") as stream:
-            yield from ijson.items(stream, prefix, use_float=True)
+        yield from json_items(source_path, prefix)
 
     packet = {key: next(items(key)) for key in ("summary", "limitations")}
     publication = next(items("publication_format"), None)

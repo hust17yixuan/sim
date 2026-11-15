@@ -14,6 +14,7 @@ _MAP_FIELDS = (
     "compute_peaks", "rates", "buffers", "resource_units", "buffer_units",
     "work_units", "kernel_invocations", "store_queues",
 )
+_ARCH_FIELDS = ("architecture", "arch_family")
 _RATE_FIELDS = {
     "hbm_bw_bytes_per_s": ("hbm",),
     "vector_ops_per_s": ("vector",),
@@ -27,12 +28,18 @@ _RATE_FIELDS = {
 }
 _RATE_ALIASES = {"memory": "hbm", "read": "mte2", "write": "mte3"}
 _POOLS = ("l1", "l0a", "l0b", "l0c", "ub")
+#: Capability declarations merge by name so one per-device override does not
+#: discard the other declared modes, casts or paths.
+_CAPABILITY_MAP_FIELDS = (
+    "instruction_services", "representations", "native_compute", "casts",
+    "paths", "runtimes",
+)
 
 
 def machine_device_defaults(raw):
     """Extract common device supply; rank/node/package remain placement fields."""
     fields = {
-        *_MAP_FIELDS, "service_modes", "compute_arch", *_RATE_FIELDS,
+        *_MAP_FIELDS, *_ARCH_FIELDS, "service_modes", "compute_arch", *_RATE_FIELDS,
         "memory_bytes", "hbm_gib", "hbm_bytes", "cube_flops_per_s",
         "compute_units", "aic_count", "aiv_count", "launch_us",
         *(pool + "_bytes" for pool in _POOLS),
@@ -42,6 +49,13 @@ def machine_device_defaults(raw):
 
 def _normalize(raw):
     data = deepcopy(raw)
+    # Architecture synonyms are resolved once per declaration layer. The
+    # original same-layer priority is architecture > arch_family; the canonical
+    # field is arch_family so a later layer can override an earlier identity.
+    if "architecture" in data:
+        architecture = data.pop("architecture")
+        if architecture is not None:
+            data["arch_family"] = architecture
     rates = {}
     for field, roles in _RATE_FIELDS.items():
         if field in data:
@@ -69,6 +83,15 @@ def _normalize(raw):
     if "aic_count" in data:
         count = data.pop("aic_count")
         data.setdefault("compute_units", count)
+    if "num_cores" in data or "cores" in data:
+        # Existing per-layer priority: compute_units > aic_count > num_cores
+        # > cores. The aliases are consumed here so an inherited compute_units
+        # from a previous layer cannot mask them.
+        count = data.pop("num_cores", None)
+        cores = data.pop("cores", None)
+        count = count if count is not None else cores
+        if count is not None:
+            data.setdefault("compute_units", count)
     if "aiv_count" in data:
         count = data.pop("aiv_count")
         data["resource_units"] = {"vector": count, **data.get("resource_units", {})}
@@ -99,10 +122,18 @@ def merge_device_inputs(*declarations):
         data = _normalize(raw)
         if "compute_arch" in data:
             previous_arch = result.get("compute_arch", {})
-            data["compute_arch"] = {**previous_arch, **data["compute_arch"],
-                "instruction_services": {
-                    **previous_arch.get("instruction_services", {}),
-                    **data["compute_arch"].get("instruction_services", {})}}
+            current_arch = data["compute_arch"]
+            changed_preset = (current_arch.get("preset")
+                              and previous_arch.get("preset")
+                              and current_arch["preset"] != previous_arch["preset"])
+            base = {} if changed_preset else previous_arch
+            merged_arch = {**base, **current_arch}
+            for field in _CAPABILITY_MAP_FIELDS:
+                if field in base and field in current_arch:
+                    merged_arch[field] = {**base[field], **current_arch[field]}
+                elif field in base and field not in current_arch:
+                    merged_arch[field] = base[field]
+            data["compute_arch"] = merged_arch
         previous = result.get("rates", {})
         ratios = {}
         for role, new_rate in data.get("rates", {}).items():

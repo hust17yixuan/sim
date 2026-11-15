@@ -75,16 +75,40 @@ def apply_traffic_profile(ops, declaration, profile, *, external_outputs=()):
         raise ModelingError("native_fusion_traffic_profile_role_mismatch")
     phases = list(ops)
     positions = {op.op_id: index for index, op in enumerate(phases)}
+    exact_external, all_external = set(), set()
+    for item in external_outputs:
+        if isinstance(item, str):
+            all_external.add(item)
+        elif isinstance(item, (tuple, list)) and len(item) == 2:
+            exact_external.add((str(item[0]), str(item[1])))
+        elif isinstance(item, dict):
+            producer = item.get("op") or item.get("member")
+            if isinstance(producer, str) and item.get("output"):
+                exact_external.add((producer, str(item["output"])))
+    external_positions = {
+        positions[producer] for producer, _ in exact_external if producer in positions
+    } | {positions[producer] for producer in all_external if producer in positions}
     ledger = {"profile": profile, "eliminated_reads": 0.0, "eliminated_writes": 0.0,
-              "reused_edges": [], "limitations": [], "source": None}
+              "reused_edges": [], "limitations": [], "source": None,
+              "value_effects": [],
+              "external_output_writes_preserved_phase_positions": sorted(external_positions),
+              "representation_guard": {},
+              "capture": {"implied": False, "kernel_count_unchanged": True},
+              "overlap": {"implied": False, "declared_concurrency": "unchanged"}}
 
     def recipe(name):
         return next(op for op in phases if op.recipe == name)
 
-    def remove(producer, consumer, amount, *, preserve_output=False):
+    def remove(producer, consumer, amount, *, preserve_output=False,
+               producer_output=None):
         source, target = positions[producer.op_id], positions[consumer.op_id]
         before, after = phases[source], phases[target]
-        preserve_output = preserve_output or producer.op_id in external_outputs
+        if producer_output is None:
+            from .implementations import produced_values
+            values = produced_values(producer)
+            producer_output = values[0]["output"] if values else "output"
+        preserve_output = (preserve_output or producer.op_id in all_external
+                           or (producer.op_id, producer_output) in exact_external)
         write = 0 if preserve_output else amount
         if amount > after.mte2_bytes + 1e-6 or write > before.mte3_bytes + 1e-6:
             raise ModelingError("native_fusion_reuse_exceeds_declared_tensor_transfer")
@@ -99,13 +123,36 @@ def apply_traffic_profile(ops, declaration, profile, *, external_outputs=()):
             "read_bytes": amount, "write_bytes": write,
             "externally_visible_write_preserved": preserve_output,
         })
+        ledger["value_effects"].append({
+            "producer_phase": source, "consumer_phase": target,
+            "value": producer_output,
+            "action": "preserve" if preserve_output else "consume",
+            "materialized": preserve_output,
+            "hbm_write_bytes": write,
+            "source": "selected_source_profile",
+        })
+        ledger["value_effects"].append({
+            "consumer_phase": target, "value": "input",
+            "action": "consume", "materialized": False,
+            "hbm_read_bytes": amount,
+            "source": "selected_source_profile",
+        })
 
     if profile == "preserve_workspaces":
         ledger["limitations"].append("internal_tensor_placement_not_selected")
+        ledger["value_effects"].append({
+            "value": "all_internal_edges",
+            "action": "preserve", "materialized": True,
+            "source": "no_selected_traffic_profile",
+        })
         return tuple(phases), ledger
     role, view = declaration["role"], declaration["tensor_view"]
     from .family_hc_arch35 import PRE_PROFILE, COMPACT_PRE_PROFILE, POST_PROFILE, SOURCE, LIMITATIONS
     if profile in {PRE_PROFILE, COMPACT_PRE_PROFILE, POST_PROFILE}:
+        ledger["representation_guard"] = {
+            "role": role, "dtype": view.get("dtype"),
+            "parameter_dtype": view.get("parameter_dtype"),
+        }
         ledger["source"] = SOURCE
         ledger["limitations"].extend((
             "complete_source_replacement_owns_all_workspace_and_output_traffic",
@@ -113,6 +160,10 @@ def apply_traffic_profile(ops, declaration, profile, *, external_outputs=()):
         ))
         return tuple(phases), ledger
     if profile == MLA_PACKED_PROFILE:
+        ledger["representation_guard"] = {
+            "role": role, "latent_rank": view.get("latent_rank"),
+            "rope_width": view.get("rope_width"),
+        }
         from .mla_prolog_packed import SOURCE as PACKED_SOURCE, validate_view
         validate_view(view)
         ledger["source"] = PACKED_SOURCE
@@ -123,6 +174,11 @@ def apply_traffic_profile(ops, declaration, profile, *, external_outputs=()):
         ])
         return tuple(phases), ledger
     if profile == MLA_ARCH22_PROFILE:
+        ledger["representation_guard"] = {
+            "role": role, "dtype": view.get("dtype"),
+            "cache_dtype": view.get("cache_dtype"),
+            "scale_dtype": view.get("scale_dtype"),
+        }
         # The complete source program owns every scratch materialization. Do
         # not apply arch35 local-reuse savings or member epilogue work here.
         if role != "mla_prolog":
@@ -172,6 +228,10 @@ def apply_traffic_profile(ops, declaration, profile, *, external_outputs=()):
             "vector_issue_barrier_latency_and_instruction_ports_not_calibrated",
         ])
     elif role == "situ_quant":
+        ledger["representation_guard"] = {
+            "input_dtype": view["input_dtype"], "output_dtype": view["output_dtype"],
+            "scale_dtype": view["scale_dtype"], "axis": view["axis"],
+        }
         if (view["input_dtype"] != "bf16"
                 or view["output_dtype"] not in {"fp8_e4m3", "fp8_e5m2"}
                 or view["scale_dtype"] != "fp8_e8m0" or view["axis"] != -1):
@@ -187,6 +247,10 @@ def apply_traffic_profile(ops, declaration, profile, *, external_outputs=()):
         ])
     elif role == "grouped_gate_up_activation_quant":
         expected = "int4" if profile == "grouped_swiglu_quant_int4_post_ae923905" else "int8"
+        ledger["representation_guard"] = {
+            "input_dtype": view["input_dtype"], "weight_dtype": view["weight_dtype"],
+            "output_dtype": view["output_dtype"], "expected_weight_dtype": expected,
+        }
         if (view["input_dtype"], view["weight_dtype"], view["output_dtype"]) != (
                 "int8", expected, "int8"):
             raise ModelingError("native_fusion_traffic_profile_representation_mismatch")

@@ -61,7 +61,13 @@ def test_chunked_prefill_mean_ttft_round_robin_and_chunking():
     assert seen_chunks == [(8192, 8192), (8192, 16384)]
     assert ctx_aware == pytest.approx((0.05 * 8192 + 0.01 * 8192) + (0.05 * 8192 + 0.01 * 16384))
     assert service_ttft_overhead_ms(prompt_tokens=4096, tp=8, ep=32) == 0.0
-    assert service_ttft_overhead_ms(prompt_tokens=1024, tp=8, ep=32) == pytest.approx(145.0)
+    # Host time is a declared input, not a prompt/TP/EP fitted constant.
+    assert service_ttft_overhead_ms(
+        prompt_tokens=1024, tp=8, ep=32, host_overhead_ms=145.0,
+    ) == pytest.approx(145.0)
+    assert service_ttft_overhead_ms(
+        prompt_tokens=4096, tp=1, ep=1, host_overhead_ms=145.0,
+    ) == pytest.approx(145.0)
 
 
 def test_hardware_cube_peak_sensitivity_moves_compiled_gemm():
@@ -111,7 +117,7 @@ def test_lower_layer_predictions_preserves_dense_and_lowers_ep_subgraphs():
 
     # 2) Single-row F0 call is invariant to model_label and never invents moe_grouped.
     f0_row = SimpleNamespace(
-        name="gate_up", kind="F0", mechanism="gemm", total_ms=0.026597, count=1, cost=None
+        name="gate_up", kind="mlp", mechanism="gemm", total_ms=0.026597, count=1, cost=None
     )
     f0_neu = lower_layer_predictions(
         model_label="neutral", rows=[f0_row], per_layer={"gemm": 0.026597}, body_ms=0.026597
@@ -128,14 +134,14 @@ def test_lower_layer_predictions_preserves_dense_and_lowers_ep_subgraphs():
 
     # 3) Full-layer rows lower purely from structural kinds/rows and are label-invariant.
     full_rows = [
-        SimpleNamespace(name="rmsnorm", kind="N0", mechanism="norm_residual", total_ms=1.22, count=61, cost=None),
-        SimpleNamespace(name="mla_attention", kind="A1", mechanism="attention", total_ms=7.32, count=61, cost=None),
-        SimpleNamespace(name="index_score", kind="I0", mechanism="indexer", total_ms=0.61, count=61, cost=None),
-        SimpleNamespace(name="router_topk", kind="F1", mechanism="moe_router", total_ms=0.61, count=61, cost=None),
-        SimpleNamespace(name="dispatch", kind="F2", mechanism="collective", total_ms=2.44, count=61, cost=None),
+        SimpleNamespace(name="rmsnorm", kind="layernorm", mechanism="norm_residual", total_ms=1.22, count=61, cost=None),
+        SimpleNamespace(name="mla_attention", kind="mla_attention", mechanism="attention", total_ms=7.32, count=61, cost=None),
+        SimpleNamespace(name="index_score", kind="indexer_prolog", mechanism="indexer", total_ms=0.61, count=61, cost=None),
+        SimpleNamespace(name="router_topk", kind="moe_router", mechanism="moe_router", total_ms=0.61, count=61, cost=None),
+        SimpleNamespace(name="dispatch", kind="moe_token_dispatcher", mechanism="collective", total_ms=2.44, count=61, cost=None),
         SimpleNamespace(
             name="expert_gate_up",
-            kind="F3",
+            kind="routed_experts",
             mechanism="moe_grouped",
             total_ms=12.20,
             count=61,
@@ -221,7 +227,7 @@ def test_p1_2_p1_3_p1_4_f3_routing_quant_cross_pipe_monotonicity_and_assumptions
             sup_full,
             rates=tuple({**r_base, "vector": r_base["vector"] * 0.5, "hbm": r_base["hbm"] * hbm_mult}.items()),
         )
-        durs_a0.append(float(OperatorPiecewiseCompiler(sup_mod, pol).compile_operator(a0_op, kind="A0").evaluate(g16k).duration_ms))
+        durs_a0.append(float(OperatorPiecewiseCompiler(sup_mod, pol).compile_operator(a0_op, kind="gqa_attention").evaluate(g16k).duration_ms))
     assert durs_a0[0] >= durs_a0[1] >= durs_a0[2]
 
     # P1-2: F3 prefill quant with explicit routing does not double-localize by local_batch / batch
@@ -247,7 +253,7 @@ def test_p1_2_p1_3_p1_4_f3_routing_quant_cross_pipe_monotonicity_and_assumptions
         local_batch=1,
         routing=((0, (32, 32)),),
     )
-    comp_q = OperatorPiecewiseCompiler(sup_full, pol).compile_operator(q_op, kind="F3")
+    comp_q = OperatorPiecewiseCompiler(sup_full, pol).compile_operator(q_op, kind="routed_experts")
     assert comp_q.evaluate(g_routed_b4).duration_ms == comp_q.evaluate(g_routed_b1).duration_ms
 
     # P1-2 (StateView routing with E == local == 2):
@@ -263,7 +269,7 @@ def test_p1_2_p1_3_p1_4_f3_routing_quant_cross_pipe_monotonicity_and_assumptions
             tiles=(("mt", 64), ("cores", 8)),
         ),
     )
-    comp_q_e2 = OperatorPiecewiseCompiler(sup_full, pol).compile_operator(q_op_e2, kind="F3")
+    comp_q_e2 = OperatorPiecewiseCompiler(sup_full, pol).compile_operator(q_op_e2, kind="routed_experts")
     g_sv_b1 = WorkloadGeometry(
         tuple(RequestGeometry(2048, 0, phase="prefill") for _ in range(4)),
         phase="prefill",

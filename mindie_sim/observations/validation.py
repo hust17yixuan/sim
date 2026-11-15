@@ -10,7 +10,10 @@ import json
 import math
 from pathlib import Path
 
-import ijson
+try:
+    import ijson
+except ImportError:  # pragma: no cover - stdlib fallback when ijson is absent
+    ijson = None
 
 
 class _Moments:
@@ -46,35 +49,69 @@ def service_observation(path):
     observed_requests = successful = exact_usage = output_tokens = 0
     # Parse scalar leaves so token arrays and full response text are never
     # accumulated, even in captures hundreds of megabytes in size.
-    with Path(path).open("rb") as stream:
-        for prefix, event, value in ijson.parse(stream, use_float=True):
-            if prefix == "per_request.item" and event == "start_map":
-                request = {}
-            elif prefix == "per_request.item" and event == "end_map":
-                observed_requests += 1
-                if request.get("ok"):
-                    successful += 1
-                    tokens = request.get("completion_tokens")
-                    decode = request.get("decode_ms")
-                    first = request.get("ttft_ms")
-                    if tokens is not None:
-                        exact_usage += 1
-                        output_tokens += tokens
-                        if tokens > 1 and decode is not None:
-                            tpot.add(decode / (tokens - 1))
-                    if first is not None and decode is not None:
-                        last_text_e2e.add(first + decode)
-            elif prefix.startswith("per_request.item.") and event in {"number", "boolean", "null"}:
-                key = prefix.removeprefix("per_request.item.")
-                if key in request_fields:
-                    request[key] = value
-            keys = prefix.split(".")
-            if keys[0] not in wanted or len(keys) > 2 or event not in {"string", "number", "boolean", "null"}:
-                continue
-            if len(keys) == 1:
-                record[keys[0]] = value
-            else:
-                record.setdefault(keys[0], {})[keys[1]] = value
+    if ijson is not None:
+        with Path(path).open("rb") as stream:
+            for prefix, event, value in ijson.parse(stream, use_float=True):
+                if prefix == "per_request.item" and event == "start_map":
+                    request = {}
+                elif prefix == "per_request.item" and event == "end_map":
+                    observed_requests += 1
+                    if request.get("ok"):
+                        successful += 1
+                        tokens = request.get("completion_tokens")
+                        decode = request.get("decode_ms")
+                        first = request.get("ttft_ms")
+                        if tokens is not None:
+                            exact_usage += 1
+                            output_tokens += tokens
+                            if tokens > 1 and decode is not None:
+                                tpot.add(decode / (tokens - 1))
+                        if first is not None and decode is not None:
+                            last_text_e2e.add(first + decode)
+                elif prefix.startswith("per_request.item.") and event in {"number", "boolean", "null"}:
+                    key = prefix.removeprefix("per_request.item.")
+                    if key in request_fields:
+                        request[key] = value
+                keys = prefix.split(".")
+                if keys[0] not in wanted or len(keys) > 2 or event not in {"string", "number", "boolean", "null"}:
+                    continue
+                if len(keys) == 1:
+                    record[keys[0]] = value
+                else:
+                    record.setdefault(keys[0], {})[keys[1]] = value
+    else:
+        with Path(path).open("rb") as stream:
+            doc = json.load(stream)
+        if isinstance(doc, dict):
+            for key in wanted:
+                if key not in doc:
+                    continue
+                val = doc[key]
+                if not isinstance(val, (dict, list)):
+                    record[key] = val
+                elif isinstance(val, dict):
+                    for subkey, subval in val.items():
+                        if not isinstance(subval, (dict, list)):
+                            record.setdefault(key, {})[subkey] = subval
+            per_req = doc.get("per_request")
+            if isinstance(per_req, list):
+                for item in per_req:
+                    if not isinstance(item, dict):
+                        continue
+                    observed_requests += 1
+                    if item.get("ok") is True:
+                        successful += 1
+                        tokens = item.get("completion_tokens")
+                        decode = item.get("decode_ms")
+                        first = item.get("ttft_ms")
+                        if isinstance(tokens, (int, float)) and not isinstance(tokens, bool):
+                            exact_usage += 1
+                            output_tokens += tokens
+                            if tokens > 1 and isinstance(decode, (int, float)) and not isinstance(decode, bool):
+                                tpot.add(decode / (tokens - 1))
+                        if (isinstance(first, (int, float)) and not isinstance(first, bool)
+                                and isinstance(decode, (int, float)) and not isinstance(decode, bool)):
+                            last_text_e2e.add(first + decode)
     if "n_ok" not in record or "ttft_ms" not in record:
         raise ValueError("not_a_raw_service_measurement")
     # The historical bench_stream producer divides by nonempty SSE events,

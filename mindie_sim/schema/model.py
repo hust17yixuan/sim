@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+from copy import deepcopy
 import math
 from dataclasses import dataclass, replace
 from typing import Any, Mapping, Sequence
@@ -27,6 +28,7 @@ from mindie_sim.schema.common import ModelingError, _DTYPE_BYTES, _int, _mapping
 from mindie_sim.catalog.types import (
     AuxiliarySpec, DraftSpec, EngramSpec, QuantSpec, VisionSpec,
 )
+from mindie_sim.nr_s7_validate import _request_int, _validate_request, _validate_workload
 
 
 @dataclass(frozen=True)
@@ -49,10 +51,11 @@ class MlaSpec:
     def from_mapping(cls, value: Any) -> "MlaSpec":
         raw = _mapping(value, "model.mla_invalid")
         allowed = {"q_lora_rank", "kv_lora_rank", "qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim",
+                   "qk_head_dim",
                    "o_lora_rank", "o_groups", "index_topk", "index_head_dim", "index_n_heads",
                    "compress_ratio", "sliding_window"}
         _unknown(raw, allowed, "model.mla")
-        return cls(
+        result = cls(
             q_lora_rank=_int(raw.get("q_lora_rank") or 0, "model.mla.q_lora_rank_invalid", minimum=0),
             kv_lora_rank=_int(raw.get("kv_lora_rank", 0), "model.mla.kv_lora_rank_invalid", minimum=1),
             qk_nope_head_dim=_int(raw.get("qk_nope_head_dim", 0), "model.mla.qk_nope_invalid", minimum=1),
@@ -66,23 +69,47 @@ class MlaSpec:
             compress_ratio=_int(raw.get("compress_ratio", 0), "model.mla.compress_ratio_invalid", minimum=0),
             sliding_window=_int(raw.get("sliding_window", 0), "model.mla.sliding_window_invalid", minimum=0),
         )
+        # ``to_dict`` emits the derived QK width for readers that consume the
+        # exported representation.  It is not an independent input: if a
+        # caller supplies it, it must agree with the two component widths.
+        declared = raw.get("qk_head_dim")
+        if declared is not None:
+            declared_width = _int(declared, "model.mla.qk_head_dim_invalid", minimum=1)
+            if declared_width != result.qk_head_dim:
+                raise ModelingError(
+                    f"model.mla.qk_head_dim_conflict:{declared_width}!={result.qk_head_dim}")
+        return result
 
     @property
     def qk_head_dim(self) -> int:
         return self.qk_nope_head_dim + self.qk_rope_head_dim
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "q_lora_rank": self.q_lora_rank, "kv_lora_rank": self.kv_lora_rank,
-            "qk_nope_head_dim": self.qk_nope_head_dim, "qk_rope_head_dim": self.qk_rope_head_dim,
-            "qk_head_dim": self.qk_head_dim, "v_head_dim": self.v_head_dim,
-        }
+        data = {key: getattr(self, key) for key in self.__dataclass_fields__}
+        data["qk_head_dim"] = self.qk_head_dim
+        return data
+
+
+#: ``LayerPlan.indexer_type`` spelling -> canonical role (per_layer->full).
+INDEXER_TYPE_ALIASES = {
+    "": "none",
+    "none": "none",
+    "disabled": "none",
+    "per_layer": "full",
+    "per-layer": "full",
+    "perlayer": "full",
+    "full": "full",
+    "shared": "shared",
+    "c4": "c4",
+}
+INDEXER_TYPES = frozenset({"none", "c4", "full", "shared"})
 
 
 @dataclass(frozen=True)
 class LayerPlan:
     index: int
-    attention: str = "gqa"          # gqa | mla | kda | gdn
+    #: Declared attention mechanism (mha/gqa/mqa/mla/dsa/swa/csa/csa2/hca/gdn/kda).
+    attention: str = "gqa"
     ffn: str = "dense"              # dense | moe
     compress_ratio: int = 0
     indexer: bool = False
@@ -106,6 +133,8 @@ class LayerPlan:
     state_bytes: float = 0.0
     mtp: bool = False
     # --- catalog-rich structural fields (defaults preserve generic callers) ---
+    #: Declared layer schedule name (paper-aligned): ``mha``/``gqa``/``mqa``,
+    #: ``mla``/``mla_dsa``, ``swa``/``csa``/``csa2``/``hca``, ``gdn``/``kda``.
     architecture: str = "gqa"
     indexer_type: str = "none"          # none | c4 | full | shared
     candidate_filter: bool = False
@@ -113,6 +142,7 @@ class LayerPlan:
     o_groups: int = 0
     mla_variant: str = "none"           # none | latent_mqa | latent_mla
     mla_output_gate: bool = False
+    mla_qkv_a_gate_fused: bool = False
     q_output_gate: bool = False
     noncausal_attention: bool = False
     expert_latent_size: int = 0
@@ -136,6 +166,7 @@ class LayerPlan:
     conv_width: int = 0
     recurrent_state_elements: int = 0
     recurrent_state_dtype: str = "fp32"
+    kda_gate_lower_bound: float | None = None
     conv_state_elements: int = 0
     conv_state_dtype: str = "bf16"
     kv_cache_elements: int = 0
@@ -176,6 +207,17 @@ class LayerPlan:
     activation_situ_beta: float = 1.0
     activation_situ_linear_beta: float | None = None
     k_eq_v: bool = False
+
+    def __post_init__(self) -> None:
+        # Normalise the declared indexer role once, so every downstream reader
+        # (slot variant, builder variant, cache-row accounting) sees one
+        # spelling.  Unknown roles fail loudly instead of being guessed.
+        raw = str(self.indexer_type if self.indexer_type is not None else "").strip().lower()
+        role = INDEXER_TYPE_ALIASES.get(raw)
+        if role is None:
+            raise ModelingError(f"layer_plan_indexer_type_unknown:{raw}")
+        if role != self.indexer_type:
+            object.__setattr__(self, "indexer_type", role)
 
     @property
     def indexer_executes(self) -> bool:
@@ -436,8 +478,8 @@ class ModelSpec:
     def to_dict(self):
         from dataclasses import asdict
         data = asdict(self)
-        data["metadata"] = dict(self.metadata)
-        data["catalog_facts"] = dict(self.catalog_facts)
+        data["metadata"] = {key: deepcopy(value) for key, value in self.metadata}
+        data["catalog_facts"] = {key: deepcopy(value) for key, value in self.catalog_facts}
         return data
 
 
@@ -526,6 +568,11 @@ class RequestSpec:
     chain_id: int = 0
     gap_ms: float = 0.0
 
+    def __post_init__(self) -> None:
+        arrival, gap = _validate_request(self)
+        object.__setattr__(self, "arrival_ms", arrival)
+        object.__setattr__(self, "gap_ms", gap)
+
     @classmethod
     def from_mapping(cls, value: Any, index: int) -> "RequestSpec":
         raw = _mapping(value, f"workload.requests[{index}]_invalid")
@@ -533,30 +580,28 @@ class RequestSpec:
                        "text_tokens", "media_tokens", "media_encoded",
                        "output_tokens", "output_len", "prefix_tokens", "prefix_len", "priority",
                        "chain_id", "gap_ms", "text_prompt_tokens"}, "workload.request")
-        request_id = str(raw.get("request_id", raw.get("id", f"r{index}")))
-        text_prompt = _int(
+        request_id = raw.get("request_id", raw.get("id", f"r{index}"))
+        text_prompt = _request_int("prompt_tokens",
             raw.get("text_prompt_tokens",
                     raw.get("text_tokens", raw.get("prompt_tokens", raw.get("prompt_len")))),
-            "workload.prompt_tokens_invalid", minimum=1,
+            reason="workload", minimum=0,
         )
-        media_tokens = _int(raw.get("media_tokens", 0), "workload.media_tokens_invalid", minimum=0)
-        media_encoded = bool(raw.get("media_encoded", False))
+        media_tokens = _request_int("media_tokens", raw.get("media_tokens", 0), reason="workload")
         # Encoding status may skip vision work, but media positions remain part
         # of the sequence budget and cache.
         prompt = text_prompt + media_tokens
-        output = _int(raw.get("output_tokens", raw.get("output_len")), "workload.output_tokens_invalid", minimum=1)
-        prefix = _int(raw.get("prefix_tokens", raw.get("prefix_len", 0)), "workload.prefix_tokens_invalid")
-        if prefix > prompt:
-            raise ModelingError("workload.prefix_exceeds_prompt")
+        if ("text_prompt_tokens" in raw or "text_tokens" in raw) and "prompt_tokens" in raw:
+            if _request_int("prompt_tokens", raw["prompt_tokens"], minimum=1, reason="workload") != prompt:
+                raise ModelingError("workload.text_media_prompt_mismatch")
         return cls(
             request_id=request_id,
-            arrival_ms=_positive_float(raw.get("arrival_ms", 0.0), "workload.arrival_invalid", allow_zero=True),
-            prompt_tokens=prompt, output_tokens=output, prefix_tokens=prefix,
-            priority=_int(raw.get("priority", 0), "workload.priority_invalid", minimum=0),
+            arrival_ms=raw.get("arrival_ms", 0.0), prompt_tokens=prompt,
+            output_tokens=raw.get("output_tokens", raw.get("output_len")),
+            prefix_tokens=raw.get("prefix_tokens", raw.get("prefix_len", 0)),
+            priority=raw.get("priority", 0),
             text_prompt_tokens=text_prompt, media_tokens=media_tokens,
-            media_encoded=media_encoded,
-            chain_id=_int(raw.get("chain_id", 0), "workload.chain_id_invalid", minimum=0),
-            gap_ms=_positive_float(raw.get("gap_ms", 0.0), "workload.gap_ms_invalid", allow_zero=True),
+            media_encoded=raw.get("media_encoded", False),
+            chain_id=raw.get("chain_id", 0), gap_ms=raw.get("gap_ms", 0.0),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -581,6 +626,20 @@ class WorkloadSpec:
     synthetic: bool = False
     metadata: tuple[tuple[str, str], ...] = ()
 
+    def __post_init__(self) -> None:
+        requests, metadata = _validate_workload(self)
+        object.__setattr__(self, "requests", requests)
+        object.__setattr__(self, "metadata", metadata)
+
+    @classmethod
+    def _pure_model_sentinel(cls) -> "WorkloadSpec":
+        """Represent absent workload geometry only for pure-model parsing."""
+        sentinel = object.__new__(cls)
+        object.__setattr__(sentinel, "requests", ())
+        object.__setattr__(sentinel, "synthetic", False)
+        object.__setattr__(sentinel, "metadata", ())
+        return sentinel
+
     @classmethod
     def from_mapping(cls, value: Any) -> "WorkloadSpec":
         raw = _mapping(value, "workload_invalid")
@@ -603,9 +662,6 @@ class WorkloadSpec:
                 for i in range(count)
             )
             synthetic = bool(raw.get("synthetic", True))
-        ids = [request.request_id for request in requests]
-        if len(ids) != len(set(ids)):
-            raise ModelingError("workload.request_id_duplicate")
         return cls(requests=requests, synthetic=synthetic, metadata=_metadata(raw))
 
     def validate_model(self, model: ModelSpec, runtime: "RuntimeSpec") -> None:

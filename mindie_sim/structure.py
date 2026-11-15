@@ -3,6 +3,8 @@
 [Role] Reuse the semantic frontend and implementation expansion for profiling.
 [Invariants] Node identities preserve layer/replica instances. Declared tensor
   contracts and software boundaries are not evidence that kernels were observed.
+  Every node keeps per-value dtype/layout/quant/attrs, nullable semantic refs and
+  separate native candidates/selection; candidates never become executed work.
   Source calls retain their children; unknown logical origins are not invented.
 [Timeouts & Locks] One finite target cohort, metadata only; no device or locks.
 [Side-Effect Policy] The CLI reads one bounded case and writes requested JSON.
@@ -12,7 +14,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 from collections.abc import Mapping
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -26,7 +28,9 @@ from .prediction.native_binding import (
 from .prediction.program import RecipeBook
 from .prediction.structure import parse_case
 from .structure_contracts import comparison_scope, predicted_contract
-from .structure_implementations import native_implementation
+from .structure_implementations import (
+    native_implementation, operator_structure, region_structure,
+)
 from .structure_physical import node_physical, subgraph_physical
 from .structure_subgraphs import (
     export_subgraphs, layer_structure, metadata, subgraph_comparison_scope,
@@ -83,32 +87,6 @@ def _json_value(value):
     return _intern_tree(json.loads(json.dumps(value, allow_nan=False)))
 
 
-_NATIVE_EVIDENCE_KEYS = frozenset(("native_call", "native_call_binding", "observed_aliases"))
-
-
-def _without_native_call_evidence(op):
-    """Structural view: derived native-call provenance is not identity.
-
-    ``native_call``/``native_call_binding``/``observed_aliases`` describe what a
-    profiler observed about a boundary, not the declared structural or physical
-    program.  They are carried beside the graph identity and must not enter the
-    node, source-call or physical-signature serialization.
-    """
-    meta = dict(op.metadata)
-    semantic = meta.get("semantic_metadata")
-    nested = (isinstance(semantic, Mapping)
-              and bool(_NATIVE_EVIDENCE_KEYS.intersection(semantic)))
-    if not _NATIVE_EVIDENCE_KEYS.intersection(meta) and not nested:
-        return op
-    for key in _NATIVE_EVIDENCE_KEYS:
-        meta.pop(key, None)
-    if nested:
-        meta["semantic_metadata"] = {
-            key: value for key, value in semantic.items()
-            if key not in _NATIVE_EVIDENCE_KEYS}
-    return replace(op, metadata=tuple(meta.items()))
-
-
 def _node_id(replica, op_id):
     return f"rank:{replica}/{op_id}"
 
@@ -119,18 +97,56 @@ def _block(op):
     return _FAMILY_BLOCKS.get(op.family)
 
 
+def _semantic_refs(op, replica, *, parent=None, block=None):
+    """Nullable semantic relations; none decides whether this node executes."""
+    meta = metadata(op)
+    refs = []
+    if op.layer is not None and op.layer >= 0:
+        refs.append({"kind": "layer", "name": str(op.layer),
+                     "role": block or "layer"})
+    for group in meta.get("structure_subgraph_memberships", ()):
+        refs.append({"kind": "subgraph",
+                     "name": f"rank:{replica}/subgraph:{group}", "role": "member"})
+    for origin in meta.get("fused_origin_scopes", ()):
+        if isinstance(origin, dict) and origin.get("layer") is not None:
+            refs.append({"kind": "layer", "name": str(origin["layer"]),
+                         "role": origin.get("block") or "layer"})
+    if parent is not None:
+        refs.append({"kind": "operator", "name": parent, "role": "source_call"})
+    unique = []
+    for ref in refs:
+        if ref not in unique:
+            unique.append(ref)
+    return unique
+
+
 def _node(op, replica, *, source_call=None, block=None, role=None, structure=None,
-          kernels=None, book=None, geometry=None, shared_call=None, native_sink=None):
+          kernels=None, book=None, geometry=None, shared_call=None, native_sink=None,
+          semantic_refs=None, outputs_by_id=None, metadata_by_id=None):
     plan = None
     if geometry is not None and op.source_boundary != "call":
         # Source planners own physical declarations. Preparing a plan does not
         # start its program, consult timings, or resolve captured ABI identity.
         op, plan = book.prepare(op, geometry)
-    # The actual call keeps the full operator metadata (including observed
-    # aliases); structural and physical views strip only derived evidence.
-    structural_op = _without_native_call_evidence(op)
-    operator = structural_op.to_dict(include_work=False)
+    node_id = _node_id(replica, op.op_id)
+    operator = op.to_dict(include_work=False)
     contract = predicted_contract(operator)
+    outputs_by_id = {} if outputs_by_id is None else outputs_by_id
+    metadata_by_id = {} if metadata_by_id is None else metadata_by_id
+    try:
+        from .prediction.implementations import produced_values
+        produced = tuple(produced_values(op))
+    except (KeyError, ValueError, TypeError):
+        # A producer helper may refuse an unsupported declaration.  The
+        # declared contract/audit remains authoritative; this is not a value
+        # extraction path and must not hide a malformed T11 layout.
+        produced = ()
+    structure_record = operator_structure(
+        operator, contract, semantic_refs=semantic_refs, owner_id=node_id,
+        context={"op": op, "outputs_by_id": outputs_by_id,
+                 "metadata_by_id": metadata_by_id, "produced": produced})
+    outputs_by_id[op.op_id] = tuple(structure_record["values"]["outputs"])
+    metadata_by_id[op.op_id] = dict(op.metadata)
     meta = dict(op.metadata)
     semantic = meta.get("semantic_metadata", {})
     if shared_call is not None:
@@ -140,7 +156,6 @@ def _node(op, replica, *, source_call=None, block=None, role=None, structure=Non
     else:
         binding = bind_native_call(op, contract=contract, plan=plan,
                                    prepared=op if plan is not None else None)
-    node_id = _node_id(replica, op.op_id)
     payload = {
         "node_id": node_id,
         "op_id": op.op_id,
@@ -156,8 +171,13 @@ def _node(op, replica, *, source_call=None, block=None, role=None, structure=Non
         "deps": [_node_id(replica, dep) for dep in op.deps],
         "operator": operator,
         "contract": contract,
+        "values": structure_record["values"],
+        "semantic_refs": structure_record["semantic_refs"],
+        "native_candidates": structure_record["native_candidates"],
+        "native_execution": structure_record["native_execution"],
+        "representation_gaps": structure_record["gaps"],
         "implementation": native_implementation(operator, contract) or {},
-        **node_physical(structural_op, recipe_bindings=kernels),
+        **node_physical(op, recipe_bindings=kernels),
         "physical_work_basis": ("prepared_source_plan" if geometry is not None else
                                 "source_declaration_without_resource_geometry")
                                if op.source_boundary == "kernel" else "operator_declaration",
@@ -177,8 +197,7 @@ def _node(op, replica, *, source_call=None, block=None, role=None, structure=Non
 
 
 def export_op_structure(ops, *, model, execution, kernels=None, source=None,
-                        expand_calls=True, resource_graphs=None, resource_geometries=None,
-                        native_evidence=False):
+                        expand_calls=True, resource_graphs=None, resource_geometries=None):
     """Export a declared OpSpec DAG without a hardware Case or timing execution.
 
     A sequence selects replica 0; a mapping supplies explicit replica -> DAG.
@@ -191,10 +210,6 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
     ``resource_geometries`` optionally maps (replica, stage) to declared Geometry
     for source-kernel planning. It contains ownership/capacity, not resource rates.
     Caller ``source`` is provenance excluded from the content hash.
-    ``native_evidence=True`` attaches derived ``native_calls`` and
-    ``native_call_coverage`` beside the identity. It is opt-in because released
-    consumers (profiler <= 0.5.11) verify ``graph_id`` over every top-level key
-    except ``graph_id``/``source``; the default report stays verifiable by them.
     """
     graphs = ops if isinstance(ops, Mapping) else {0: ops}
     graphs = {replica: tuple(operators) for replica, operators in graphs.items()}
@@ -212,6 +227,7 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
     native_calls = []
     declarations, entry_dependencies, memberships = {}, defaultdict(set), defaultdict(set)
     for replica, operators in sorted(graphs.items()):
+        outputs_by_id, metadata_by_id = {}, {}
         for op in operators:
             if op.phase != phase:
                 raise ValueError(f"structure_phase_mismatch:{op.op_id}:{op.phase}:{phase}")
@@ -235,7 +251,7 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
             if is_expanded:
                 source_calls.append(_json_value({
                     "node_id": parent,
-                    "operator": _without_native_call_evidence(op).to_dict(include_work=False),
+                    "operator": op.to_dict(include_work=False),
                     "children": [
                         _node_id(replica, child.op_id)
                         for child in expanded if child.op_id != op.op_id
@@ -246,7 +262,11 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
                                structure=layer_structure(model, op.layer), kernels=kernels,
                                book=book, geometry=resource_geometries.get((replica, child.stage)),
                                shared_call=(None if child.family == "barrier" else call_binding),
-                               native_sink=native_calls)
+                               native_sink=native_calls,
+                               outputs_by_id=outputs_by_id,
+                               metadata_by_id=metadata_by_id,
+                               semantic_refs=_semantic_refs(
+                                   child, replica, parent=parent, block=_block(op)))
                          for child in expanded)
     ids = {node["node_id"] for node in nodes}
     if len(ids) != len(nodes):
@@ -257,10 +277,19 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
     by_id = {node["node_id"]: node for node in nodes}
     for group in subgraphs:
         group.update(subgraph_physical(by_id, group))
+        member_refs = [{"kind": "operator", "name": key,
+                        "role": by_id[key]["family"]}
+                       for key in group["node_ids"]]
+        group["semantic_refs"] = member_refs or None
+        group.update(region_structure(group.get("implementation") or {},
+                                      region_id=group["subgraph_id"],
+                                      semantic_refs=member_refs))
+        group.setdefault("representation_gaps", [])
     resource_operators = []
     if resource_graphs is not None:
         groups = {group["subgraph_id"]: group for group in subgraphs}
         for replica, operators in sorted(resource_graphs.items()):
+            outputs_by_id, metadata_by_id = {}, {}
             for op in operators:
                 meta = dict(op.metadata)
                 if "fusion_group_key" not in meta:
@@ -269,7 +298,10 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
                 group = groups[key]
                 resource = _node(op, replica, block=group["block"], role=group["role"],
                                  structure=group["structure"], kernels=kernels, book=book,
-                                 geometry=resource_geometries.get((replica, op.stage)))
+                                 geometry=resource_geometries.get((replica, op.stage)),
+                                 semantic_refs=group["semantic_refs"],
+                                 outputs_by_id=outputs_by_id,
+                                 metadata_by_id=metadata_by_id)
                 resource_operators.append(resource)
                 boundary = {**meta["fusion_boundary"],
                             "operator_ids": [resource["node_id"]],
@@ -279,14 +311,72 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
                               for field in ("physical_work", "physical_signature")})
                 group["contract_scope"] = subgraph_comparison_scope(
                     group["role"], [by_id[key] for key in group["node_ids"]], resource=resource)
+                # The region owns one physical boundary.  A native name is a
+                # correspondence; only a selection fact may mark it chosen.
+                candidates = [dict(candidate)
+                              for candidate in resource["native_candidates"]]
+                selected = (resource["native_execution"] or {}).get("selected")
+                selected_candidate = None
+                if selected and selected.get("native"):
+                    selected_candidate = next(
+                        (candidate for candidate in candidates
+                         if candidate["native"] == selected["native"]), None)
+                    if selected_candidate is not None:
+                        selected_candidate.update(selected=True,
+                                                  status="selected_declared")
+                    fusion_execution = {
+                        "kind": "selected_native_fusion",
+                        "selection_state": "selected_declared",
+                        "selected": {
+                            **selected,
+                            "candidate_id": (selected_candidate or {}).get(
+                                "candidate_id")},
+                        "observed": False,
+                        "reason": "one selected region boundary covers every semantic member",
+                    }
+                elif selected:
+                    fusion_execution = {
+                        "kind": "selected_native_fusion_boundary",
+                        "selection_state": "selected_declared",
+                        "selected": {**selected, "candidate_id": None},
+                        "observed": False,
+                        "reason": "a plan is selected but its native API is not unique",
+                    }
+                else:
+                    fusion_execution = {
+                        "kind": "selected_native_fusion_boundary",
+                        "selection_state": ("multiple_compatible_unselected"
+                                            if candidates else "unresolved"),
+                        "selected": None,
+                        "observed": False,
+                        "reason": "fusion boundary is replaced but no native API is selected",
+                    }
+                group["native_candidates"] = candidates
+                group["native_execution"] = fusion_execution
+                region_gaps = list(group.get("representation_gaps") or ())
+                if selected and selected.get("native") and selected_candidate is None:
+                    region_gaps.append({
+                        "code": "selected_native_not_in_candidates",
+                        "detail": {"selected": selected["native"]}})
+                group["representation_gaps"] = region_gaps
                 members = set(group["node_ids"])
                 internal = {"kind": "internal_to_selected_native_fusion",
                             "subgraph_id": key, "operator_ids": [resource["node_id"]]}
+                covered = {
+                    "kind": "covered_by_fused_region",
+                    "selection_state": "covered",
+                    "selected": None,
+                    "observed": False,
+                    "region": key,
+                    "reason": "member work belongs to the region's selected native boundary",
+                }
                 for member in members:
-                    by_id[member].update(event_matchable=False, resource_boundary=internal)
+                    by_id[member].update(event_matchable=False, resource_boundary=internal,
+                                         native_execution=covered)
                 for other in subgraphs:
                     if other is not group and set(other["node_ids"]) <= members:
-                        other.update(event_matchable=False, resource_boundary=internal)
+                        other.update(event_matchable=False, resource_boundary=internal,
+                                     native_execution=covered)
     # Normalize each owned record separately. A whole-payload JSON round trip
     # retained the DAG, its encoded string and a second DAG at the same time.
     payload = {
@@ -307,18 +397,16 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
     encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"), allow_nan=False)
     for chunk in encoder.iterencode(payload):
         digest.update(chunk.encode("utf-8"))
-    report = {
+    return {
         **payload,
         "graph_id": "sha256:" + digest.hexdigest(),
         "source": _json_value(source),
-    }
-    if native_evidence:
         # Derived actual-invocation evidence: carried beside the structural
         # identity, excluded from its hash exactly like caller source.
-        report["native_calls"] = _json_value(native_calls)
-        report["native_call_coverage"] = _json_value(
-            coverage_from_records(native_calls, emitted=len(nodes)))
-    return report
+        "native_calls": _json_value(native_calls),
+        "native_call_coverage": _json_value(
+            coverage_from_records(native_calls, emitted=len(nodes))),
+    }
 
 
 def export_structure(case, *, phase, tokens, context=0, sequences=1,

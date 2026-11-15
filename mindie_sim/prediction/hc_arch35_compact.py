@@ -1,28 +1,33 @@
-"""Opt-in finite-DAG compression of one HCPre L1 panel per Cube owner.
+"""Opt-in finite-DAG lowering of one HCPre owner on the ordinary Engine.
 
-[Role] Retain source input, RMS and projection publication while compressing
-  private finite AIV and MTE1/Cube pipelines on the ordinary Engine.
-[Invariants] Source work/owners and fixed buffers are unchanged. A source DAG
-  supplies a nominal period, not a measured span. Coupled interiors approximate
-  external contention; each prologue and terminal publication remain explicit.
-[Timeouts & Locks] Finite source DAGs; bounded shared nominal cache, no locks.
-[Side-Effect Policy] Constructs programs and isolated nominal controls only.
+[Role] Preserve source input slots, UB publication, L1 release, matrix micro
+  slots and terminal RMS/projection order while exposing the same finite
+  per-owner graph for compact-profile selection.
+[Invariants] The source chunk DAG is retained exactly: ``read`` waits the cast
+  two chunks back, ``transpose`` waits the publish two chunks back, publish
+  waits the previous write and panel ``p-2`` MTE1 release, RMS waits the last
+  vector and write FIFO, and matrix operands/cube keep operand/cube FIFO and
+  ``cube[m-2]`` L0 reuse. No measured span or nominal cap enters the program.
+[Timeouts & Locks] Finite source panels; no threads, locks or I/O.
+[Side-Effect Policy] Constructs programs only; no files, observations or
+  device contexts.
 """
 from dataclasses import replace
 
-from .program import KernelProgram, Stage
-from .refill_steady import _duration, producer_duration
+from mindie_sim.schema.common import ModelingError
+
+from .program import PipelinePhase, PipelineTemplate, Stage
 from .hc_arch35_program import phase_program
 
 
 def capsule(context, stages, prefix, after=()):
-    """Compress a closed single-entry/single-exit source branch.
+    """Compress a closed bound-stage branch for the retained hand control.
 
-    In this source domain the first read dominates every interior task and
-    the last store/Cube consumes them all. The original finite-slot DAG sets
-    the isolated service span; its resource demand still runs on the caller's
-    shared Engine. This is not an arbitrary-contention equivalence claim.
+    Production HCPre does not use this helper: ``first_owner`` below retains
+    every source slot and FIFO boundary. This control remains for the existing
+    hand-computed two-chunk test only.
     """
+    from .refill_steady import _duration, producer_duration
     if len(stages) <= 2:
         names={stage.name:f'{prefix}.{stage.name}' for stage in stages}
         return tuple(replace(stage,name=names[stage.name],
@@ -48,38 +53,122 @@ def capsule(context, stages, prefix, after=()):
     )
 
 
-def _branch(phases, context):
-    names={phase.name for phase in phases}
-    local=tuple(replace(phase,after=tuple(key for key in phase.after if key in names))
-                for phase in phases)
-    return phase_program(local,context).stages
+def _roles(work):
+    return tuple(sorted(work.resources.keys()-{'hbm'}))+(('cube',) if work.matrix else ())
 
 
-def first_owner(g, phases, context):
-    """Source one-panel branches publish RMS before the Cube projection ends."""
-    result=[]
-    weight=next(phase for phase in phases if phase.name=='p0.weight')
-    result.extend(_branch((weight,),context))
-    vector_ends=[]
-    for sub in (0,1):
-        branch=tuple(phase for phase in phases if phase.name.startswith(f'p0.v{sub}.'))
-        compact=capsule(context,_branch(branch,context),f'aiv{sub}')
-        result.extend(compact)
-        vector_ends.append(compact[-1].name)
-    matrix=tuple(phase for phase in phases if phase.name.startswith('p0.k'))
-    compact=capsule(context,_branch(matrix,context),'matrix',('p0.weight',*vector_ends))
-    result.extend(compact)
-    projection=next(phase for phase in phases if phase.name=='projection_out')
-    result.extend(replace(stage,after=(compact[-1].name,))
-                  for stage in _branch((projection,),context))
-    for sub in (0,1):
-        rms=next(phase for phase in phases if phase.name==f'rms_out{sub}')
-        result.extend(replace(stage,after=(vector_ends[sub],))
-                      for stage in _branch((rms,),context))
-    return KernelProgram(tuple(result))
+def _class_stage(phase, name, context, after=(), previous=()):
+    return Stage(name,context.bind(phase.work),after=tuple(after),
+                 previous=tuple(previous),
+                 placement=context.owned(phase.owner,phase.domain,_roles(phase.work)))
+
+
+def finite_template_available():
+    """True only when the actual T04 ordered-template consumer is importable."""
+    try:
+        from .scheduling import start_pipeline_template
+    except ImportError:
+        return False
+    return callable(start_pipeline_template)
+
+
+def finite_owner_template(g, phases, context, *, terminal='projection_out', slots=2):
+    """Build a finite ordered PipelineTemplate for one key1000 owner.
+
+    Panels are grouped into adjacent pairs.  Every source dependency inside a
+    pair is a local ``after``; dependencies on the preceding pair become
+    ``Stage.previous`` references, so the two-panel L1/L0/input/output slots
+    and FIFOs remain real cross-tile edges.  A final odd panel gets its own
+    one-panel class.  Identical classes share one Stage set and a phase count.
+    This is the ordered-phase mode of the existing PipelineTemplate; it does
+    not claim the indexed catalog ABI.
+    """
+    panels={}
+    for phase in phases:
+        head=phase.name.split('.',1)[0]
+        if head.startswith('p') and head[1:].isdigit() and '.' in phase.name:
+            panels.setdefault(int(head[1:]),[]).append(phase)
+    order=sorted(panels)
+    if not order:
+        raise ModelingError('hc_arch35_finite_template_requires_panels')
+    groups=[order[index:index+2] for index in range(0,len(order),2)]
+    classes=[]          # [signature, count, stages]
+    previous_map={}
+    last_map={}
+    for group in groups:
+        local_map={}
+        stages=[]
+        for slot,panel in enumerate(group):
+            role='ab'[slot]
+            for phase in panels[panel]:
+                suffix=phase.name.split('.',1)[1]
+                local_map[phase.name]=f'{role}.{suffix}'
+        for slot,panel in enumerate(group):
+            role='ab'[slot]
+            for phase in panels[panel]:
+                after=[];previous=[]
+                for dep in phase.after:
+                    if dep in local_map:
+                        after.append(local_map[dep])
+                    elif dep in previous_map:
+                        previous.append(previous_map[dep])
+                    else:
+                        raise ModelingError(
+                            f'hc_arch35_finite_template_unsupported_dependency:{dep}')
+                stages.append(_class_stage(phase,local_map[phase.name],context,
+                                           after,previous))
+        signature=tuple((stage.name,dict(stage.work),stage.after,stage.previous,
+                         dict(stage.placement),stage.coupled) for stage in stages)
+        if classes and classes[-1][0]==signature:
+            classes[-1][1]+=1
+        else:
+            classes.append([signature,1,stages])
+        previous_map=local_map
+        last_map=local_map
+    terms={phase.name:phase for phase in phases
+           if phase.name in (terminal,'rms_out0','rms_out1')}
+    drain=[]
+    for name in (terminal,'rms_out0','rms_out1'):
+        phase=terms.get(name)
+        if phase is None:
+            raise ModelingError(f'hc_arch35_finite_template_missing_terminal:{name}')
+        previous=[]
+        for dep in phase.after:
+            if dep not in last_map:
+                raise ModelingError(
+                    f'hc_arch35_finite_template_unsupported_terminal:{dep}')
+            previous.append(last_map[dep])
+        drain.append(_class_stage(phase,name,context,(),previous))
+    phase_objects=len(classes)
+    stage_objects=sum(len(stages) for _,_,stages in classes)+len(drain)
+    classes=tuple(PipelinePhase(kind='hc_panel_pair',stages=tuple(stages),
+                                count=count)
+                  for _,count,stages in classes)
+    return PipelineTemplate(
+        owner=panels[order[0]][0].owner,slots=slots,phases=classes,
+        drain=tuple(drain),phase_objects=phase_objects,
+        stage_objects=stage_objects,static_phase_classes=phase_objects,
+        dynamic_instances=len(order),tile_factory_calls=phase_objects,
+    )
+
+
+def first_owner(g, phases, context, *, terminal='projection_out'):
+    """Lower one source owner without crossing a source slot boundary.
+
+    The production path keeps the complete source chunk DAG: each chunk's
+    ``read`` waits the cast two chunks back (input ring), each ``transpose``
+    waits the publish two chunks back (UB ring), each ``publish_l1`` waits the
+    previous write and panel ``p-2`` last MTE1 operands (L1 slot), and each RMS
+    stage waits the last vector plus the last publish (write FIFO). The matrix
+    micro DAG (weight, per-micro operands/cube, ``cube[m-2]`` L0 reuse and
+    operand/cube FIFO) is likewise the source dependency graph. Repeating this
+    for every legal panel uses the existing ``Phase``/``Stage`` objects and
+    creates fresh events per occurrence; static ``Phase`` tuples may be shared.
+    """
+    return phase_program(phases, context)
 
 
 def eligible(g):
-    # Multiple L1 panels expose intermediate MTE1 releases and output-ring
-    # reuse across panels. Keep their original DAG, with visible diagnostics.
-    return g.k_span <= g.k_l1
+    # Both host keys lower the same finite source stage1 graph. key1001 keeps
+    # its local vector stage2 explicit because it owns public materialization.
+    return g.tiling_key in (1000, 1001)

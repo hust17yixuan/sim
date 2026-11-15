@@ -221,8 +221,9 @@ def test_gate_cumsum_uses_only_real_head_owners_and_global_barrier():
               for row in gate}
     assert len(groups) == 12
     gate_end = max(row["end_ms"] for row in gate)
-    sync = next(row for row in engine.trace if row["task"].endswith(":syncall"))
-    assert gate_end <= sync["start_ms"]
+    prepare_start = min(row["start_ms"] for row in engine.trace
+                        if ":prepare:program:group" in row["task"])
+    assert gate_end <= prepare_start
     assert engine.summary()["live_tasks"] == 0
 
 

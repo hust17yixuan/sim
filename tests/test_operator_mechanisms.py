@@ -1,8 +1,9 @@
 """Physical contracts checked against raw kernels and independent work oracles."""
 from dataclasses import replace
+from itertools import product
+from math import prod
 from pathlib import Path
 
-import numpy as np
 import pytest
 
 from mindie_sim.catalog.ops import gemm_op, vector_op
@@ -20,10 +21,29 @@ from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.transforms import lower_implementations
 from mindie_sim.schema.workload import RequestView
 from mindie_sim.schema.tensors import TensorLayout
-from test_prediction_system import case
 
 
 CAPTURE = Path(__file__).parent / "fixtures/observations/operator-kernels.csv"
+
+
+def case(*, dp=1, tp=1, pp=1, ep=1, prompt=4, output=3, requests=None):
+    ranks = dp * tp * pp
+    return {
+        "machine": {
+            "name": "declared-gpu", "architecture": "cuda", "num_devices": ranks,
+            "device": {"memory_bytes": 1024 ** 3, "compute_peaks": {"bf16": 1e9, "fp32": 1e9},
+                       "rates": {"memory": 1e9, "vector": 1e9}, "compute_units": 4},
+            "links": [{"name": "fabric", "capacity_bytes_per_ms": 1000,
+                       "members": list(range(ranks)), "semantics": "shared"}],
+        },
+        "model": {
+            "name": "geometry", "layers": 2, "hidden_size": 32, "num_heads": 4,
+            "num_kv_heads": 2, "head_dim": 8, "intermediate_size": 64, "vocab_size": 128,
+        },
+        "workload": {"requests": requests or [
+            {"id": "r", "prompt_tokens": prompt, "output_tokens": output}]},
+        "runtime": {"dp": dp, "tp": tp, "pp": pp, "ep": ep, "max_num_batched_tokens": 16},
+    }
 
 
 def quantized_case():
@@ -199,23 +219,44 @@ def test_raw_epoch_precision_and_unknown_shapes_survive_import(profiler_api):
 
 
 def test_strided_reshape_preserves_actual_addresses_and_detects_required_copies():
-    source = np.arange(3 * 8 * 4).reshape(3, 8, 4)
-    dense = TensorLayout.contiguous(source.shape)
-    for actual, layout in (
-        (source, dense),
-        (source[:, 2:6], dense.narrow(1, 2, 4)),
-        (source.transpose(1, 0, 2), dense.permute((1, 0, 2))),
-        (source[:1, 2:6], dense.narrow(0, 0, 1).narrow(1, 2, 4)),
-    ):
-        for shape in (actual.shape, (actual.size,), (actual.size // 4, 4),
-                      (1, actual.size // 4, 2, 2, 1)):
-            expected = actual.reshape(shape)
+    dense = TensorLayout.contiguous((3, 8, 4))
+
+    def _is_affine_strided_view(flat_addrs: list[int], shape: tuple[int, ...]) -> bool:
+        if not flat_addrs:
+            return True
+        offset = flat_addrs[0]
+        # Compute candidate stride along each axis d by stepping +1 on axis d
+        # in the row-major flattened sequence of shape.
+        strides = []
+        rem = len(flat_addrs)
+        for s in shape:
+            rem //= s
+            strides.append((flat_addrs[rem] - offset) if s > 1 else 0)
+        reconstructed = [
+            offset + sum(idx * st for idx, st in zip(coord, strides))
+            for coord in product(*(range(s) for s in shape))
+        ]
+        return reconstructed == flat_addrs
+
+    cases = (
+        ((3, 8, 4), [i * 32 + j * 4 + k for i in range(3) for j in range(8) for k in range(4)], dense),
+        ((3, 4, 4), [i * 32 + (2 + j) * 4 + k for i in range(3) for j in range(4) for k in range(4)],
+         dense.narrow(1, 2, 4)),
+        ((8, 3, 4), [j * 4 + i * 32 + k for j in range(8) for i in range(3) for k in range(4)],
+         dense.permute((1, 0, 2))),
+        ((1, 4, 4), [(2 + j) * 4 + k for j in range(4) for k in range(4)],
+         dense.narrow(0, 0, 1).narrow(1, 2, 4)),
+    )
+    for actual_shape, expected_addrs, layout in cases:
+        size = prod(actual_shape)
+        for shape in (actual_shape, (size,), (size // 4, 4),
+                      (1, size // 4, 2, 2, 1)):
             view = layout.reshape_view(shape)
-            assert (view is not None) == np.shares_memory(actual, expected)
+            assert (view is not None) == _is_affine_strided_view(expected_addrs, shape)
             if view:
                 addresses = [view.offset + sum(i * stride for i, stride in zip(index, view.strides))
-                             for index in np.ndindex(shape)]
-                assert np.array_equal(source.ravel()[addresses], expected.ravel())
+                             for index in product(*(range(s) for s in shape))]
+                assert addresses == expected_addrs
     assert dense.narrow(1, 2, 4).reshape_view((3, 4, 2, 2)) is not None
     assert dense.narrow(1, 2, 4).reshape_view((12, 4)) is None
 

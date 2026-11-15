@@ -227,6 +227,7 @@ def _glm_hybrid_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                 recurrent_state_dtype="fp32",
                 conv_state_elements=conv_width * (conv_k - 1),
                 conv_state_dtype="bf16",
+                kda_gate_lower_bound=-5.0,
                 state_bytes=float(
                     kda_heads * kda_dim * kda_dim * 4
                     + conv_width * (conv_k - 1) * 2

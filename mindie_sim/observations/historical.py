@@ -12,32 +12,12 @@ import math
 from pathlib import Path
 from statistics import median
 
-import ijson
-from ijson.common import ObjectBuilder
-
-from .store import digest_file, json_items
+from .store import digest_file, json_items, json_top_fields
 
 
 def _header(path):
     wanted = {"schema", "env", "geometry", "trials", "samples_per_condition", "warmup"}
-    result, builder, root, depth = {}, None, None, 0
-    with Path(path).open("rb") as stream:
-        for prefix, event, value in ijson.parse(stream, use_float=True):
-            if builder is None:
-                if prefix not in wanted:
-                    continue
-                if event not in {"start_map", "start_array"}:
-                    result[prefix] = value
-                    continue
-                root, builder, depth = prefix, ObjectBuilder(), 0
-            builder.event(event, value)
-            if event in {"start_map", "start_array"}:
-                depth += 1
-            elif event in {"end_map", "end_array"}:
-                depth -= 1
-                if depth == 0:
-                    result[root], builder = builder.value, None
-    return result
+    return json_top_fields(path, wanted)
 
 
 def _checked_source(root, reference):

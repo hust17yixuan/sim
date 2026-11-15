@@ -10,6 +10,8 @@
 """
 from __future__ import annotations
 
+import signal
+
 import pytest
 
 from mindie_sim.prediction.api import predict
@@ -20,6 +22,21 @@ from mindie_sim.prediction.efficiency import (
 )
 from mindie_sim.prediction.structure import parse_case
 from test_prediction_system import case, linear_work
+
+
+def _predict_bounded(case_obj, *, lower, timeout_s: int = 3):
+    def _on_alarm(_signum, _frame):
+        raise TimeoutError(
+            f"predict() exceeded {timeout_s}s (Scheduler infinite loop under async_scheduling delayed KV release)"
+        )
+
+    old_handler = signal.signal(signal.SIGALRM, _on_alarm)
+    signal.alarm(timeout_s)
+    try:
+        return predict(case_obj, lower=lower)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
 
 
 def test_memory_accounts_for_async_workspace_and_delayed_release_policy():
@@ -68,7 +85,7 @@ def test_scheduler_delayed_kv_release_under_async_scheduling_delays_admission_by
     # 12 tokens * 128 bytes/token = 1536 bytes of KV capacity
     base["machine"]["device"]["memory_bytes"] = int(Memory(parsed).weights[0] + 12 * 128)
 
-    sync_report = predict(base, lower=linear_work)
+    sync_report = _predict_bounded(base, lower=linear_work)
     assert sync_report["status"] == "modeled"
     sync_r3 = next(r for r in sync_report["requests"] if r["request_id"] == "r3")
     assert sync_report["memory"]["peak_delayed_release_cache_bytes_per_replica_stage"] == [[0.0]]
@@ -85,7 +102,7 @@ def test_scheduler_delayed_kv_release_under_async_scheduling_delays_admission_by
     )
     async_case["machine"]["device"]["memory_bytes"] = base["machine"]["device"]["memory_bytes"]
 
-    async_report = predict(async_case, lower=linear_work)
+    async_report = _predict_bounded(async_case, lower=linear_work)
     assert async_report["status"] == "modeled"
     async_r3 = next(r for r in async_report["requests"] if r["request_id"] == "r3")
 
@@ -117,7 +134,7 @@ def test_scheduler_stalls_rather_than_failing_when_single_slot_is_pinned_by_dela
     parsed = parse_case(raw)
     raw["machine"]["device"]["memory_bytes"] = int(Memory(parsed).weights[0] + 4 * 128)
 
-    report = predict(raw, lower=linear_work)
+    report = _predict_bounded(raw, lower=linear_work)
     assert report["status"] == "modeled"
     assert [r["status"] for r in report["requests"]] == ["served", "served", "served", "served"]
     r1_finish = next(r for r in report["requests"] if r["request_id"] == "r1")["finish_ms"]
@@ -159,11 +176,11 @@ def test_speculative_lookahead_does_not_exceed_remaining_request_output():
         ),
     )
 
-    sync_res = predict(parsed_sync, lower=linear_work)
+    sync_res = _predict_bounded(parsed_sync, lower=linear_work)
     assert sync_res["status"] == "modeled"
 
     parsed_async = replace(parsed_sync, runtime=replace(parsed_sync.runtime, async_scheduling=True))
-    async_res = predict(parsed_async, lower=linear_work)
+    async_res = _predict_bounded(parsed_async, lower=linear_work)
     assert async_res["status"] == "modeled"
 
 
@@ -215,7 +232,12 @@ def test_sla_solver_quantifies_concurrency_gain_from_disabling_async_scheduling(
     assert b_async < b_sync
 
     sla_async = solve_hardware_sla_throughput(
-        raw, sla_ms=50.0, context=64, output_budget=16, scenarios=[{"id": "baseline", "label": "baseline"}]
+        raw,
+        sla_ms=50.0,
+        context=64,
+        output_budget=16,
+        max_sequences_per_dp=8,
+        scenarios=[{"id": "baseline", "label": "baseline"}],
     )
     summary = sla_async["async_scheduling_memory"]
     assert summary["configured_async_scheduling"] is True
@@ -226,7 +248,12 @@ def test_sla_solver_quantifies_concurrency_gain_from_disabling_async_scheduling(
 
     raw_sync = {**raw, "runtime": {**raw["runtime"], "async_scheduling": False}}
     sla_sync = solve_hardware_sla_throughput(
-        raw_sync, sla_ms=50.0, context=64, output_budget=16, scenarios=[{"id": "baseline", "label": "baseline"}]
+        raw_sync,
+        sla_ms=50.0,
+        context=64,
+        output_budget=16,
+        max_sequences_per_dp=8,
+        scenarios=[{"id": "baseline", "label": "baseline"}],
     )
     assert sla_sync["scenarios"][0]["b_feasible"] > sla_async["scenarios"][0]["b_feasible"]
     assert sla_sync["scenarios"][0]["tps_feasible"] > sla_async["scenarios"][0]["tps_feasible"]

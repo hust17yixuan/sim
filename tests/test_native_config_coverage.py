@@ -13,7 +13,10 @@ import pytest
 
 from mindie_sim import target_operators
 from mindie_sim.catalog.weights import body_head_terms, layer_weight_terms
+from mindie_sim.catalog.specs import build_model_spec
 from mindie_sim.model_catalog import CATALOG, load_model
+from mindie_sim.prediction.subgraphs import FeatureConfig, instantiate_model
+from mindie_sim.schema.common import dtype_bytes
 from mindie_sim.schema.model import ModelSpec
 from test_prediction_system import case
 
@@ -62,12 +65,78 @@ def test_hybrid_full_attention_keeps_source_qk_norm_before_rope(source_type):
                    for op in target_operators(raw, phase="prefill", tokens=3))
 
 
+def test_declared_activation_dtype_is_the_model_stream_not_an_omitted_proxy():
+    config = hybrid_config(activation_dtype="fp32")
+    model = ModelSpec.from_mapping(config)
+    assert model.activation_dtype == model.weight_dtype == model.compute_dtype == "fp32"
+    metadata = dict(model.metadata)
+    assert not any("native_activation_dtype" in gap for gap in metadata["unmodeled_features"])
+    assert "activation_dtype" not in metadata["unconsumed_config_fields"]
+    assert physical_work(config) != physical_work(hybrid_config())
+    assert ModelSpec.from_mapping(model.to_dict()) == model
+
+
+def test_explicit_high_precision_weight_is_an_independent_format():
+    model = ModelSpec.from_mapping(hybrid_config(weight_dtype="fp16"))
+    assert model.activation_dtype == "bf16"
+    assert model.weight_dtype == model.quant.weight_format == "fp16"
+    assert model.quant.expert_weight_format == "fp16"
+    metadata = dict(model.metadata)
+    assert not any("native_weight_dtype" in gap
+                   for gap in metadata["unmodeled_features"])
+    assert "weight_dtype" not in metadata["unconsumed_config_fields"]
+
+
+def test_explicit_kv_format_is_independent_of_the_native_stream():
+    config = hybrid_config(activation_dtype="fp32", kv_dtype="bf16")
+    model = ModelSpec.from_mapping(config)
+    assert model.activation_dtype == "fp32"
+    assert model.kv_dtype == model.quant.kv_dtype == "bf16"
+    gqa = next(plan for plan in model.layer_plans if plan.attention == "gqa")
+    # 2 KV heads * head_dim 8 * (K,V) * 2 bytes = 64, not the 128-byte FP32 row.
+    assert gqa.cache_row_elements * dtype_bytes(model.kv_dtype) == 64
+    metadata = dict(model.metadata)
+    assert not any("native_kv_dtype" in gap for gap in metadata["unmodeled_features"])
+    assert "kv_dtype" not in metadata["unconsumed_config_fields"]
+    features = FeatureConfig.from_model(model)
+    assert (features.activation_dtype, features.kv_dtype) == ("fp32", "bf16")
+    instance = instantiate_model(model, features)
+    store = next(op for subgraph in instance.subgraphs if subgraph.kind == "kv_cache"
+                 for op in subgraph.operators if op.template.name == "kv_store")
+    assert dict(store.theta.matrix)["row_bytes"] == 64
+    raw = case(prompt=3, output=2)
+    raw["model"] = config
+    cache = next(op for op in target_operators(raw, phase="prefill", tokens=3)
+                 if op.family == "cache_store")
+    assert cache.dtype == "bf16" and cache.local_shape[-1] == 64
+
+    fp8 = ModelSpec.from_mapping(hybrid_config(kv_dtype="fp8"))
+    assert fp8.kv_dtype == fp8.quant.kv_dtype == "fp8_e4m3"
+    gqa8 = next(plan for plan in fp8.layer_plans if plan.attention == "gqa")
+    assert gqa8.cache_row_elements * dtype_bytes(fp8.kv_dtype) == 32
+    assert not any("native_kv_dtype" in gap
+                   for gap in dict(fp8.metadata)["unmodeled_features"])
+
+
+def test_low_precision_weight_and_scale_do_not_follow_the_native_stream():
+    source = Path(__file__).parents[1] / "mindie_sim/model_configs/deepseek-v4.1-flash.json"
+    raw = json.loads(source.read_text())
+    raw["torch_dtype"] = "float16"
+    model = build_model_spec("external-deepseek-fp16", raw)
+    quant = model.quant
+    assert model.activation_dtype == "fp16"
+    assert model.kv_dtype == quant.kv_dtype == "bf16"
+    assert quant.weight_format == "fp8_e4m3"
+    assert quant.expert_weight_format == "mxfp4"
+    assert quant.scale_format == "fp8_e8m0"
+    assert quant.activation_scale_format == "fp8_e8m0"
+    assert quant.activation_group_size == 32
+
+
 @pytest.mark.parametrize("changes", [
     {"hidden_act": "gelu"}, {"qkv_bias": True}, {"attention_bias": True},
     {"mlp_bias": True}, {"partial_rotary_factor": 0.5},
     {"sliding_window": 4, "use_sliding_window": True, "max_window_layers": 2},
-    {"activation_dtype": "fp32"}, {"weight_dtype": "fp16"}, {"kv_dtype": "fp8"},
-    {"expert_dtype": "fp8"},
     {"rope_scaling": {"rope_type": "dynamic", "factor": 2}},
 ])
 def test_unconsumed_native_changes_keep_work_and_full_declarations(changes):
@@ -126,7 +195,7 @@ def test_native_packing_does_not_imply_module_targets_or_expert_precision():
     assert kimi.quant.weight_format == "bf16" and kimi.quant.expert_weight_format == "mxfp4"
     assert "native_quant_config_groups_unresolved:retained_plan_proxy" in metadata["unmodeled_features"]
     assert metadata["unconsumed_config_fields"]["quantization_config"]["config_groups"][
-        "group_0"]["targets"] == ("re:.*self_attn.*",)
+        "group_0"]["targets"] == ["re:.*self_attn.*"]
 
     raw = json.loads((directory / "deepseek-v4.1-flash.json").read_text())
     raw.get("text_config", raw)["expert_dtype"] = "bf16"

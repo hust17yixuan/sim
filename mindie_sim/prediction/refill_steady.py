@@ -311,13 +311,14 @@ def compact_periodic_pipeline(
             ))
         return tuple(encoded)
 
-    max_steady = 144 if steady_count >= 144 + 2 * step else (72 if steady_count >= 72 + 2 * step else 24)
     w, t0, slope, peaks, converged = _periodic_pair(
         resources_key, pools_key, slots,
         tuple(encode_stages(t) for t in head_tiles),
         encode_stages(steady_stages),
         tuple(encode_stages(t) for t in tail_tiles),
-        max_steady,
+        # This bound includes both verification periods, not just the base
+        # warm-up. Passing the base alone rejected otherwise valid probes.
+        steady_count,
     )
     if not converged:
         return PipelineProgram(count, slots, tile_fn)

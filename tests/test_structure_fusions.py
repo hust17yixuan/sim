@@ -1,4 +1,5 @@
 """Native fusion candidates retain real semantic work and ownership."""
+import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -30,7 +31,10 @@ def _observed(filename, profiler_api):
     import mindie_profiler
     from mindie_profiler.tensor_contracts import observed_contract
 
-    path = Path(mindie_profiler.__file__).resolve().parents[1] / "tests/fixtures/fusion_contracts" / filename
+    rel = Path("tests/fixtures/fusion_contracts") / filename
+    path = Path(mindie_profiler.__file__).resolve().parents[1] / rel
+    if not path.is_file():
+        path = Path(__file__).resolve().parents[2] / "profiler" / rel
     if not path.is_file():
         pytest.skip(f"retained fusion fixture unavailable: {path}")
     return [(row, json.loads(json.dumps(observed_contract(row)))) for row in kernel_rows(path)]
@@ -166,10 +170,15 @@ def test_kda_stage_launches_never_receive_complete_chunk_contract_and_decode_sou
     assert groups and all(g["contract"] is None for g in groups)
     assert all(g["coverage"]["kind"] == "multi_launch_stage_unknown" for g in groups)
     baseline = _report(case, phase="decode", tokens=1, context=32768)
-    assert all(g["contract"] is None for g in baseline["subgraphs"] if g["role"] == "kda_recurrent")
-    decode = _report(selected, phase="decode", tokens=1, context=32768)
     observed = [contract for row, contract in _observed("a5_kimi_k3.csv", profiler_api)
                 if row.kind == "RecurrentKda"]
+    baseline_groups = [g for g in baseline["subgraphs"] if g["role"] == "kda_recurrent"]
+    baseline_nodes = {node["node_id"]: node for node in baseline["nodes"]}
+    assert observed and baseline_groups and all(g["contract"] in observed for g in baseline_groups)
+    for group in baseline_groups:
+        members = [baseline_nodes[key] for key in group["node_ids"]]
+        assert all(node["recipe"] not in {"qk_l2norm", "delta_gates"} for node in members)
+    decode = _report(selected, phase="decode", tokens=1, context=32768)
     groups = [g for g in decode["subgraphs"] if g["role"] == "kda_recurrent"]
     assert observed and groups and all(g["contract"] in observed for g in groups)
     nodes = {node["node_id"]: node for node in decode["nodes"]}

@@ -12,6 +12,11 @@ from dataclasses import replace
 from mindie_sim.catalog.ops import compute_dtype_for
 from mindie_sim.catalog.quant import projection_quant
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.invocation import Occurrence
+from mindie_sim.schema.operators import (
+    FieldDisposition, ProgramFragment, SemanticAttr, SemanticRef, WorkItem, WorkSet,
+)
+from mindie_sim.schema.subgraphs import EventPortSpec, PortSet, TensorPortSpec
 
 IMPLEMENTATION = "vllm_ascend_mla_head_padding"
 SOURCE = {
@@ -87,11 +92,130 @@ def contract(model, plan, views):
     return declared
 
 
+def _padding_plan(*, plan, parallel=None, tokens, input_dtype="bf16",
+                  logical_heads=None, physical_heads=None):
+    logical, physical = (
+        (int(logical_heads), int(physical_heads))
+        if logical_heads is not None and physical_heads is not None
+        else _heads(plan, parallel))
+    if (type(tokens) is not int or isinstance(tokens, bool) or tokens < 0):
+        raise ModelingError("mla_head_padding_requires_nonnegative_token_rows")
+    if input_dtype != "bf16":
+        raise ModelingError("mla_head_padding_requires_bf16_query_rows")
+    if (plan.kv_lora_rank, plan.qk_rope_head_dim) != (512, 64):
+        raise ModelingError(
+            "mla_head_padding_requires_latent512_rope64:"
+            f"{plan.kv_lora_rank}:{plan.qk_rope_head_dim}")
+    if not 1 <= logical <= physical or physical < 1:
+        raise ModelingError("mla_head_padding_requires_logical_le_physical_heads")
+    byte = dtype_bytes(input_dtype)
+    latent, rope = plan.kv_lora_rank, plan.qk_rope_head_dim
+    copy_volume = tokens * logical * latent * byte if tokens > 1 else 0
+    nope_read = tokens * logical * latent * byte
+    nope_write = tokens * physical * latent * byte
+    rope_read = tokens * logical * rope * byte
+    rope_write = tokens * physical * rope * byte
+    return {
+        "logical_heads": logical,
+        "physical_heads": physical,
+        "tokens": tokens,
+        "input_dtype": input_dtype,
+        "latent": latent,
+        "rope": rope,
+        "copy_volume": copy_volume,
+        "nope_read": nope_read,
+        "nope_write": nope_write,
+        "rope_read": rope_read,
+        "rope_write": rope_write,
+        "zero_fill_bytes": tokens * (physical - logical) * (latent + rope) * byte,
+        "mte2": copy_volume + nope_read + rope_read,
+        "mte3": copy_volume + nope_write + rope_write,
+    }
+
+
+def padding_contract(*, plan, parallel, tokens, input_dtype="bf16",
+                     logical_heads=None, physical_heads=None,
+                     position_start=None, occurrence=None):
+    """Typed logical->physical head materialization with real copy/pad bytes."""
+    if occurrence is not None and not isinstance(occurrence, Occurrence):
+        raise ModelingError("mla_head_padding_occurrence_invalid")
+    spec = _padding_plan(
+        plan=plan, parallel=parallel, tokens=tokens, input_dtype=input_dtype,
+        logical_heads=logical_heads, physical_heads=physical_heads)
+    logical, physical = spec["logical_heads"], spec["physical_heads"]
+    hbm = spec["mte2"] + spec["mte3"]
+    return ProgramFragment(
+        "mla_head_padding",
+        occurrence=occurrence,
+        semantic_refs=(SemanticRef("subgraph", "mla_attention",
+                                   role="head_materialization"),),
+        attrs=(
+            SemanticAttr("implementation", IMPLEMENTATION, source="selected_program"),
+            SemanticAttr("source", SOURCE, source="source_binding"),
+            SemanticAttr("logical_heads", logical, unit="head"),
+            SemanticAttr("physical_heads", physical, unit="head"),
+            SemanticAttr("tokens", spec["tokens"], unit="row"),
+            SemanticAttr("input_dtype", spec["input_dtype"], source="typed_input"),
+            SemanticAttr("latent_width", spec["latent"], unit="element"),
+            SemanticAttr("rope_width", spec["rope"], unit="element"),
+            SemanticAttr("copy_volume", spec["copy_volume"], unit="byte"),
+            SemanticAttr("zero_fill_bytes", spec["zero_fill_bytes"], unit="byte"),
+            SemanticAttr("input_view",
+                         "prolog[:, :logical_heads]; zero-copy slice",
+                         source="caller_view"),
+            SemanticAttr("output_view",
+                         "FIA_NBSD[:logical_heads]; contiguous leading-head slice; no copy",
+                         source="caller_view"),
+            SemanticAttr("position_start", position_start, unit="token",
+                         source="request_context"),
+            SemanticAttr("unresolved_fields",
+                         ("capture_binary_identity", "prepared_weight_aliasing_for_single_head"),
+                         source="specific_request"),
+        ),
+        ports=PortSet(
+            tensor_in=(
+                TensorPortSpec("q_logical", "in", "activation", dtype=input_dtype,
+                               layout_kind="BNSD", scope="layer"),
+                TensorPortSpec("q_rope_logical", "in", "activation",
+                               dtype=input_dtype, layout_kind="BNSD", scope="layer"),
+            ),
+            tensor_out=(
+                TensorPortSpec("q_physical", "out", "activation",
+                               dtype=input_dtype, layout_kind="BNSD", scope="layer"),
+                TensorPortSpec("q_rope_physical", "out", "activation",
+                               dtype=input_dtype, layout_kind="BNSD", scope="layer"),
+            ),
+            event_in=(EventPortSpec("q_ready", "in", "ready"),),
+            event_out=(EventPortSpec("done", "out", "complete"),),
+        ),
+        work=WorkSet((
+            WorkItem("hbm", hbm, "bytes", "issued", "selected_copy_and_pad"),
+            WorkItem("mte2", spec["mte2"], "bytes", "issued", "selected_copy_and_pad"),
+            WorkItem("mte3", spec["mte3"], "bytes", "issued", "selected_copy_and_pad"),
+        )),
+        field_effects=(
+            FieldDisposition("q.dtype", "preserve"),
+            FieldDisposition("q.layout", "consume",
+                             source="native BNSD logical->physical view"),
+            FieldDisposition("position", "preserve",
+                             source="request_context"),
+            FieldDisposition("scale", "preserve",
+                             source="no scale materialization in this copy/pad"),
+        ),
+        notes=("work is the actual contiguous-copy and F.pad traffic",
+               "logical KV cache and final FIA output head view are unchanged"),
+    )
+
+
 def query_inputs(b, *, declaration, tokens, query, rotary, plan):
     """Native prolog slice -> required contiguous copy -> FIA F.pad."""
     logical, physical = declaration["logical_heads"], declaration["physical_heads"]
     if logical == physical:
         return query, rotary
+    spec = _padding_plan(
+        plan=plan, parallel=None, tokens=tokens,
+        input_dtype=b.model.activation_dtype,
+        logical_heads=logical, physical_heads=physical)
     byte = dtype_bytes(b.model.activation_dtype)
     common = (("implementation", IMPLEMENTATION), ("source", SOURCE),
               ("logical_heads", logical), ("physical_heads", physical),
@@ -99,19 +223,21 @@ def query_inputs(b, *, declaration, tokens, query, rotary, plan):
     # A [B,P,D] -> [:,:L] slice retains row stride P*D. It is contiguous
     # when B=1, otherwise the source's q_nope.contiguous() allocates/copies.
     if tokens > 1:
-        volume = tokens * logical * plan.kv_lora_rank * byte
+        volume = spec["copy_volume"]
         query = b.work("mla_query_contiguous", (query,),
                        (tokens, logical, plan.kv_lora_rank), read=volume, write=volume,
                        family="copy", dtype=b.model.activation_dtype, metadata=common)
     outputs = []
-    for name, source, width in (("nope", query, plan.kv_lora_rank),
-                                ("rope", rotary, plan.qk_rope_head_dim)):
+    for name, source, width, read, write in (
+            ("nope", query, plan.kv_lora_rank, spec["nope_read"], spec["nope_write"]),
+            ("rope", rotary, plan.qk_rope_head_dim,
+             spec["rope_read"], spec["rope_write"])):
         outputs.append(b.work(
             "mla_query_pad_" + name, (source,), (tokens, physical, width),
-            read=tokens * logical * width * byte,
-            write=tokens * physical * width * byte, family="copy",
+            read=read, write=write, family="copy",
             dtype=b.model.activation_dtype,
-            metadata=common + (("zero_fill_bytes", tokens * (physical - logical) * width * byte),)))
+            metadata=common + (("zero_fill_bytes",
+                                tokens * (physical - logical) * width * byte),)))
     return tuple(outputs)
 
 

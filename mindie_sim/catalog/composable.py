@@ -15,7 +15,10 @@ from dataclasses import replace
 from collections.abc import Mapping
 
 from .config import flatten_config
-from .hf_config import normalize_config, positive, resolve_quant, unrecognized_fields
+from .hf_config import (
+    declared_context, declared_rope, json_sequences, normalize_config, positive,
+    resolve_native_formats, resolve_quant, unrecognized_fields,
+)
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.model import LayerPlan, MlaSpec, ModelSpec
 
@@ -222,6 +225,7 @@ def build_composable(key, config, family="generic"):
             gaps.append("generic_architecture_semantics_not_fully_verified")
     plans = shared_owners(c, plans, gaps)
     quant, quant_gaps = resolve_quant(c)
+    quant = resolve_native_formats(quant, c)
     gaps.extend(quant_gaps)
     if c.get("hidden_act", "silu") not in {"silu", "swiglu", "situ"}:
         gaps.append(f"ffn_activation:{c['hidden_act']}:silu_proxy")
@@ -242,9 +246,14 @@ def build_composable(key, config, family="generic"):
     mla_plan = next((p for p in plans if p.attention == "mla"), None)
     mla = (MlaSpec(mla_plan.q_lora_rank, mla_plan.kv_lora_rank,
                    mla_plan.qk_nope_head_dim, mla_plan.qk_rope_head_dim, mla_plan.v_head_dim,
+                   o_lora_rank=mla_plan.o_lora_rank, o_groups=mla_plan.o_groups,
                    index_topk=mla_plan.index_topk, index_head_dim=mla_plan.index_dim,
-                   index_n_heads=mla_plan.index_heads)
+                   index_n_heads=mla_plan.index_heads,
+                   compress_ratio=mla_plan.compress_ratio,
+                   sliding_window=mla_plan.window)
            if mla_plan else None)
+    rope = declared_rope(c)
+    context = declared_context(c)
     metadata = {
         "model_coverage": "partial" if gaps else "complete",
         "unmodeled_features": gaps,
@@ -258,9 +267,16 @@ def build_composable(key, config, family="generic"):
             config, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
         "source_model_type": str(c.get("model_type", "")),
         "declared_quantization": c.get("quantization_config", {}),
+        **({"routed_scaling_factor": c["routed_scaling_factor"]}
+           if isinstance(c.get("routed_scaling_factor"), (int, float))
+           and not isinstance(c.get("routed_scaling_factor"), bool) else {}),
+        **({"rope_parameters": rope} if rope else {}),
+        **({"max_position_embeddings": int(context["max_position_embeddings"])}
+           if "max_position_embeddings" in context else {}),
     }
-    from mindie_sim.schema.serialization import immutable_sequences
-    metadata = immutable_sequences(metadata)
+    metadata = tuple(sorted((key, json_sequences(value))
+                            for key, value in metadata.items()))
+    metadata_map = dict(metadata)
     model = ModelSpec(
         name=key, layers=len(plans), body_layers=len(plans), hidden_size=h,
         num_heads=first.num_heads, num_kv_heads=first.num_kv_heads, head_dim=first.head_dim,
@@ -275,7 +291,7 @@ def build_composable(key, config, family="generic"):
         num_shared_experts=max(p.num_shared_experts for p in plans),
         tie_word_embeddings=bool(c.get("tie_word_embeddings", False)),
         expert_routing_source="uniform", layer_plans=tuple(plans), mla=mla,
-        auxiliary=aux, metadata=tuple(sorted(metadata.items())),
+        auxiliary=aux, metadata=metadata,
         state_bytes_per_request=sum(p.state_bytes_total for p in plans),
     )
     from .specs import _set_facts, _model_weight_totals
@@ -286,7 +302,7 @@ def build_composable(key, config, family="generic"):
         ("parameter_count_body", params), ("resident_weight_bytes_body", weights),
         ("parameter_count_optional_draft", draft_params), ("optional_draft_weight_bytes", draft_weights),
         ("cache_row_bytes_by_layer", cache_row_bytes_by_layer(model)),
-        ("model_coverage", metadata["model_coverage"]),
+        ("model_coverage", metadata_map["model_coverage"]),
         ("attention_types", {kind: sum(p.attention == kind for p in plans)
                              for kind in sorted({p.attention for p in plans})}),
         ("ffn_types", {kind: sum(p.ffn == kind for p in plans)

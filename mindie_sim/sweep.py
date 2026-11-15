@@ -405,37 +405,48 @@ def sweep_topology_grid(
                 max_sequences_per_dp=max_sequences_per_dp, scenarios=_BASELINE_SCENARIO,
             )
             scen = sla_res["scenarios"][0]
-            b_sla, b_vram_max, b_feasible = int(scen["b_sla"]), int(scen["b_vram_max"]), int(scen["b_feasible"])
-            feasible = bool(b_feasible >= 1)
-            tps_feasible = float(scen["tps_feasible"])
-            rows.append({
+            candidate = scen.get("feasible_candidate")
+            feasible = candidate is not None
+            b_sla, b_vram_max = int(scen["b_sla"]), int(scen["b_vram_max"])
+            b_feasible = int(candidate["b"]) if candidate is not None else 0
+            tps_feasible = float(candidate["tps_feasible"]) if candidate is not None and "tps_feasible" in candidate else float(scen["tps_feasible"])
+            row = {
                 "parallel": {k: cand_dict[k] for k in ("dp", "tp", "ep", "pp", "pcp")},
                 "status": "feasible" if feasible else "sla_or_vram_exceeded",
                 "feasible": feasible,
-                "reason": None if feasible else ("vram_oom" if b_vram_max < 1 else "sla_exceeded"),
+                "plan_mode": "reselected_parallel",
+                "evaluation_boundary": "complete_candidate_graph_and_capacity",
+                "reason": None if feasible else scen.get("feasibility_status"),
                 "num_devices": cand_devices,
                 "ranks_per_node": machines_by_count[cand_devices].ranks_per_node,
                 "weight_bytes_per_die": weight_bytes_per_die,
                 "kv_bytes_per_token_per_die": kv_bytes_per_token_per_die,
                 "b_sla": b_sla, "b_vram_max": b_vram_max, "b_feasible": b_feasible,
+                "latency_candidate": scen.get("latency_candidate"),
+                "feasible_candidate": candidate,
+                "feasibility_status": scen.get("feasibility_status"), "search": scen.get("search"),
                 "total_feasible_concurrency": b_feasible * cand_p.dp,
                 "step_ms_at_b1": float(scen["step_ms_at_b1"]),
-                "step_ms_feasible": float(scen["step_ms_feasible"]),
+                "step_ms_feasible": float(candidate["step_ms"]) if candidate is not None else None,
                 "tps_at_b1": float(scen["tps_at_b1"]),
                 "tps_feasible": tps_feasible,
                 "tps_per_die": tps_feasible / float(cand_devices),
-                "network_mbu": float(scen["network_mbu"]),
-                "network_cube_mfu": float(scen["network_cube_mfu"]),
-                "network_vec_mfu": float(scen["network_vec_mfu"]),
-                "network_link_util": float(scen["network_link_util"]),
-            })
+                "network_mbu": float(candidate["network_mbu"]) if candidate is not None else None,
+                "network_cube_mfu": float(candidate["network_cube_mfu"]) if candidate is not None else None,
+                "network_vec_mfu": float(candidate["network_vec_mfu"]) if candidate is not None else None,
+                "network_link_util": float(candidate["network_link_util"]) if candidate is not None else None,
+            }
+            rows.append(row)
         except (ModelingError, ValueError) as exc:
             rows.append({
                 "parallel": {k: cand_dict[k] for k in ("dp", "tp", "ep", "pp", "pcp")},
                 "status": "infeasible", "feasible": False, "reason": str(exc),
+                "plan_mode": "reselected_parallel", "evaluation_boundary": "candidate_rejected_before_or_during_complete_evaluation",
+                "feasibility_status": "infeasible_before_evaluation", "search": None,
                 "num_devices": cand_devices, "ranks_per_node": None,
                 "weight_bytes_per_die": None, "kv_bytes_per_token_per_die": None,
                 "b_sla": 0, "b_vram_max": 0, "b_feasible": 0, "total_feasible_concurrency": 0,
+                "latency_candidate": None, "feasible_candidate": None,
                 "step_ms_at_b1": None, "step_ms_feasible": None, "tps_at_b1": 0.0,
                 "tps_feasible": 0.0, "tps_per_die": 0.0, "network_mbu": None,
                 "network_cube_mfu": None, "network_vec_mfu": None, "network_link_util": None,
@@ -450,6 +461,10 @@ def sweep_topology_grid(
             "allow_pp": allow_pp, "allow_pcp": allow_pcp, "candidate_count": len(rows),
         },
         "candidates": rows, "pareto_frontier": pareto_frontier,
+        "plan_selection": "reselected_parallel_per_candidate",
+        "comparison_boundary": "each_row_is_one_complete_candidate_no_cross_candidate_metric_stitching",
+        "pareto": {"basis": "exact_multi_objective_dominance_on_single_candidate_metrics",
+                   "frontier_is_selected_candidates_not_a_global_optimum_proof": True},
     }
 
 
@@ -558,9 +573,11 @@ def sweep_pd_disaggregation_ratios(
         decode_len_ok = bool(max(n_prompt, eff_decode_ctx) + n_output <= d_parsed.runtime.max_model_len)
         b_vram_max = int(d_scen["b_vram_max"]) if decode_len_ok else 0
         b_sla = int(d_scen["b_sla"]) if decode_budget_ms > 0.0 else 0
-        b_feasible = min(b_sla, b_vram_max)
+        b_feasible = int(d_scen["b_feasible"])
         step_ms_at_b1 = float(d_scen["step_ms_at_b1"])
-        decode_step_ms = float(d_scen["step_ms_feasible"]) if b_feasible >= 1 else step_ms_at_b1
+        decode_step_ms = (float(d_scen["step_ms_feasible"])
+                          if b_feasible >= 1 and d_scen.get("step_ms_feasible") is not None
+                          else step_ms_at_b1)
         effective_tpot_ms = (decode_step_ms / max(emit_tokens, 1e-12)) + handoff_tpot_ms
         first_decode_itl_ms = kv_transfer_ms_per_request + decode_step_ms
         tpot_sla_ok = bool(b_feasible >= 1 and effective_tpot_ms <= tpot_sla_ms)
@@ -605,6 +622,7 @@ def sweep_pd_disaggregation_ratios(
                 "decode_step_ms": decode_step_ms, "effective_tpot_ms": effective_tpot_ms,
                 "first_decode_itl_ms": first_decode_itl_ms, "bottleneck_stage": bottleneck_stage,
                 "feasible": feasible, "infeasible_reason": infeasible_reason, "reason": infeasible_reason,
+                "metrics_boundary": "one_pipeline_stage_rate_composition",
             })
 
     feasible_rows = [r for r in rows if r["feasible"]]
@@ -651,6 +669,9 @@ def sweep_pd_disaggregation_ratios(
         },
         "candidates": rows, "ratios": rows,
         "pareto_frontier": pareto_frontier, "best_configuration": best_cfg,
+        "plan_selection": "fixed_stage_case_per_pipeline",
+        "composition": "separate_prefill_and_decode_stage_programs_bound_by_min_stage_rate",
+        "comparison_boundary": "stage_rates_are_composed_for_one_pipeline_configuration_not_stitched_per_metric",
     }
 
 

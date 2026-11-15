@@ -37,8 +37,8 @@ def bf16(values):
     """Round float32 to bfloat16 (nearest-even), retaining float32 storage."""
     array = np.asarray(values, dtype=np.float32)
     bits = array.view(np.uint32).copy()
-    rounded = bits + np.uint32(0x7FFF) + ((bits >> 16) & 1)
-    return (rounded & np.uint32(0xFFFF0000)).view(np.float32)
+    rounded = np.asarray(bits + np.uint32(0x7FFF) + ((bits >> np.uint32(16)) & np.uint32(1)), dtype=np.uint32)
+    return np.asarray(rounded & np.uint32(0xFFFF0000), dtype=np.uint32).view(np.float32)
 
 
 def quantize(values, dtype):

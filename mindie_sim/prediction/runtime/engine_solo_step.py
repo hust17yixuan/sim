@@ -1,0 +1,256 @@
+"""Single-active-task fast-path step integration for the causal Engine.
+
+[Role] Integrate one eligible active consumer (uncoupled single/multi-resource
+  or all-fair coupled) without allocating intermediate rate dictionaries.
+[Invariants] Zero allocated service rates raise ``service_rate_underflow``
+  before any state mutation; falls back cleanly (returns ``None``) when FIFO
+  or multi-tier coupled constraints require the general arbiter.
+[Timeouts & Locks] O(task resources) arithmetic; no locks, sleeps or I/O.
+[Side-Effect Policy] Mutates live task remaining/service maps and Engine counters.
+"""
+from __future__ import annotations
+
+import heapq
+import math
+
+from ..coupled import _coupled_demand_and_cap_limit
+from .engine_types import ExecutionError, _Task
+
+
+class _EngineSoloStepMixin:
+    def _step_solo_fast(
+        self, key: int, task: _Task, now: float, horizon: float,
+        max_steps: int | None,
+    ) -> float | None:
+        rem = task.remaining
+        releases = self._releases
+        latency_active = self._latency_active
+        tasks = self._tasks
+        resources = self.resources
+        busy_ms = self.busy_ms
+        serviced = self.serviced
+        completable = self._completable
+        completable_seen = self._completable_seen
+        _isfinite = math.isfinite
+        _ulp = math.ulp
+        _nextafter = math.nextafter
+        _heappush = heapq.heappush
+        _inf = math.inf
+        stop_dt = horizon - now
+        if releases:
+            rel_dt = releases[0][0] - now
+            if rel_dt < stop_dt:
+                stop_dt = rel_dt
+        if latency_active:
+            if len(latency_active) == 1:
+                ltask = tasks[next(iter(latency_active))]
+                if ltask.start + ltask.latency > now:
+                    lat_dt = ltask.start + ltask.latency - now
+                    if lat_dt < stop_dt:
+                        stop_dt = lat_dt
+            else:
+                for lkey in latency_active:
+                    ltask = tasks[lkey]
+                    if ltask.start + ltask.latency > now:
+                        lat_dt = ltask.start + ltask.latency - now
+                        if lat_dt < stop_dt:
+                            stop_dt = lat_dt
+        if not rem:
+            if not _isfinite(stop_dt):
+                names = ",".join(t.event.name for t in tasks.values())
+                raise ExecutionError(f"execution_stalled:{names[:300]}")
+            next_time = now + stop_dt
+            if stop_dt > 0 and next_time == now:
+                next_time = _nextafter(now, _inf)
+            return next_time
+        if not task.coupled:
+            prep = task.prepared
+            s_rates = prep.solo_rates if prep is not None else None
+            if len(rem) == 1:
+                rname, remaining = next(iter(rem.items()))
+                if s_rates is not None:
+                    rate = s_rates[rname]
+                else:
+                    res = resources[rname]
+                    if res.policy == "fifo":
+                        rate = res.rate
+                    elif task.placement and rname in task.placement:
+                        rate = res.rate / res.units * len(task.placement[rname])
+                    else:
+                        rate = res.rate
+                    if task.caps and rname in task.caps:
+                        cap = task.caps[rname]
+                        if cap < rate:
+                            rate = cap
+                if rate == 0.0:
+                    raise ExecutionError(f"service_rate_underflow:{rname}")
+                work_dt = remaining / rate
+                dt = work_dt if work_dt < stop_dt else stop_dt
+                if not _isfinite(dt):
+                    names = ",".join(t.event.name for t in tasks.values())
+                    raise ExecutionError(f"execution_stalled:{names[:300]}")
+                next_time = now + dt
+                if dt > 0 and next_time == now:
+                    next_time = _nextafter(now, _inf)
+                busy_ms[rname] += dt
+                scaled = dt * rate
+                if scaled >= remaining:
+                    used, residual = remaining, 0.0
+                else:
+                    residual = remaining - scaled
+                    if residual <= 4 * _ulp(remaining):
+                        used, residual = remaining, 0.0
+                    else:
+                        used = scaled
+                service = task.service
+                service[rname] = service.get(rname, 0.0) + used
+                serviced[rname] += used
+                if residual:
+                    rem[rname] = residual
+                else:
+                    del rem[rname]
+                    if task.latency <= 0.0:
+                        completable_seen.add(key)
+                        _heappush(completable, key)
+                return next_time
+            entries = []
+            min_wdt = stop_dt
+            max_wdt = 0.0
+            t_place = task.placement
+            t_caps = task.caps
+            for rname, remaining in rem.items():
+                if s_rates is not None:
+                    rate = s_rates[rname]
+                else:
+                    res = resources[rname]
+                    if res.policy == "fifo":
+                        rate = res.rate
+                    elif t_place and rname in t_place:
+                        rate = res.rate / res.units * len(t_place[rname])
+                    else:
+                        rate = res.rate
+                    if t_caps and rname in t_caps:
+                        cap = t_caps[rname]
+                        if cap < rate:
+                            rate = cap
+                if rate == 0.0:
+                    raise ExecutionError(f"service_rate_underflow:{rname}")
+                wdt = remaining / rate
+                if wdt < min_wdt:
+                    min_wdt = wdt
+                if wdt > max_wdt:
+                    max_wdt = wdt
+                entries.append((rname, remaining, rate, wdt))
+            if max_steps is None and _isfinite(max_wdt) and max_wdt <= stop_dt:
+                next_time = now + max_wdt
+                if max_wdt > 0 and next_time == now:
+                    next_time = _nextafter(now, _inf)
+                service = task.service
+                for rname, remaining, _rate, wdt in entries:
+                    busy_ms[rname] += wdt
+                    service[rname] = service.get(rname, 0.0) + remaining
+                    serviced[rname] += remaining
+                rem.clear()
+                if task.latency <= 0.0:
+                    completable_seen.add(key)
+                    _heappush(completable, key)
+                return next_time
+            dt = min_wdt
+            if not _isfinite(dt):
+                names = ",".join(t.event.name for t in tasks.values())
+                raise ExecutionError(f"execution_stalled:{names[:300]}")
+            next_time = now + dt
+            if dt > 0 and next_time == now:
+                next_time = _nextafter(now, _inf)
+            service = task.service
+            for rname, remaining, rate, _wdt in entries:
+                busy_ms[rname] += dt
+                scaled = dt * rate
+                if scaled >= remaining:
+                    used, residual = remaining, 0.0
+                else:
+                    residual = remaining - scaled
+                    if residual <= 4 * _ulp(remaining):
+                        used, residual = remaining, 0.0
+                    else:
+                        used = scaled
+                service[rname] = service.get(rname, 0.0) + used
+                serviced[rname] += used
+                if residual:
+                    rem[rname] = residual
+                else:
+                    del rem[rname]
+            if not rem and task.latency <= 0.0:
+                completable_seen.add(key)
+                _heappush(completable, key)
+            return next_time
+        prep = task.prepared
+        c_rates = (prep.coupled_solo_rates
+                   if (prep is not None
+                       and prep.coupled_solo_rates is not None
+                       and len(rem) == len(prep.coupled_solo_rates))
+                   else None)
+        if c_rates is not None:
+            dt = stop_dt
+            for rname, rate in c_rates:
+                if rate == 0.0:
+                    raise ExecutionError(f"service_rate_underflow:{rname}")
+                wdt = rem[rname] / rate
+                if wdt < dt:
+                    dt = wdt
+        elif all(resources[rname].policy != "fifo" for rname in rem):
+            c_demand, c_limit = _coupled_demand_and_cap_limit(resources, task)
+            t_place = task.placement
+            for rname, amount in c_demand.items():
+                if amount:
+                    res = resources[rname]
+                    u_cnt = (len(t_place[rname])
+                             if t_place and rname in t_place else res.units)
+                    per_unit = amount if u_cnt == 1 else amount / u_cnt
+                    if per_unit:
+                        cap_lim = (res.rate / res.units) / per_unit
+                        if cap_lim < c_limit:
+                            c_limit = cap_lim
+            if 0.0 < c_limit < _inf:
+                dt = stop_dt
+                c_rates_list = []
+                for rname, amount in c_demand.items():
+                    rate = amount * c_limit
+                    if rate == 0.0:
+                        raise ExecutionError(f"service_rate_underflow:{rname}")
+                    wdt = rem[rname] / rate
+                    if wdt < dt:
+                        dt = wdt
+                    c_rates_list.append((rname, rate))
+                c_rates = c_rates_list
+        if c_rates is None:
+            return None
+        if not _isfinite(dt):
+            names = ",".join(t.event.name for t in tasks.values())
+            raise ExecutionError(f"execution_stalled:{names[:300]}")
+        next_time = now + dt
+        if dt > 0 and next_time == now:
+            next_time = _nextafter(now, _inf)
+        service = task.service
+        for rname, rate in c_rates:
+            busy_ms[rname] += dt
+            remaining = rem[rname]
+            scaled = dt * rate
+            if scaled >= remaining:
+                used, residual = remaining, 0.0
+            else:
+                residual = remaining - scaled
+                if residual <= 4 * _ulp(remaining):
+                    used, residual = remaining, 0.0
+                else:
+                    used = scaled
+            service[rname] = service.get(rname, 0.0) + used
+            serviced[rname] += used
+            if residual:
+                rem[rname] = residual
+            else:
+                del rem[rname]
+        if not rem and task.latency <= 0.0:
+            completable_seen.add(key)
+            _heappush(completable, key)
+        return next_time

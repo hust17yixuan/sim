@@ -9,9 +9,10 @@
 """
 from dataclasses import dataclass
 from bisect import bisect_right
+from mindie_sim.schema.common import dtype_bytes
 from .engine import Allocation
 from .ownership import read_role, unit_group
-from .program import PipelineProgram, Stage
+from .program import KernelProgram, PipelineProgram, Stage
 
 
 @dataclass(frozen=True)
@@ -22,7 +23,16 @@ class RecurrentVector:
         op, names = context.op, context.resource_names
         meta = dict(op.metadata)
         q, heads, dk, dv = (meta[key] for key in ("tokens", "heads", "dk", "dv"))
-        sequences = meta.get("sequence_tokens", (q,))
+        sequences = tuple(sequence for sequence in
+                           meta.get("sequence_tokens", (q,)) if sequence > 0)
+        state_dtype = meta.get("state_dtype", "fp32")
+        state_byte = dtype_bytes(state_dtype)
+        if meta.get("state_element_bytes", state_byte) != state_byte:
+            raise ValueError("recurrent_vector_state_element_bytes_mismatch")
+        if not sequences:
+            # A physical graph may allocate state rows with no active sequence.
+            # The host grid remains; the source recurrence does no state work.
+            return KernelProgram(())
         units = context.resource_units.get("vector", context.core_count)
         waves, ends = [], [0]
         for start in range(0, heads * len(sequences), units):
@@ -30,7 +40,7 @@ class RecurrentVector:
                             for head in range(start, min(start + units, heads * len(sequences))))
             waves.append(lengths)
             ends.append(ends[-1] + max(lengths))
-        per_head_state = dk * dv * meta["state_element_bytes"]
+        per_head_state = dk * dv * state_byte
         steps = sum(sequences) * heads
         read_per_step = (op.mte2_bytes - len(sequences) * heads * per_head_state) / steps
         write_per_step = op.mte3_bytes / steps
@@ -38,7 +48,7 @@ class RecurrentVector:
         operand_read = read_role(names, aiv=0)
         pool = context.pool_names.get(self.state_pool)
         # State plus the state-dot temporary and vector inputs/delta.
-        storage = 2 * dk * dv * 4 + (2 * dk + 2 * dv) * 4
+        storage = 2 * dk * dv * state_byte + (2 * dk + 2 * dv) * 4
 
         def copies(label, amount, role, active, after):
             if role not in names:

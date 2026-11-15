@@ -13,11 +13,8 @@ import json
 import math
 from pathlib import Path
 
-import ijson
-from ijson.common import ObjectBuilder
-
 from .kernels import kernel_rows
-from .store import digest_file, json_items
+from .store import digest_file, json_items, json_kvitems, json_top_fields
 
 
 def _checked(root, reference):
@@ -28,24 +25,7 @@ def _checked(root, reference):
 
 
 def _fields(path, wanted):
-    result, builder, selected, depth = {}, None, None, 0
-    with path.open("rb") as stream:
-        for prefix, event, value in ijson.parse(stream, use_float=True):
-            if builder is None:
-                if prefix not in wanted:
-                    continue
-                if event not in {"start_map", "start_array"}:
-                    result[prefix] = value
-                    continue
-                selected, builder = prefix, ObjectBuilder()
-            builder.event(event, value)
-            if event in {"start_map", "start_array"}:
-                depth += 1
-            elif event in {"end_map", "end_array"}:
-                depth -= 1
-                if not depth:
-                    result[selected], builder = builder.value, None
-    return result
+    return json_top_fields(path, wanted)
 
 
 def _identity(manifest, header, *, level, boundary, implementation, phase,
@@ -93,8 +73,8 @@ def _activation(manifest, capture, path):
     header = _fields(path, {"schema", "device", "visible", "torch", "torch_npu", "canaries"})
     if header["schema"] != "a3-activation-measure/1":
         raise ValueError("activation_capture_schema_mismatch")
-    with path.open("rb") as stream:
-        for key, row in ijson.kvitems(stream, "cells", use_float=True):
+    for key, row in json_kvitems(path, "cells"):
+        if True:
             variant = manifest["variants"][row["variant"]]
             prefix = "/cells/" + key.replace("~", "~0").replace("/", "~1")
             metadata = {

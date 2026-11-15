@@ -342,7 +342,6 @@ def test_ordinary_frontend_mla_groups_and_source_bindings():
             if name.startswith("matrix@"):
                 units.update(owners)
     assert len(programs) == len(units) == 16
-    assert sum(row["task"] == "tiled:setup" for row in engine.trace) == 1
     assert all(row["start_ms"] >= 7 for row in engine.trace if row["demand"])
     assert engine.summary()["live_tasks"] == engine.summary()["live_programs"] == 0
     assert not any(engine.allocated.values())

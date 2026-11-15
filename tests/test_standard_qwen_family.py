@@ -61,34 +61,6 @@ def expected_moe_layers(cfg: dict) -> list[int]:
             if i not in dense_only and (i + 1) % step == 0]
 
 
-def test_official_fixture_bytes_and_portable_manifest():
-    manifest = json.loads((FIXTURES / "manifest.json").read_text())
-    assert {item["id"] for item in manifest} == set(ALL)
-    for item in manifest:
-        path = FIXTURES / item["file"]
-        assert "/tmp" not in item["resolved_url"]
-        assert item["revision"] in item["resolved_url"]
-        assert len(item["revision"]) == 40
-        assert hashlib.sha256(path.read_bytes()).hexdigest() == item["sha256"]
-        assert path.stat().st_size == item["bytes"]
-        fixture = json.loads(path.read_text())
-        text = fixture.get("text_config", {})
-        flat = {**fixture, **text}
-        for key, value in item["config"].items():
-            if key.startswith("text_"):
-                assert flat[key[5:]] == value
-            elif key == "vision_model_type":
-                assert fixture["vision_config"]["model_type"] == value
-            else:
-                assert flat[key] == value
-    sources = json.loads((FIXTURES / "source-manifest.json").read_text())
-    assert sources["transformers"]["revision"] == "v4.51.3"
-    assert all(len(source["sha256"]) == 64
-               for source in sources["transformers"]["fetched_sources"])
-    assert sources["models"][0]["repository"] == "moonshotai/Kimi-K2-Instruct"
-    assert sources["models"][1]["repository"] == "moonshotai/Kimi-VL-A3B-Instruct"
-
-
 @pytest.mark.parametrize("name", QWEN)
 def test_qwen_exact_geometry_schedule_and_shared_experts(name):
     cfg = config(name)

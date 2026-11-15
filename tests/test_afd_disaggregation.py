@@ -287,7 +287,7 @@ def test_predict_afd_m_step_pipeline_af_comm_and_link_degradation():
     """Verify serial, M=2 and M>=3 pipeline equations plus degraded link behavior."""
     attn_case = _make_dense_gqa_case(layers=2, tp=4)
     ffn_case = _make_dense_gqa_case(layers=2, tp=8)
-    common = dict(tokens=64, context=2048, sequences=60)
+    common = dict(tokens=64, context=512, sequences=60)
     serial = predict_afd(attn_case, ffn_case, m_steps=1, **common)
     partial = predict_afd(attn_case, ffn_case, m_steps=2, **common)
     pipelined = predict_afd(attn_case, ffn_case, m_steps=3, **common)
@@ -508,12 +508,14 @@ def test_afd_request_latency_sla_and_pool_memory_feasibility():
     )
     assert mid_report["meets_tpot_sla"] is False
 
-    oom_attn = _make_dense_gqa_case(layers=64, tp=2)
-    oom_ffn = _make_dense_gqa_case(layers=64, tp=8)
+    oom_attn = _make_dense_gqa_case(layers=2, tp=2)
+    oom_ffn = _make_dense_gqa_case(layers=2, tp=8)
+    oom_attn["machine"]["device"] = {"memory_bytes": 50 * 1024**2}
+    oom_ffn["machine"]["device"] = {"memory_bytes": 50 * 1024**2}
     oom_report = solve_afd_pareto(
         oom_attn, oom_ffn,
         attn_die_counts=(2,), ffn_die_counts=(8,), m_steps_options=(3,),
-        sequences=128, context=65536, sla_tpot_ms=1000.0,
+        sequences=8, context=256, sla_tpot_ms=1000.0,
     )
     assert oom_report["candidates"][0]["feasible"] is False
     assert oom_report["candidates"][0]["status"] == "oom"

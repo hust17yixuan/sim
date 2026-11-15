@@ -158,7 +158,7 @@ def test_optional_prepared_weights_stay_resident_when_mixed_calls_select_analyti
             "phases": ["decode"], "max_query_tokens": {"max": 1}}, otherwise="analytical")
     parsed = parse_case(replace(original, runtime=replace(original.runtime, kernels=kernels)))
     assert stage_weight_bytes(parsed.model, parsed.runtime.parallel) == resident
-    views = (RequestView("d", 1, 4104, False, "decode", draft_advanced_tokens=1),
+    views = (RequestView("d", 1, 4096, False, "decode", draft_advanced_tokens=1),
              RequestView("p", 8, 0, False, "prefill"))
     mixed = Frontend()(IterationPlan(views), parsed.model, parsed.runtime, parsed.machine)
     assert all(row["implementation"] == "analytical" for row in mixed.implementation_selections)

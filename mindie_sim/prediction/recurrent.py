@@ -11,11 +11,37 @@ from dataclasses import replace
 
 from mindie_sim.catalog.attention_common import AttentionResult
 from mindie_sim.schema.common import dtype_bytes, ModelingError
+from mindie_sim.schema.tensors import TensorLayout, TensorValue
+from . import gdn_recurrent
+from .operators import kda_state_selection as pcp_state_selection
 from .lowering import Builder
 from .tensors import TensorLowering
 from .structure_groups import declare_group, source_reference
 from .implementations import select
 from .projections import kda_projections, require_packed_slice
+
+
+def _serving_kda_source(runtime, model, views, plan):
+    """Shared A5 KDA source selection for ordinary serving.
+
+    The phase/runtime/typed-plan gate is the same helper used by body defaults.
+    Explicit lowerings, recipes, families and programs are preserved.
+    """
+    from .kda_source import resolve
+    if runtime is None:
+        return None
+    kernels = runtime.kernels
+    metadata = dict(runtime.metadata)
+    opts = resolve(plan, arch=metadata.get("arch_family"),
+                   phase=(views[0].phase if views else ""),
+                   kernels=kernels, activation_dtype=model.activation_dtype,
+                   views=views)
+    if opts is None:
+        return None
+    return select({"kda": {
+        "implementation": "vllm_ascend_recurrent_kda_arch35",
+        "options": opts,
+    }}, "kda")
 
 
 def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
@@ -46,6 +72,8 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     key_width, value_width = key_heads * dk, heads * dv
     kda_source = (select(runtime.kernels.get("lowerings", {}), "kda")
                   if runtime and plan.attention == "kda" else None)
+    if kda_source is None:
+        kda_source = _serving_kda_source(runtime, model, views, plan)
     kda_caps = frozenset(getattr(kda_source.module, "CAPABILITIES", ())
                          if kda_source else ())
     prefill_source = (kda_source if kda_caps & {"prefill", "prefill_fwd_h"}
@@ -113,10 +141,64 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             b, tensors, plan=plan, views=views, tokens=tokens, sources=sources,
             key_width=key_width, value_width=value_width, **conv_source.options)
     else:
+        active_views = tuple(view for view in views if not view.padding)
+        active_tokens = sum(view.q_len for view in active_views)
+        history_bytes = (plan.conv_kernel - 1) * len(active_views) * conv_width * 2
         conv = b.vector("short_convolution", tuple(dict.fromkeys(sources)),
                         tokens * conv_width, 2 * plan.conv_kernel,
-                        read_bytes_override=(tokens + (plan.conv_kernel - 1) * len(views)) * conv_width * 2,
-                        write_bytes_override=tokens * conv_width * 2)
+                        read_bytes_override=(active_tokens * conv_width * 2
+                                             + history_bytes),
+                        write_bytes_override=(active_tokens * conv_width * 2
+                                              + history_bytes))
+        if plan.attention == "gdn" and active_views:
+            # One physical convolution may carry speculative decode rows and
+            # prefill rows.  Each slot keeps its own event: a decode row writes
+            # query candidates and commits only its accepted offset, while a
+            # prefill row writes its sequence tail once.  A whole-batch
+            # "decode_only" or "conv" branch would publish 4100 for a q4 decode
+            # slice and ignore B's pending decision.
+            directions = tuple("token" if view.phase == "decode" else "conv"
+                               for view in views)
+            cursor, conv_views = 0, []
+            for view in views:
+                conv_views.append(conv_input.narrow(0, cursor, view.q_len))
+                cursor += view.q_len
+            contract, effects = gdn_recurrent.state_contract(
+                views=views, phase="mixed", state_dtype=None,
+                conv_state_dtype=plan.conv_state_dtype,
+                conv_kernel=plan.conv_kernel, target_prefix=prefix,
+                initial_state=tuple(view.context > 0 and not view.padding
+                                    for view in views),
+                direction=directions[0], directions=directions,
+                target_kind="conv",
+                global_lengths=tuple(view.global_q_len or view.q_len
+                                     for view in views),
+                value_inputs=tuple(conv_views), heads=heads,
+                remote_publish=parallel.pcp > 1)
+            contract, _state_outputs = gdn_recurrent.bind_state_ports(
+                contract, b.ops[-1].op_id, heads=heads, head_shards=1)
+            b.ops[-1] = replace(b.ops[-1], metadata=tuple({
+                **dict(b.ops[-1].metadata),
+                "state_dtype": plan.conv_state_dtype,
+                "state_layout": "slots_history_channels",
+                "state_mutation": "inplace_history_writeback",
+                "state_write_bytes": history_bytes,
+                "state_ready": b.ops[-1].op_id,
+                "state_value_inputs": contract["value_inputs"],
+                "state_value_outputs": contract["value_outputs"],
+                "state_candidate_stores": contract["candidate_stores"],
+                "state_candidate_storage": ({
+                    "kind": "history_ring+query_rows",
+                    "recovery": "accepted_prefix_from_conv_history_and_query_inputs",
+                    "history_slots": plan.conv_kernel - 1,
+                    "kernel": plan.conv_kernel,
+                    "query_rows": tuple(view.q_len for view in views
+                                        if view.phase == "decode"),
+                    "op": b.ops[-1].op_id,
+                } if any(direction == "token"
+                         for direction in directions) else {}),
+                "gdn_state_contract": contract,
+                "gdn_state_effects": effects}.items()))
     if projection_group:
         # Source returns from its auxiliary stream only after beta is ready.
         b.ops[-1] = replace(b.ops[-1], deps=tuple(dict.fromkeys(
@@ -157,6 +239,10 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             metadata=(("A_log_dtype", "fp32"), ("dt_bias_dtype", "fp32"),
                       ("beta_dtype", "fp32"), ("raw_gate_dtype", model.activation_dtype)))
     outputs, prefill_scan_ids, prepare_ids = [], [], []
+    view_offsets, _cursor = [], 0
+    for _view in views:
+        view_offsets.append(_cursor)
+        _cursor += _view.q_len
     for index, view in enumerate(views):
         q = view.q_len
         chunks = math.ceil(q / chunk) if view.phase == "prefill" else q
@@ -192,37 +278,229 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                           flops=2 * pairs * heads * (dk + dv), vector=wy_vec,
                           read=wy_read, write=wy_write, family="recurrent_local")
         state_bytes = heads * dk * dv * dtype_bytes(plan.recurrent_state_dtype)
+        pcp_ranges = (plan.attention == "gdn" and view.phase == "prefill"
+                      and parallel.pcp > 1 and len(view.query_ranges) > 1)
         if view.phase == "prefill" or plan.attention != "gdn":
             is_kda_prefill = view.phase == "prefill" and plan.attention == "kda"
-            chunk_vec = chunks * (6 if is_kda_prefill else 2) * heads * dk * dv
-            token_vec = q * heads * (dk * dv if is_kda_prefill else 2 + 2 * dv)
-            scan_vec = token_vec + chunk_vec
-            scan_read = (2 * chunks * state_bytes + q * heads * ((2 * dk + dv) * 2 + dk * 4)
-                         if is_kda_prefill else
-                         chunks * state_bytes + q * heads * (2 * dk + dv) * 2)
-            scan_write = (2 * chunks * state_bytes + q * (value_width + heads * dv) * 2
-                          if is_kda_prefill else
-                          chunks * state_bytes + q * value_width * 2)
-            last = b.work(
-                f"recurrent_scan{index}", (last, normalized), (q, heads, dk, dv),
-                flops=(4 if view.phase == "prefill" else 6) * q * heads * dk * dv,
-                vector=scan_vec, read=scan_read, write=scan_write, family="recurrent_scan",
-                metadata=(("chunk", span), ("chunks", chunks), ("tokens", q),
-                          ("heads", heads), ("dk", dk), ("dv", dv),
-                          ("chunk_vector_ops", float(chunk_vec)),
-                          ("token_vector_ops", float(token_vec))),
-            )
+            if pcp_ranges:
+                version = view.context
+                previous = last
+                segment_index = 0
+                total_global = view.global_q_len or view.q_len
+                for range_index, (start, end) in enumerate(view.query_ranges):
+                    length = int(end) - int(start)
+                    if length <= 0:
+                        continue
+                    seg_chunks = math.ceil(length / chunk)
+                    seg_vec = (seg_chunks * 2 * heads * dk * dv
+                               + length * heads * (2 + 2 * dv))
+                    seg_read = (seg_chunks * state_bytes
+                                + length * heads * (2 * dk + dv) * 2)
+                    seg_write = (seg_chunks * state_bytes
+                                 + length * value_width * 2)
+                    seg = b.work(
+                        f"recurrent_scan{index}_seg{segment_index}",
+                        (previous, normalized), (length, heads, dk, dv),
+                        flops=4 * length * heads * dk * dv,
+                        vector=seg_vec, read=seg_read, write=seg_write,
+                        family="recurrent_scan",
+                        metadata=(("chunk", chunk), ("chunks", seg_chunks),
+                                  ("tokens", length), ("heads", heads),
+                                  ("dk", dk), ("dv", dv),
+                                  ("chunk_vector_ops",
+                                   float(seg_chunks * 2 * heads * dk * dv)),
+                                  ("token_vector_ops",
+                                   float(length * heads * (2 + 2 * dv))),
+                                  ("pcp_segment", (int(start), int(end)))))
+                    segment_view = replace(
+                        view, q_len=length, context=version,
+                        global_q_len=length, query_ranges=((0, length),))
+                    direction = ("conv" if range_index == len(view.query_ranges) - 1
+                                 else "h")
+                    # A local tail segment that reaches the global end is not
+                    # necessarily the global owner: a PCP rank may miss the
+                    # middle ranges owned by its peers.  Publish only when the
+                    # whole rank owns every global query token.
+                    owner = not pcp_state_selection.pcp_remote_publish(
+                        view.query_ranges, view.q_len, total_global,
+                        pcp=parallel.pcp, padding=view.padding)
+                    contract, effects = gdn_recurrent.state_contract(
+                        views=(segment_view,), phase="prefill",
+                        state_dtype=plan.recurrent_state_dtype,
+                        conv_state_dtype=plan.conv_state_dtype,
+                        conv_kernel=plan.conv_kernel, target_prefix=prefix,
+                        chunk=chunk, initial_state=(True,), direction=direction,
+                        target_kind=("recurrent" if direction == "conv" else "local"),
+                        global_lengths=(length,),
+                        remote_publish=(direction == "conv"
+                                        and parallel.pcp > 1 and not owner))
+                    b.ops[-1] = replace(b.ops[-1], metadata=tuple({
+                        **dict(b.ops[-1].metadata),
+                        "gdn_state_contract": contract,
+                        "gdn_state_effects": effects,
+                        "state_segment_index": segment_index,
+                        "state_segment_range": (int(start), int(end)),
+                        "state_segment_from_version": version,
+                        "state_segment_to_version": version + length}.items()))
+                    previous = seg
+                    version += length
+                    if range_index < len(view.query_ranges) - 1:
+                        next_start = int(view.query_ranges[range_index + 1][0])
+                        gap = next_start - int(end)
+                        if gap:
+                            exchange = b.communicate(
+                                f"pcp_recurrent_state_step{index}_{segment_index}",
+                                (previous,),
+                                state_bytes * (2 * parallel.pcp - 1) / parallel.pcp,
+                                "state_transfer", "pcp",
+                                state_scope="recurrent_local_bank",
+                                remote_producer="external_rank",
+                                source_implementation="pcp1_only",
+                                status="pending_external_rank",
+                                from_version=version, to_version=version + gap)
+                            previous = exchange
+                            version += gap
+                    segment_index += 1
+                if previous is not None and parallel.pcp > 1:
+                    pub_name = ("pcp_remote_state_publish" if len(views) == 1
+                                else f"pcp_remote_state_publish{index}")
+                    previous = b.work(
+                        pub_name, (previous,), (0,),
+                        recipe="pcp_remote_state_publish",
+                        family="state_publish",
+                        metadata=(("status", ("local_owner" if owner
+                                              else "pending_external_rank")),
+                                  ("producer_scope", ("local_writeback" if owner
+                                                      else "external_rank")),
+                                  ("completion_owner", "T04/final_writeback"),
+                                  ("source_implementation", "pcp1_only"),
+                                  ("global_expected_version",
+                                   view.context + (view.global_q_len or view.q_len))))
+                last = previous
+            else:
+                chunk_vec = chunks * (6 if is_kda_prefill else 2) * heads * dk * dv
+                token_vec = q * heads * (dk * dv if is_kda_prefill else 2 + 2 * dv)
+                scan_vec = token_vec + chunk_vec
+                scan_read = (2 * chunks * state_bytes + q * heads * ((2 * dk + dv) * 2 + dk * 4)
+                             if is_kda_prefill else
+                             chunks * state_bytes + q * heads * (2 * dk + dv) * 2)
+                scan_write = (2 * chunks * state_bytes + q * (value_width + heads * dv) * 2
+                              if is_kda_prefill else
+                              chunks * state_bytes + q * value_width * 2)
+                pcp_segment = (plan.attention == "gdn"
+                               and view.phase == "prefill" and parallel.pcp > 1)
+                ranges = tuple(view.query_ranges)
+                first_start = int(ranges[0][0]) if ranges else 0
+                range_end = int(ranges[-1][1]) if ranges else q
+                global_q = view.global_q_len or view.q_len
+                remote_initial = None
+                remote_port = None
+                if pcp_segment and first_start > 0:
+                    remote_initial = b.work(
+                        f"pcp_remote_initial_state{index}", (normalized,), (0,),
+                        family="state_transfer",
+                        metadata=(("status", "pending_external_rank"),
+                                  ("producer_scope", "external_rank"),
+                                  ("completion_owner", "T09/COMM-LEAVES"),
+                                  ("source_implementation", "pcp1_only"),
+                                  ("request", view.request_id),
+                                  ("from_version", view.context),
+                                  ("to_version", view.context + first_start)))
+                    remote_port = gdn_recurrent.tensor_port(TensorValue(
+                        "", plan.recurrent_state_dtype or "fp32",
+                        TensorLayout.contiguous((1, heads, dv, dk)),
+                        binding="external",
+                        binding_name=(f"pcp_peer:{view.request_id}:state@"
+                                      f"{view.context + first_start}"),
+                        state_version=view.context + first_start),
+                        ready=str(remote_initial), role="remote_input",
+                        owner="external_rank")
+                scan_deps = (last, normalized) + ((remote_initial,)
+                                                  if remote_initial else ())
+                last = b.work(
+                    f"recurrent_scan{index}", scan_deps, (q, heads, dk, dv),
+                    flops=(4 if view.phase == "prefill" else 6) * q * heads * dk * dv,
+                    vector=scan_vec, read=scan_read, write=scan_write,
+                    family="recurrent_scan",
+                    metadata=(("chunk", span), ("chunks", chunks), ("tokens", q),
+                              ("heads", heads), ("dk", dk), ("dv", dv),
+                              ("chunk_vector_ops", float(chunk_vec)),
+                              ("token_vector_ops", float(token_vec))),
+                )
+                if plan.attention == "gdn":
+                    contract, effects = gdn_recurrent.state_contract(
+                        views=(view,), phase="prefill",
+                        state_dtype=plan.recurrent_state_dtype,
+                        conv_state_dtype=plan.conv_state_dtype,
+                        conv_kernel=plan.conv_kernel, target_prefix=prefix,
+                        chunk=chunk, initial_state=(view.context > 0,),
+                        direction="conv", target_kind="recurrent",
+                        global_lengths=(view.global_q_len or view.q_len,),
+                        remote_publish=(
+                            pcp_segment and
+                            pcp_state_selection.pcp_remote_publish(
+                                view.query_ranges, q, global_q,
+                                pcp=parallel.pcp, padding=view.padding)),
+                        remote_input=(remote_port,),
+                        heads=heads)
+                    contract, state_outputs = gdn_recurrent.bind_state_ports(
+                        contract, last, heads=heads, head_shards=1,
+                        remote_input=(remote_port,))
+                    meta = {
+                        **dict(b.ops[-1].metadata),
+                        "state_ready": last,
+                        "state_remote_inputs": ((remote_port,) if remote_port else ()),
+                        "gdn_state_contract": contract,
+                        "gdn_state_effects": effects,
+                        "state_value_outputs": state_outputs,
+                    }
+                    b.ops[-1] = replace(b.ops[-1], metadata=tuple(meta.items()))
+                    if pcp_segment:
+                        state_bytes = heads * dk * dv * dtype_bytes(
+                            plan.recurrent_state_dtype or "fp32")
+                        step = None
+                        if first_start == 0 and range_end < global_q:
+                            step = b.communicate(
+                                f"pcp_recurrent_state_step{index}", (last,),
+                                state_bytes * (2 * parallel.pcp - 1) / parallel.pcp,
+                                "state_transfer", "pcp",
+                                request=view.request_id,
+                                from_version=view.context + range_end,
+                                to_version=view.context + global_q,
+                                remote_producer="external_rank",
+                                completion_owner="T09/COMM-LEAVES",
+                                source_implementation="pcp1_only",
+                                status="pending_external_rank")
+                        publish_dep = step or last
+                        owner = ("local_writeback"
+                                 if range_end >= global_q else "external_rank")
+                        b.work(
+                            f"pcp_remote_state_publish{index}", (publish_dep,), (0,),
+                            family="state_publish",
+                            metadata=(("status", ("local_owner"
+                                                  if range_end >= global_q
+                                                  else "pending_external_rank")),
+                                      ("producer_scope", owner),
+                                      ("completion_owner", "T04/final_writeback"),
+                                      ("source_implementation", "pcp1_only"),
+                                      ("request", view.request_id),
+                                      ("global_expected_version",
+                                       view.context + global_q),
+                                      ("publish_pending", "remote_producer")))
             if view.phase == "prefill":
                 prefill_scan_ids.append(last)
-                if parallel.pcp > 1:
-                    # The output projection must wait until this request's state
-                    # has crossed the other DualChunkSwap chunks.
+                if (parallel.pcp > 1 and not pcp_ranges
+                        and plan.attention != "gdn"):
+                    # Contiguous KDA ranges keep the single post-scan handoff.
                     state_bytes = heads * dk * dv * dtype_bytes(
                         plan.recurrent_state_dtype or "fp32")
                     step_comm = b.communicate(
                         f"pcp_recurrent_state_step{index}", (last,),
                         state_bytes * (2 * parallel.pcp - 1) / parallel.pcp,
-                        "allgather", "pcp")
+                        "state_transfer", "pcp",
+                        remote_producer="external_rank",
+                        source_implementation="pcp1_only",
+                        status="pending_external_rank")
                     last = step_comm
         else:
             last = b.work(
@@ -237,6 +515,53 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                           ("state_element_bytes", dtype_bytes(plan.recurrent_state_dtype)),
                           ("state_checkpoints", q)),
             )
+            if plan.attention == "gdn":
+                offset = view_offsets[index]
+                activation = model.activation_dtype
+                decay_value = TensorValue(
+                    gated, activation, TensorLayout.contiguous((tokens, heads)))
+                qk_value = TensorValue(
+                    normalized, activation,
+                    TensorLayout.contiguous((tokens, 2 * key_width)))
+                conv_value = TensorValue(
+                    conv, activation,
+                    TensorLayout.contiguous((tokens, conv_width)))
+                row_view = (offset, offset + view.q_len)
+                value_views = {
+                    "decay": decay_value.narrow(0, offset, view.q_len),
+                    "qk": qk_value.narrow(0, offset, view.q_len),
+                    "conv": conv_value.narrow(0, offset, view.q_len),
+                }
+                contract, effects = gdn_recurrent.state_contract(
+                    views=(view,), phase="decode",
+                    state_dtype=plan.recurrent_state_dtype,
+                    conv_state_dtype=plan.conv_state_dtype,
+                    conv_kernel=plan.conv_kernel, target_prefix=prefix,
+                    initial_state=(view.context > 0,),
+                    direction="token", target_kind="recurrent",
+                    value_inputs=(value_views["conv"],), heads=heads)
+                contract, _state_outputs = gdn_recurrent.bind_state_ports(
+                    contract, b.ops[-1].op_id, heads=heads, head_shards=1)
+                b.ops[-1] = replace(b.ops[-1], metadata=tuple({
+                    **dict(b.ops[-1].metadata),
+                    "state_ready": b.ops[-1].op_id,
+                    "state_row_range": row_view,
+                    "state_value_views": {
+                        name: gdn_recurrent.tensor_port(value, role=name)
+                        for name, value in value_views.items()},
+                    "state_value_inputs": contract["value_inputs"],
+                    "state_value_outputs": contract["value_outputs"],
+                    "state_candidate_stores": contract["candidate_stores"],
+                    "state_candidate_storage": {
+                        "kind": "token_checkpoint_store",
+                        "recovery": "accepted_prefix_from_query_candidates",
+                        "history_slots": None,
+                        "kernel": None,
+                        "query_rows": (view.q_len,),
+                        "op": b.ops[-1].op_id,
+                    },
+                    "gdn_state_contract": contract,
+                    "gdn_state_effects": effects}.items()))
         if view.phase == "prefill":
             is_kda = plan.attention == "kda"
             pair_width = dv if is_kda else dk + dv
@@ -251,8 +576,8 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     decode_core = None
     decode_binder = (getattr(decode_source.module, "bind_decode_scans", None)
                      if decode_source else None)
-    if decode_binder is not None and any(view.phase == "decode" for view in views):
-        if any(view.phase != "decode" for view in views):
+    if decode_binder is not None and views and all(view.phase == "decode" for view in views):
+        if parallel.cp > 1:
             raise ModelingError("kda_source_recurrent_requires_decode_only_pcp1")
         options = dict(decode_source.options)
         # This caller provides raw Q/K and decay. The selected kernel owns
@@ -364,10 +689,35 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             first = scans[0]
             shape = (total_tokens, heads, dk, dv)
             fields = ("flops", "vector_ops", "hbm_bytes", "mte2_bytes", "mte3_bytes")
+            contracts = [dict(op.metadata).get("gdn_state_contract") for op in scans]
+            contracts = [contract for contract in contracts if contract is not None]
+            effects = tuple(effect for op in scans
+                            for effect in (dict(op.metadata).get("gdn_state_effects") or ()))
+            offsets, cursor = [], 0
+            for count in tokens_in_scan:
+                offsets.append(cursor)
+                cursor += count
             meta = {**dict(first.metadata), "tokens": total_tokens,
-                    "sequence_tokens": tokens_in_scan, "state_checkpoints": total_tokens}
+                    "sequence_tokens": tokens_in_scan, "state_checkpoints": total_tokens,
+                    "state_request_offsets": tuple(offsets),
+                    "state_request_ids": tuple(dict.fromkeys(
+                        request for op in scans for request in op.requests)),
+                    "gdn_state_effects": effects}
+            if contracts:
+                fused_contract = gdn_recurrent.merge_contracts(contracts)
+                fused_contract, _fused_outputs = gdn_recurrent.bind_state_ports(
+                    fused_contract, first.op_id, heads=heads, head_shards=1)
+                meta["gdn_state_contract"] = fused_contract
+                meta["state_ready"] = first.op_id
+                meta["state_candidate_stores"] = fused_contract["candidate_stores"]
+                meta["state_value_inputs"] = fused_contract["value_inputs"]
+                meta["state_value_outputs"] = fused_contract["value_outputs"]
+                meta["state_checkpoint_versions"] = tuple(
+                    item for op in scans
+                    for item in (dict(op.metadata).get("state_checkpoint_versions") or ()))
             fused = replace(
                 first, semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
+                requests=tuple(dict.fromkeys(request for op in scans for request in op.requests)),
                 deps=tuple(dict.fromkeys(dep for op in scans for dep in op.deps)),
                 metadata=tuple(meta.items()), **{key: sum(getattr(op, key) for op in scans) for key in fields})
             b.ops = [fused if op.op_id == first.op_id else op for op in b.ops

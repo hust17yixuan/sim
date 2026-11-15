@@ -1,4 +1,5 @@
 """Source kernel structure uses the same physical work as actual execution."""
+import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 from copy import deepcopy
 from dataclasses import replace
 import json
@@ -138,7 +139,10 @@ def test_declared_contract_matches_retained_a5_full31_active_tensor_abi(profiler
     from mindie_profiler.normalized import kernel_rows
     from mindie_profiler.tensor_contracts import observed_contract
 
-    path = Path(mindie_profiler.__file__).resolve().parents[1] / "tests/fixtures/attention_cache_contracts/a5_kimi_mla31.csv"
+    rel = Path("tests/fixtures/attention_cache_contracts/a5_kimi_mla31.csv")
+    path = Path(mindie_profiler.__file__).resolve().parents[1] / rel
+    if not path.is_file():
+        path = Path(__file__).resolve().parents[2] / "profiler" / rel
     if not path.is_file():
         pytest.skip("retained A5 MLA full31 capture fixture unavailable")
     for row, batch in zip(kernel_rows(path), (1, 1, 32)):

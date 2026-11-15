@@ -16,10 +16,12 @@ import math
 from mindie_sim.schema.common import dtype_bytes
 from .matrix_cycle import matrix_cycle
 from .matrix_epilogue import MatrixEpilogue
-from .matrix_mapping import MappedMatmul, footprint
+from .matrix_mapping import (MappedMatmul, footprint, matrix_geometry,
+                             physical_owner_rate)
 from .matrix import operand_transfer
 from .ownership import read_role
-from .program import KernelProgram, ParallelProgram, PipelineProgram, Stage
+from .program import (KernelProgram, ParallelProgram, PipelineProgram,
+                      PipelineTemplateProgram, Stage)
 
 
 @lru_cache(maxsize=1024)
@@ -33,9 +35,23 @@ class SteadyMatmul(MappedMatmul):
     """Keep exact nominal K-loop dependencies and a compact contended body."""
 
     compact_output_tiles: bool = True
+    #: Eligible one-tile owners reuse the finite template path.  Multi-tile
+    #: owner_run stays its existing real KernelProgram branch.
+    template_execution: bool = True
+    #: Combine symmetric owners (identical tile count and shape sequence) into
+    #: one cohort program: summed work/caps and the union of their units.  The
+    #: Engine divides a placement over its units, so the cohort's per-unit
+    #: demand, completion time and allocation accounting are the per-owner
+    #: values; only task count falls.  ``False`` keeps the detailed per-owner
+    #: programs, including asymmetric external contention between owners.
+    owner_cohorts: bool = False
 
-    def lower(self, context, *, mapping=None, owner_tiles=None, output=None,
-              directional_mte1=False):
+    def lower(self, context, *, mapping=None, owner_tiles=None, group_rows=None,
+              output=None, directional_mte1=False):
+        from .matrix_mapping import (freeze_owner_tiles, grouped_owner_rectangles,
+                                     owner_records)
+        owner_tiles = (freeze_owner_tiles(owner_tiles)
+                       if owner_tiles is not None else None)
         if mapping is None:
             recipe, record = self.select(context)
         else:
@@ -43,6 +59,20 @@ class SteadyMatmul(MappedMatmul):
                 "basis": "declared_source_owner_mapping", "selected": asdict(mapping),
                 "shape": list(context.op.local_shape[-3:]),
             }
+        if owner_tiles is not None:
+            sources = [tuple(tiles) for _, tiles in owner_tiles]
+            explicit = owner_records(owner_tiles)
+        elif group_rows is not None and len(context.op.local_shape) >= 3:
+            sources = [shapes for _, shapes in grouped_owner_rectangles(
+                group_rows, context.op.local_shape[-2], recipe.tile_m,
+                recipe.tile_n, context.core_count)]
+            explicit = owner_records(tuple(
+                (len(shapes), tuple(shapes)) for shapes in sources))
+        else:
+            sources = None
+            explicit = None
+        geometry = matrix_geometry(
+            context, recipe, owners=explicit, group_rows=group_rows)
         record.update({
             "execution_abstraction": "closed_form_k_pipeline",
             "overlap": "finite_K_micro_recurrence; inter_output_tiles_serial_per_owner",
@@ -50,18 +80,18 @@ class SteadyMatmul(MappedMatmul):
             "buffer_model": "finite_selected_tile_reservation",
             "output_tile_execution": ("coupled_owner_run" if self.compact_output_tiles
                                       else "individual_serial_tiles"),
+            "geometry": geometry.to_dict(),
         })
         if context.record_mapping is not None:
             context.record_mapping(record)
         op, names = context.op, context.resource_names
-        total_m, n, k = op.local_shape[-3:]
+        total_m, n, k = geometry.local_shape
         if not total_m:
             return KernelProgram((Stage("setup", latency=context.setup_ms),),
                                  minimum_ms=context.minimum_ms)
         meta, cores = dict(op.metadata), context.core_count
-        groups = int(meta.get("matrix_groups", 1))
-        m = total_m // groups
-        nm, nn = math.ceil(m / recipe.tile_m), math.ceil(n / recipe.tile_n)
+        groups, m = geometry.groups, geometry.m_per_group
+        nm, nn = geometry.nm, geometry.nn
         count, tail = divmod(k, recipe.tile_k)
         epilogue = MatrixEpilogue.from_op(op)
         inputs, weights = epilogue.operands(op)
@@ -83,9 +113,8 @@ class SteadyMatmul(MappedMatmul):
 
         def duration(stage):
             return max((amount / min(stage.caps.get(key, math.inf),
-                        context.rates[key] * (len(stage.placement[key]) / context.resource_units.get(
-                            next(role for role, resource in names.items() if resource == key),
-                            cores) if key in stage.placement else 1))
+                        physical_owner_rate(
+                            context, key, stage.placement.get(key)))
                         for key, amount in stage.work.items()), default=0)
 
         def build(core, index, shape=None):
@@ -148,11 +177,11 @@ class SteadyMatmul(MappedMatmul):
             span = max(duration(steady),
                        cycle.span_ms - duration(load0) - duration(final))
             buffers = tuple(context.allocate(f"tile{index}:{pool}", pool, amount, (core,))
-                            for pool, amount in footprint(context, recipe).items()
+                            for pool, amount in footprint(
+                                context, recipe, geometry=geometry).items()
                             if pool in context.pool_names and amount)
             stages = [
-                Stage("reserve", acquire=buffers),
-                Stage("load", load0.work, after=("reserve",), placement=load0.placement),
+                Stage("load", load0.work, acquire=buffers, placement=load0.placement),
                 Stage("steady", work, after=("load",), placement=placement, coupled=True,
                       caps={key: amount / span for key, amount in work.items()} if span else {}),
                 Stage("matrix", final.work, after=("steady",), placement=final.placement),
@@ -184,8 +213,8 @@ class SteadyMatmul(MappedMatmul):
                 stages.append(Stage("store", transfer("mte3", writes, hbm=writes),
                                     after=(predecessor,),
                                     placement=context.owned(core, cores, ("mte3",))))
-                predecessor = "store"
-            stages.append(Stage("release", after=(predecessor,), free=buffers))
+            if buffers:
+                stages[-1] = replace(stages[-1], free=stages[-1].free + buffers)
             return (Stage("tile", program=KernelProgram(tuple(stages))),)
 
         def owner_run(core, tiles, source_shapes=None):
@@ -214,7 +243,7 @@ class SteadyMatmul(MappedMatmul):
                     for key, value in stage.work.items():
                         work[key] = work.get(key, 0) + multiplicity * value
                     placement.update(stage.placement)
-            load, store = first[1], last[-2]
+            load, store = first[0], last[-1]
             for stage in (load, store):
                 total_span -= duration(stage)
                 for key, value in stage.work.items():
@@ -224,32 +253,142 @@ class SteadyMatmul(MappedMatmul):
             # shares their coupled fluid body, just like the inner K pipeline.
             caps = {key: value / total_span for key, value in work.items()}
             return KernelProgram((
-                first[0],
-                load,
+                Stage("load", load.work, acquire=load.acquire, placement=load.placement),
                 Stage("owner_run", work, after=("load",), placement=placement,
                       coupled=True, caps=caps),
-                Stage("store", store.work, after=("owner_run",), placement=store.placement),
-                Stage("release", after=("store",), free=first[0].acquire),
+                Stage("store", store.work, after=("owner_run",), free=load.acquire,
+                      placement=store.placement),
             ))
 
         owners = []
-        counts = ((groups * nm * nn - 1 - core) // cores + 1
-                  for core in range(min(cores, groups * nm * nn))) if owner_tiles is None else (
-                      count for count, _ in owner_tiles)
-        for core, tiles in enumerate(counts):
-            if not tiles:
-                continue
-            source = None if owner_tiles is None else iter(owner_tiles[core][1])
-            if self.compact_output_tiles and tiles > 1:
-                owners.append(owner_run(core, tiles, source))
-            elif source is None:
-                owners.append(PipelineProgram(tiles, 1, lambda index, core=core: build(core, index, None)))
-            else:
-                seq = tuple(owner_tiles[core][1])
-                owners.append(PipelineProgram(
-                    tiles, 1, lambda index, core=core, seq=seq:
-                    build(core, index, seq[index])))
-        return KernelProgram((
-            Stage("setup", latency=context.setup_ms),
-            Stage("owners", after=("setup",), program=ParallelProgram(tuple(owners))),
-        ), minimum_ms=context.minimum_ms)
+        counts = (tuple(record[0] for record in geometry.owners)
+                  if sources is None else tuple(len(shapes) for shapes in sources))
+        if self.owner_cohorts:
+            from .ownership import unit_group
+            from .program import merge_programs
+            #: Resource name -> owned-unit count, derived from the same
+            #: declaration ``RecipeContext.owned`` consumes.
+            name_units = {}
+            for role, name in context.resource_names.items():
+                name_units[name] = context.resource_units.get(
+                    role, context.core_count)
+
+            def shapes_for(core, tiles):
+                if sources is not None:
+                    return tuple(sources[core])
+                return tuple(
+                    (min(recipe.tile_m,
+                         m - (((index * cores + core) // nn) % nm) * recipe.tile_m),
+                     min(recipe.tile_n,
+                         n - ((index * cores + core) % nn) * recipe.tile_n))
+                    for index in range(tiles))
+
+            def make(core, tiles, shapes):
+                if self.compact_output_tiles and tiles > 1:
+                    return owner_run(core, tiles, iter(shapes))
+                if self.template_execution and tiles == 1:
+                    return build(core, 0, shapes[0])[0].program
+                return PipelineProgram(
+                    tiles, 1, lambda index, core=core, shapes=shapes:
+                    build(core, index, shapes[index]), homogeneous=True)
+
+            def clone_stage(stage, core, reference):
+                placement = {}
+                for name, units in stage.placement.items():
+                    declared = name_units.get(name)
+                    if declared is None:
+                        return None
+                    if reference and unit_group(reference, cores, declared) != units:
+                        return None
+                    placement[name] = unit_group(core, cores, declared)
+                acquire = tuple(replace(item, units=(core,))
+                                if len(item.units) == 1 else item
+                                for item in stage.acquire)
+                free = tuple(replace(item, units=(core,))
+                             if len(item.units) == 1 else item
+                             for item in stage.free)
+                nested = None
+                if stage.program is not None:
+                    nested = clone_program(stage.program, core, reference)
+                    if nested is None:
+                        return None
+                return replace(stage, placement=placement, acquire=acquire,
+                               free=free, program=nested)
+
+            def clone_program(program, core, reference=False):
+                if isinstance(program, KernelProgram):
+                    stages = tuple(clone_stage(stage, core, reference)
+                                   for stage in program.stages)
+                    if any(stage is None for stage in stages):
+                        return None
+                    return replace(program, stages=stages)
+                if isinstance(program, PipelineTemplateProgram):
+                    template = program.template
+                    phases = []
+                    for phase in template.phases:
+                        stages = tuple(clone_stage(stage, core, reference)
+                                       for stage in phase.stages)
+                        if any(stage is None for stage in stages):
+                            return None
+                        phases.append(replace(phase, stages=stages))
+                    return PipelineTemplateProgram(
+                        replace(template, phases=tuple(phases)))
+                return None
+
+            grouped: dict[tuple, list[int]] = {}
+            for core, tiles in enumerate(counts):
+                if not tiles:
+                    continue
+                grouped.setdefault((tiles, shapes_for(core, tiles)),
+                                   []).append(core)
+            for (tiles, shapes), members in grouped.items():
+                if len(members) == 1:
+                    owners.append(make(members[0], tiles, shapes))
+                    continue
+                # One real lowering per symmetric cohort: identical tile count
+                # and per-index shape sequence means identical work, caps and
+                # allocation sizes; only the owned units differ.
+                representative = make(members[0], tiles, shapes)
+                clones = [representative]
+                for core in members[1:]:
+                    clone = clone_program(representative, core)
+                    if clone is None:
+                        break
+                    clones.append(clone)
+                merged = None
+                if len(clones) == len(members):
+                    merged = merge_programs(
+                        clones, scale_coupled_cohort=(tiles > 1))
+                if merged is not None:
+                    owners.append(merged)
+                else:
+                    owners.extend(make(core, tiles, shapes) for core in members)
+        else:
+            for core, tiles in enumerate(counts):
+                if not tiles:
+                    continue
+                source = None if sources is None else iter(sources[core])
+                if self.compact_output_tiles and tiles > 1:
+                    owners.append(owner_run(core, tiles, source))
+                elif source is None:
+                    owners.append(PipelineProgram(
+                        tiles, 1, lambda index, core=core: build(core, index, None),
+                        homogeneous=True))
+                else:
+                    seq = tuple(sources[core])
+                    owners.append(PipelineProgram(
+                        tiles, 1, lambda index, core=core, seq=seq:
+                        build(core, index, seq[index]), homogeneous=True))
+            if self.template_execution:
+                owners = [
+                    PipelineTemplateProgram(pipe.template(
+                        owner=owner, panels_per_output=1))
+                    if isinstance(pipe, PipelineProgram) and pipe.count == 1 else pipe
+                    for owner, pipe in enumerate(owners)]
+        stages = (
+            (Stage("setup", latency=context.setup_ms),
+             Stage("owners", after=("setup",), program=ParallelProgram(tuple(owners))))
+            if context.setup_ms
+            else (Stage("owners", program=ParallelProgram(tuple(owners))),)
+        )
+        return KernelProgram(stages, minimum_ms=context.minimum_ms)

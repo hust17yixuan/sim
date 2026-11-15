@@ -7,6 +7,7 @@
 [Side-Effect Policy] Returns immutable operators and local recipe mappings.
 """
 from mindie_sim.schema.common import ModelingError
+from .kda_source import view_state_declaration
 from .mechanism import PlannedRecipe
 from .operators import kda_recurrent
 
@@ -27,13 +28,23 @@ def validate(*, key_heads, value_heads, key_width, value_width, model):
 
 
 def bind_decode_scans(scans, *, lengths, heads, key_heads, dk, dv, dtype,
-                      state_dtype, requests, deps, **flags):
+                      state_dtype, requests, deps, views=None,
+                      state_values=None, state_slots=None, state_ready=(),
+                      state_grants=(), state_decisions=(),
+                      state_generation=None, **flags):
     scans = tuple(scans)
     if not scans:
         raise ModelingError("recurrent_kda_decode_scans_missing")
+    if views is not None:
+        contexts, acceptance = view_state_declaration(views)
+        flags.setdefault("state_contexts", contexts)
+        flags.setdefault("state_acceptance", acceptance)
     first = scans[0]
     return kda_recurrent.make_op({
         "lengths": tuple(lengths), "heads": heads, "key_heads": key_heads,
         "dk": dk, "dv": dv, "dtype": dtype, "state_dtype": state_dtype, **flags,
     }, op_id=first.op_id, deps=deps, requests=requests, stage=first.stage,
-        layer=first.layer, phase=first.phase, stream=first.stream, notes=first.notes)
+        layer=first.layer, phase=first.phase, stream=first.stream,
+        notes=first.notes, state_values=state_values, state_slots=state_slots,
+        state_ready=state_ready, state_grants=state_grants,
+        state_decisions=state_decisions, state_generation=state_generation)

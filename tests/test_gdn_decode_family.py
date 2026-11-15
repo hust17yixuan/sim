@@ -9,13 +9,36 @@ from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.gdn_decode_programs import CONV, GATING, update_geometry
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.program import RecipeBook
+from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.operators import IterationWork
 from mindie_sim.schema.workload import IterationPlan, RequestView
-from test_operator_mechanisms import recurrent_case
+
+
+def _recurrent_case():
+    parsed = parse_case({
+        "machine": {
+            "name": "declared-gpu", "architecture": "cuda", "num_devices": 1,
+            "device": {"memory_bytes": 1024 ** 3, "compute_peaks": {"bf16": 1e9, "fp32": 1e9},
+                       "rates": {"memory": 1e9, "vector": 1e9}, "compute_units": 4},
+            "links": [{"name": "fabric", "capacity_bytes_per_ms": 1000,
+                       "members": [0], "semantics": "shared"}],
+        },
+        "model": {
+            "name": "geometry", "layers": 2, "hidden_size": 32, "num_heads": 4,
+            "num_kv_heads": 2, "head_dim": 8, "intermediate_size": 64, "vocab_size": 128,
+        },
+        "workload": {"requests": [{"id": "r", "prompt_tokens": 4, "output_tokens": 3}]},
+        "runtime": {"dp": 1, "tp": 1, "pp": 1, "ep": 1, "max_num_batched_tokens": 16},
+    })
+    layer = replace(parsed.model.layer_plans[0], attention="gdn", linear_key_heads=1,
+                    linear_value_heads=2, linear_heads=2, linear_key_head_dim=3,
+                    linear_head_dim=2, conv_kernel=3, recurrent_state_dtype="fp32")
+    return replace(parsed, model=replace(parsed.model, layers=1, layer_plans=(layer,)),
+                   runtime=replace(parsed.runtime, pp_layer_partition=(1,)))
 
 
 def source_case(lengths=(4,) * 4, *, keys=4, heads=12, units=64, queue=False):
-    parsed = recurrent_case()
+    parsed = _recurrent_case()
     layer = replace(parsed.model.layer_plans[0], linear_key_heads=keys,
                     linear_value_heads=heads, linear_heads=heads,
                     linear_key_head_dim=128, linear_head_dim=128, conv_kernel=4)

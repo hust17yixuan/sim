@@ -47,7 +47,7 @@ class _Op:
         self.operator = _Operator(_Theta({"weight_format": "int8", "tp": 1}))
         self.family = "gemm"
         self.name = "proj"
-        self.kind = "F3"
+        self.kind = "routed_experts"
 
 
 class _Geometry:
@@ -160,12 +160,25 @@ def test_missing_invocation_classes_use_declared_minima_not_ratios():
     ratio_empty = ARCH3510_VECTOR_MIN_MS * 0.35
     assert ARCH3510_W8A8_ND_BF16_MIN_MS != pytest.approx(ratio_quant)
     assert ARCH3510_EMPTY_AIC_MIN_MS != pytest.approx(ratio_empty)
-    expected = (
-        Fraction(1)
+    # A 1 ms cube body is already above the declared cube invocation floor.
+    # This operator's work is cube-only, so an undeclared w8a8 class and a
+    # 1.5x vector multiple are not added.  The old expected sum
+    # 1 + w8a8 + 1.5*vector had no source in the invocation table.
+    declared_cube = as_fraction(dict(supply.invocations)["cube"])
+    assert stage_times[-1] == Fraction(1)
+    assert declared_cube == as_fraction(ARCH3510_CUBE_MIN_MS)
+    tiny = [Fraction(1, 1_000_000)]
+    apply_hardware_service(
+        _Op(supply), _Geometry(), {}, [{"cube": Fraction(1)}], tiny,
+        {"cube": Fraction(1)}, {"cube": Fraction(1)}, {"cube": Fraction(1)},
+    )
+    # A body below the declared cube floor completes at that floor alone.
+    assert tiny[-1] == declared_cube
+    assert tiny[-1] != (
+        declared_cube
         + as_fraction(ARCH3510_W8A8_ND_BF16_MIN_MS)
         + as_fraction(ARCH3510_VECTOR_MIN_MS) * Fraction(3, 2)
     )
-    assert stage_times[-1] == expected
 
 
 def test_undeclared_mte2_does_not_invent_an_arch3510_rate():
@@ -219,7 +232,7 @@ def test_single_branch_engine_equivalence_with_hardware_service():
     features = FeatureConfig.from_model(model, ep=4, dp=4, multistream_attention_indexer=True)
     instantiated = instantiate_model(model, features)
     compiler = OperatorPiecewiseCompiler(supply, ImplementationPolicy())
-    f0_or_f4 = instantiated.find("F4", layer=0, role="shared_ffn")
+    f0_or_f4 = instantiated.find("shared_experts", layer=0, role="shared_ffn")
     op = compiler.compile(f0_or_f4).operator("shared_gate_up")
     geom = WorkloadGeometry.homogeneous(4, 1, 16, cohort_batch=16)
     cost = op.evaluate(geom)
@@ -228,8 +241,8 @@ def test_single_branch_engine_equivalence_with_hardware_service():
 
     # Indexed A1 ordering and causal selection readiness
     kinds = [s.kind for s in instantiated.layers[0].subgraphs]
-    assert kinds.index("I0") < kinds.index("I1") < kinds.index("A1")
-    a1_comp = compiler.compile(instantiated.find("A1", layer=0, role="attention"))
+    assert kinds.index("indexer_prolog") < kinds.index("lightning_indexer") < kinds.index("dsa_attention")
+    a1_comp = compiler.compile(instantiated.find("dsa_attention", layer=0, role="attention"))
     with pytest.raises(ModelingError, match="state_port_not_ready"):
         a1_comp.evaluate(geom, StateView())
 
@@ -237,13 +250,13 @@ def test_single_branch_engine_equivalence_with_hardware_service():
     pipe = assemble_model(model, supply=supply, features=features)
     pred = pipe.forward(geom)
     assert pred.active.cohort_batch == 16
-    f3_direct = compiler.compile(instantiated.find("F3", layer=0)).evaluate(geom)
-    f3_forward = next(sg for sg in pred.layers[0].subgraphs if sg.kind == "F3")
+    f3_direct = compiler.compile(instantiated.find("routed_experts", layer=0)).evaluate(geom)
+    f3_forward = next(sg for sg in pred.layers[0].subgraphs if sg.kind == "routed_experts")
     assert f3_forward.rows[0].cost.get("moe_rows") == f3_direct.operators[0].get("moe_rows") == 8
 
     # Ragged cohort expansion preserves ragged distribution and rejects invalid contraction
     ragged = WorkloadGeometry((RequestGeometry(1, 15), RequestGeometry(3, 13)), cohort_batch=4)
-    expanded = ragged.for_subgraph("F3")
+    expanded = ragged.for_subgraph("routed_experts")
     assert [r.q_len for r in expanded.requests] == [1, 3, 1, 3]
     with pytest.raises(ModelingError, match="workload_ragged_cohort_expansion_ambiguous"):
         ragged.expanded_to(3)

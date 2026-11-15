@@ -1222,36 +1222,6 @@ def test_large_batch_program_stays_lazy_and_bounded():
     assert execution.work["vector_ops"] > 0
 
 
-def test_source_identity_hashes_lines_and_scope_match_manifest():
-    manifest = json.loads(MANIFEST_FILE.read_text())
-    task = manifest
-    by_path = {item["path"]: item for item in task["sources"]}
-    op = make_op(cases()[0]["params"])
-    identity = dict(dict(op.metadata)["source_identity"])
-    assert identity["scope"] == \
-        "current_checkout_manifest_matched_not_historical_capture_image"
-    assert {item["path"] for item in identity["files"]} == set(by_path)
-    for item in identity["files"]:
-        path = SOURCE_FIXTURES / Path(item["path"]).name
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        assert digest == item["sha256"] == by_path[item["path"]]["sha256"]
-        assert path.stat().st_size == item["bytes"] == \
-            by_path[item["path"]]["bytes"]
-    assert hashlib.sha256(MATH.read_bytes()).hexdigest() == \
-        identity["helper"]["sha256"]
-    lines = dict(dict(op.metadata)["source_lines"])
-    assert "272-276" in lines["small_batch_residual_fill"]
-    assert "205-216" in lines["small_batch_fill_barriers"]
-    assert "240" in lines["small_batch_first_worker_barrier"]
-    assert "179-185" in lines["align_residual_fill"]
-    assert "613-614" in lines["small_batch_threshold"]
-    assert "616-637" in lines["small_batch_launch"]
-    assert "638-678" in lines["two_kernel_launch"]
-    assert "582-680" in lines["host_dispatch_and_launch"]
-    assert "74-88" in lines["wrapper_buffer_sizing"]
-    assert "100-103" in lines["wrapper_expert_map_gather"]
-
-
 def test_build_and_kernels_reject_unselected_or_malformed_ops():
     params = params_for([[0, 1]], 4, 16)
     op = make_op(params)

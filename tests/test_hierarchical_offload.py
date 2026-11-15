@@ -210,14 +210,15 @@ def test_mtp_ffn_hit_rate_monotonically_reduces_expert_transfer() -> None:
 
 
 def test_kv_offload_prefetch_versions_are_monotone() -> None:
-    case = _case()
+    case = _case(tp=2, dp=1, ep=2)
     reports = {}
     for version in ("v1", "v2", "v3", "v4"):
         reports[version] = analyze_kv_cache_offload(
             case,
             OffloadPolicy(kvc_ddr_ratio=0.5, kvc_ssd_ratio=0.1,
+                          ddr_bw_gbps=10.0, ssd_bw_gbps=0.5,
                           kvc_prefetch_version=version),
-            context=32768, sequences=32,
+            context=4096, sequences=4,
         )
 
     for version, report in reports.items():
@@ -247,13 +248,14 @@ def test_kv_offload_prefetch_versions_are_monotone() -> None:
 
 
 def test_kv_offload_mtp_hit_rate_monotonically_reduces_transfer() -> None:
-    case = _case()
+    case = _case(tp=2, dp=1, ep=2)
     reports = [
         analyze_kv_cache_offload(
             case,
             OffloadPolicy(kvc_ddr_ratio=0.5, kvc_ssd_ratio=0.1,
+                          ddr_bw_gbps=10.0, ssd_bw_gbps=0.5,
                           kvc_prefetch_version="v3", mtp_kvc_hit_rate=hit),
-            context=32768, sequences=32,
+            context=4096, sequences=4,
         )
         for hit in (0.0, 0.5, 1.0)
     ]
@@ -348,10 +350,10 @@ def test_predict_schedules_offload_transfers_and_active_expert_sampling() -> Non
 
     assert _expected_active_experts(8, 1, 8) == pytest.approx(8.0)
 
-    base = _case(prompt_tokens=16, output_tokens=2)
+    base = _case(layers=1, tp=2, dp=1, ep=2, prompt_tokens=16, output_tokens=2)
     base_report = predict(base)
 
-    with_offload = _case(prompt_tokens=16, output_tokens=2)
+    with_offload = _case(layers=1, tp=2, dp=1, ep=2, prompt_tokens=16, output_tokens=2)
     with_offload["runtime"]["metadata"]["offload"] = {
         "kvc_ddr_ratio": 0.5,
         "kvc_ssd_ratio": 0.25,
@@ -368,7 +370,7 @@ def test_predict_kv_prefetch_v1_through_v4_ordering_and_startup_latency() -> Non
 
     latencies = {}
     for ver in ("v1", "v2", "v3", "v4"):
-        c = _case(prompt_tokens=16, output_tokens=2)
+        c = _case(layers=1, tp=2, dp=1, ep=2, prompt_tokens=16, output_tokens=2)
         c["runtime"]["metadata"]["offload"] = {
             "kvc_ddr_ratio": 0.5,
             "kvc_prefetch_version": ver,
@@ -378,7 +380,7 @@ def test_predict_kv_prefetch_v1_through_v4_ordering_and_startup_latency() -> Non
         latencies[ver] = predict(c)["metrics"]["e2e_ms"]["mean"]
     assert latencies["v1"] >= latencies["v2"] >= latencies["v3"] >= latencies["v4"]
 
-    high_lat = _case(prompt_tokens=16, output_tokens=2)
+    high_lat = _case(layers=1, tp=2, dp=1, ep=2, prompt_tokens=16, output_tokens=2)
     high_lat["runtime"]["metadata"]["offload"] = {
         "kvc_ddr_ratio": 0.5,
         "kvc_prefetch_version": "v1",
@@ -387,8 +389,8 @@ def test_predict_kv_prefetch_v1_through_v4_ordering_and_startup_latency() -> Non
     }
     assert predict(high_lat)["metrics"]["e2e_ms"]["mean"] > latencies["v1"]
 
-    p_pool = _case(prompt_tokens=16, output_tokens=2)
-    d_pool = _case(prompt_tokens=16, output_tokens=2)
+    p_pool = _case(layers=1, tp=2, dp=1, ep=2, prompt_tokens=16, output_tokens=2)
+    d_pool = _case(layers=1, tp=2, dp=1, ep=2, prompt_tokens=16, output_tokens=2)
     pd_raw = {
         "model": p_pool["model"],
         "workload": p_pool["workload"],

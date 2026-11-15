@@ -111,8 +111,9 @@ def test_two_physical_owners_keep_merge_buffers_and_serialize_same_owner_sequenc
                          input_ready_ms=7, trace_limit=10000)
     trace = result['events']
     release = [x for x in trace if x['task'].endswith(':release')]
-    merge_writes = [x for x in trace if ':merge:' in x['task'] and x['task'].endswith(':write')]
-    assert len(release) == 1 and len(merge_writes) == 5
+    merge_writes = [x for x in trace if ':merge:' in x['task']
+                    and (x['task'].endswith(':write') or ':write:' in x['task'])]
+    assert len(release) == 1 and len({x['task'].split(':write')[0] for x in merge_writes}) == 5
     assert min(x['start_ms'] for x in release) >= max(x['end_ms'] for x in merge_writes)
     assert result['execution']['live_tasks'] == result['execution']['live_programs'] == 0
     assert not any(result['execution']['live_allocated'].values())

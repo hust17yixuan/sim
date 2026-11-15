@@ -9,9 +9,44 @@
 from mindie_sim.schema.common import ModelingError
 from .mxfp8_swiglu import PROFILE, RECIPE, ROLE, SOURCE
 
+CAPABILITIES = frozenset({
+    "A5", "decode", "mxfp8", "mx32", "e4m3", "grouped_gate_up",
+    "fused_swiglu_quant", "cgmct_source_program", "complete_region_only",
+})
+
+
+def capabilities():
+    """Machine-readable fused-region boundary and typed attributes."""
+    return {
+        "selector": "native_fusion",
+        "program_profile": PROFILE,
+        "recipe": RECIPE,
+        "role": ROLE,
+        "tensor_view_dtypes": {
+            "input": "fp8_e4m3", "weight": "fp8_e4m3",
+            "output": "fp8_e4m3", "input_scale": "fp8_e8m0",
+            "output_scale": "fp8_e8m0",
+        },
+        "scale_group_size": 32,
+        "members": ("matmul", "swiglu", "quantize"),
+        "options": ("l1_k", "compact"),
+        "requires": (
+            "exact_role", "complete_three_member_integer_grouped_chain",
+            "no_external_intermediate", "explicit_l1_k_multiple_of_128",
+            "expert_weight_scale_group32", "no_bias_or_epilogue",
+        ),
+        "source": SOURCE,
+    }
+
 
 def bind(declaration, members, outputs, selection, options):
-    view=declaration['tensor_view']
+    view = declaration.get('tensor_view')
+    if not isinstance(view, dict):
+        raise ModelingError('mxfp8_swiglu_requires_declared_tensor_view')
+    for key in ('intermediate_width', 'input_width', 'local_experts'):
+        if type(view.get(key)) is not int or view[key] < 1:
+            raise ModelingError('mxfp8_swiglu_requires_positive_' + key)
+
     if (declaration['role'] != ROLE or
             any(view.get(key) != 'fp8_e4m3' for key in ('input_dtype','weight_dtype','output_dtype'))
             or any(view.get(key) != 'fp8_e8m0' for key in ('input_scale_dtype','output_scale_dtype'))
@@ -26,6 +61,8 @@ def bind(declaration, members, outputs, selection, options):
     md=dict(matrix.metadata)
     rows=tuple(md.get('matrix_group_rows',()))
     width,k=view['intermediate_width'],view['input_width']
+    if width % 64 or k % 64:
+        raise ModelingError('mxfp8_swiglu_requires_N64_K64_geometry')
     if (not rows or sum(rows) != matrix.local_shape[-3] or len(rows) != view['local_experts']
             or matrix.local_shape[-2:] != (2*width,k)
             or md.get('weight_representation') != 'fp8_block1x32_fp8_e8m0'
@@ -35,6 +72,14 @@ def bind(declaration, members, outputs, selection, options):
         raise ModelingError('mxfp8_swiglu_requires_complete_integer_grouped_chain_no_external_intermediate')
     if set(options)-{'l1_k','compact'} or type(options.get('l1_k')) is not int:
         raise ModelingError('mxfp8_swiglu_requires_explicit_l1_k')
+    if options['l1_k'] < 128 or options['l1_k'] % 128:
+        raise ModelingError('mxfp8_swiglu_requires_explicit_l1_k_multiple_of_128')
+    if 'compact' in options and type(options['compact']) is not bool:
+        raise ModelingError('mxfp8_swiglu_compact_must_be_boolean')
+    if (activation.dtype != 'bf16' or quant.dtype != 'bf16'
+            or activation.local_shape != (sum(rows), width)
+            or quant.local_shape != (sum(rows), width)):
+        raise ModelingError('mxfp8_swiglu_requires_bf16_swiglu_input_and_mx_output_rows')
     config={'rows':rows,'width':width,'k':k,**options}
     return {
         'fusion_group_key':declaration['key'],
@@ -55,3 +100,6 @@ def bind(declaration, members, outputs, selection, options):
         **{key:value for key,value in members[-1].metadata
            if key in {'structure_block','structure_role','graph_captured','graph_segment'}},
     }
+
+
+__all__ = ["CAPABILITIES", "bind", "capabilities"]

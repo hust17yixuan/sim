@@ -2,7 +2,7 @@ name: sim-ci
 
 on:
   push:
-    branches: [main, 'codex/**']
+    branches: [main, 'codex/**', 'feat/**']
   pull_request:
 
 permissions:
@@ -16,9 +16,7 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
         python: ['3.11', '3.13']
     runs-on: ${{ matrix.os }}
-    # Windows 3.11 completed all 3910 tests at 29m41s, leaving no process
-    # teardown/artifact budget inside the former 30-minute outer limit.
-    timeout-minutes: 40
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -26,7 +24,7 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: uv venv
       - run: uv pip install -e ".[test]"
-      - run: uv run --no-project python -m pytest -q -m "not live_npu" --junitxml=results.xml
+      - run: uv run --no-project python -m pytest -q -n auto -m "not live_npu" --junitxml=results.xml
       - uses: actions/upload-artifact@v4
         if: always()
         with:

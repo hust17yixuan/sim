@@ -8,6 +8,7 @@
 [Side-Effect Policy] Appends operators; never reads captures or fits timings.
 """
 import math
+from dataclasses import replace
 
 from mindie_sim.catalog.cache import index_row_bytes
 from mindie_sim.catalog.index_pool import PoolSelection, pool_selection
@@ -76,7 +77,183 @@ def _causal_token_pairs(views):
     return total
 
 
-def producer(b, *, source, views, plan, model, quant, padded_tokens):
+def _ring_span(start, rows, pool):
+    """Contiguous/wrapped slot intervals actually touched by a tail write."""
+    if rows <= 0:
+        return ()
+    if rows >= pool:
+        return ((0, int(pool)),)
+    start = int(start) % int(pool)
+    stop = start + int(rows)
+    if stop <= pool:
+        return ((start, stop),)
+    return ((start, int(pool)), (0, stop - int(pool)))
+
+
+def _union_ring_spans(pieces, pool):
+    """Union of physical ring intervals from every query range of one request."""
+    pool = int(pool)
+    intervals = []
+    for start, end in pieces:
+        start, end = max(0, int(start)), min(pool, int(end))
+        if end > start:
+            intervals.append((start, end))
+    if not intervals:
+        return ()
+    intervals.sort()
+    merged = [list(intervals[0])]
+    for start, end in intervals[1:]:
+        if start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return tuple((start, end) for start, end in merged)
+
+
+def _lookup(mapping, request, index):
+    if mapping is None:
+        return None
+    if isinstance(mapping, dict):
+        value = mapping.get(str(request))
+        return mapping.get(request) if value is None else value
+    values = tuple(mapping)
+    return values[index] if index < len(values) else None
+
+
+def _tail_state_accesses(views, geometry, plan, width, tail, versions=None,
+                         *, tail_op=None, owners=None, occurrences=None,
+                         grants=None, readers=None, last_uses=None,
+                         storage_prefix=None):
+    """Per-request state access from the actual typed K/gate tail output.
+
+    ``tail_op`` is the real ``index_pool_tail_store`` occurrence.  Its typed
+    ``(retained, 2, width)`` output fixes the physical row count and width; the
+    per-request ring interval is the union over *all* ``query_ranges`` physical
+    write slots, including wrap and disjoint ranges.  Persistent storage is
+    derived from the stable builder prefix, not from this call's occurrence;
+    the occurrence/version/grant identifies the materialization.
+    """
+    pool = int(plan.index_kpool)
+    tail_id = str(getattr(tail_op, "op_id", tail))
+    typed_rows = typed_width = None
+    state_owner = storage_prefix
+    if tail_op is not None:
+        shape = tuple(getattr(tail_op, "local_shape", ()) or ())
+        if len(shape) == 3:
+            typed_rows, planes, typed_width = int(shape[0]), int(shape[1]), int(shape[2])
+            if planes != 2:
+                raise ModelingError("index_pool_tail_typed_planes_invalid")
+        meta = dict(getattr(tail_op, "metadata", ()) or ())
+        state_owner = (str(meta.get("state_owner") or "")
+                       or storage_prefix or "index_pool_tail")
+    if typed_width is not None:
+        width = int(typed_width)
+    accesses = []
+    for index, (view, g) in enumerate(zip(views, geometry)):
+        rows = min(int(g.retained_tail_rows), pool)
+        if rows <= 0:
+            continue
+        if typed_rows is not None and rows > typed_rows:
+            raise ModelingError("index_pool_tail_typed_rows_smaller_than_retained")
+        ranges = tuple(getattr(view, "query_ranges", ()) or ())
+        if not ranges:
+            ranges = ((0, int(view.q_len)),)
+        if rows >= pool:
+            # A full-ring overwrite touches every physical slot regardless of
+            # how the logical query ranges are partitioned.
+            span = ((0, int(pool)),)
+        else:
+            pieces = []
+            remaining = rows
+            for start, end in ranges:
+                if remaining <= 0:
+                    break
+                take = min(max(0, int(end) - int(start)), remaining)
+                if not take:
+                    continue
+                ring_start = (int(view.context) + int(start)) % pool
+                pieces.extend(_ring_span(ring_start, take, pool))
+                remaining -= take
+            if remaining:
+                # The retained ring can be longer than the declared query
+                # ranges only when it already wraps the whole pool.
+                last = int(ranges[-1][1])
+                pieces.extend(_ring_span((int(view.context) + last) % pool,
+                                         remaining, pool))
+            span = _union_ring_spans(pieces, pool)
+        version = _lookup(versions, view.request_id, index)
+        if version is None:
+            version = getattr(view, "state_version", None)
+        if version is None:
+            version = getattr(view, "generation", None)
+        version = None if version is None else int(version)
+        owner = _lookup(owners, view.request_id, index)
+        if owner is None:
+            owner = getattr(view, "rank", None)
+        if owner is None:
+            owner = getattr(view, "owner", None)
+        if owner is None:
+            owner = getattr(view, "physical_rank", None)
+        owner = None if owner is None else int(owner)
+        storage = f"index_pool_tail:{state_owner}:{view.request_id}"
+        grant = _lookup(grants, view.request_id, index)
+        if grant is None:
+            grant = storage
+        occurrence_token = _lookup(occurrences, view.request_id, index)
+        if occurrence_token is None:
+            if version is not None:
+                token = f"v{version}"
+            else:
+                token = "s" + "_".join(f"{start}-{end}" for start, end in span)
+            occurrence = f"{tail_id}:{view.request_id}:{token}"
+        else:
+            occurrence = f"{tail_id}:{occurrence_token}"
+        reader = _lookup(readers, view.request_id, index) or ""
+        last_use = _lookup(last_uses, view.request_id, index) or ""
+        accesses.append({
+            "occurrence": occurrence, "producer": tail_id,
+            "request": str(view.request_id),
+            "stage": 0, "layer": 0,
+            "direction": "write", "position": "tail",
+            "output": "index_pool_tail",
+            "storage": storage,
+            "state_version": version,
+            "span": span,
+            "rank": owner,
+            "scope": "target",
+            "bytes": float(rows * width * 8),
+            "source": tail_id,
+            "reader": reader,
+            "grant": str(grant),
+            "last_use": last_use,
+        })
+    return accesses
+
+
+def state_accesses(op):
+    """The actual per-request tail writes bound by one producer occurrence.
+
+    This is the same tuple already attached as ``metadata['state_accesses']``;
+    T04/T08 and SERVICE-CORE can consume it without rebuilding request rows
+    from a total retained count.
+    """
+    return tuple(dict(getattr(op, "metadata", ()) or ()).get("state_accesses", ()))
+
+
+def packed_parent(op):
+    """The real packed index-store K/scale/tail outputs bound by one producer.
+
+    T12/native ScatterPaCache consumes this contract instead of assuming that a
+    scale exists, that it lives inside the cache row, or that an FP32 tail is
+    part of the packed parent allocation.  A missing scale is explicit.
+    """
+    meta = dict(getattr(op, "metadata", ()) or ())
+    return meta.get("packed_parent")
+
+
+def producer(b, *, source, views, plan, model, quant, padded_tokens,
+             state_versions=None, state_owners=None, state_occurrences=None,
+             state_grants=None, state_readers=None, state_last_uses=None):
     """Complete pools before overwriting the bounded request-owned tail ring."""
     if (not plan.index_kpool_compress or plan.index_kpool <= 1
             or plan.index_input != "hidden" or plan.compress_ratio or plan.qk_rope_head_dim):
@@ -130,11 +307,109 @@ def producer(b, *, source, views, plan, model, quant, padded_tokens):
         read=retained * width * 8, write=retained * width * 8,
         family="cache_store", dtype="fp32", metadata=common + (
             ("retained_rows", retained), ("cache_kind", "index_pool_tail"),
+            ("index_width", width), ("write_bytes", retained * width * 8),
+            ("state_owner", b.prefix),
+            ("producer_output", "index_pool_tail"),
+            ("state_storage", "index_pool_tail:" + b.prefix),
+            ("state_span", ((0, retained),)),
             ("cache_visible", True), ("scope", "contiguous_forward; speculative_rollback_not_reconstructed")))
+    # Per-request tail ring facts from the actual views/pool geometry.  The
+    # aggregate retained count alone loses multiplicity; SERVICE-CORE can
+    # consume this ordered set directly without rebuilding a token total.
+    tail_accesses = _tail_state_accesses(
+        views, geometry, plan, width, tail, versions=state_versions,
+        tail_op=b.ops[-1], owners=state_owners,
+        occurrences=state_occurrences, grants=state_grants,
+        readers=state_readers, last_uses=state_last_uses,
+        storage_prefix="index_pool_tail:" + b.prefix)
+    for item in tail_accesses:
+        item["stage"] = int(b.common["stage"])
+        item["layer"] = int(b.common["layer"])
+    b.ops[-1] = replace(
+        b.ops[-1],
+        metadata=tuple(sorted({
+            **dict(b.ops[-1].metadata),
+            "state_accesses": tuple(tail_accesses),
+            "state_access_total_bytes": float(sum(
+                item["bytes"] for item in tail_accesses)),
+            "state_access_count": len(tail_accesses),
+        }.items())))
     values = index_representation(b, "index_key", pooled, completed, width,
                                   quant=quant, model=model, rotate_basis=False)
     stored = b.store("index_store", (values, tail), completed,
                      index_row_bytes(model, width), quant.index_dtype)
+    # Real packed-parent K/scale truth for T12/native ScatterPaCache.  The
+    # scale is a side output of the actual quantize occurrence, not a copy
+    # inferred from the cache row; the FP32 tail remains a separate output.
+    value_op = next((op for op in b.ops if op.op_id == values), None)
+    value_meta = dict(value_op.metadata) if value_op is not None else {}
+    scale_count = int(value_meta.get("scale_count", 0) or 0)
+    packed_elements = int(value_meta.get("packed_elements", 1) or 1)
+    scale_present = scale_count > 0
+    value_dtype = str(value_meta.get("output_format") or quant.index_dtype)
+    scale_dtype = str(value_meta.get("scale_format") or "none")
+    physical_row_bytes = int(value_meta.get(
+        "physical_row_bytes", index_row_bytes(model, width)))
+    scale_row_bytes = (int(scale_count * dtype_bytes(scale_dtype))
+                       if scale_present and scale_dtype not in {"", "none"}
+                       else 0)
+    data_row_bytes = int(max(0, physical_row_bytes - scale_row_bytes))
+    materialized = (packed_elements != 1 or scale_present
+                    or value_dtype != str(model.activation_dtype))
+    packed_parent = {
+        "parent_occurrence": stored,
+        "value": {
+            "producer": values, "output": "index_k",
+            "dtype": value_dtype, "packed_elements": packed_elements,
+            "physical_row_bytes": physical_row_bytes,
+            "data_row_bytes": data_row_bytes,
+            "presence": True,
+            "materialization": ("packed_cache_row" if materialized
+                                else "logical_value"),
+        },
+        "scale": {
+            "producer": values if scale_present else None,
+            "output": "index_scales" if scale_present else None,
+            "dtype": scale_dtype,
+            "shape": tuple(value_meta.get("native_scale_shape")
+                           or value_meta.get("scale_shape") or ()),
+            "count": scale_count,
+            "row_bytes": scale_row_bytes,
+            "row_offset": data_row_bytes,
+            "presence": scale_present,
+            "materialization": ("native_scatter_scale_slot" if scale_present
+                                else "absent"),
+        },
+        "row_materialization": ("packed_k_plus_scale_suffix"
+                                if scale_present and scale_row_bytes
+                                else "k_only"),
+        "tail": {
+            "producer": tail, "dtype": "fp32",
+            "shape": (int(retained), 2, int(width)),
+            "presence": bool(retained),
+            "materialization": "separate_fp32_tail",
+        },
+        "presence": {"value": True, "scale": scale_present,
+                     "tail": bool(retained)},
+        "alias": {"value": values, "tail": tail,
+                  "scale": values if scale_present else None},
+        "native_scatter": {
+            "parent": stored,
+            "value": values,
+            "scale": values if scale_present else None,
+            "tail": tail,
+            "child_contract": (
+                "two ScatterPaCache children (packed K + scale) when the scale "
+                "is present; one packed K write otherwise; FP32 tail is a "
+                "separate state producer"),
+        },
+    }
+    b.ops[-1] = replace(
+        b.ops[-1],
+        metadata=tuple(sorted({
+            **dict(b.ops[-1].metadata),
+            "packed_parent": packed_parent,
+        }.items())))
     members = tuple(op.op_id for op in b.ops[start:])
     declare_group(
         b.ops, key=b.prefix + ".key_pool", role="key_pool", family="pooled_indexer",

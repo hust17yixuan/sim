@@ -29,9 +29,16 @@ class QueuedStore:
     issue_placement: tuple[int, ...] = ()
 
     def start(self, engine, name, ready, *, owner=""):
-        if self.outstanding < 1 or self.granule_bytes < 1:
+        outstanding = int(self.outstanding)
+        granule = int(self.granule_bytes)
+        rows = int(self.rows)
+        cols = int(self.cols)
+        offset = int(self.offset_bytes)
+        row_stride = int(self.row_stride_bytes)
+        elem_bytes = int(self.element_bytes)
+        if outstanding < 1 or granule < 1:
             raise ValueError("transaction_queue_requires_positive_capacity_and_granule")
-        count = self.rows * self.cols
+        count = rows * cols
         if not count:
             return engine.submit(name + ":empty", after=(ready,), owner=owner)
         complete = engine.future(name + ":queue_complete")
@@ -44,10 +51,10 @@ class QueuedStore:
             index = issued
             issued += 1
             pending += 1
-            row, col = divmod(index, self.cols)
-            address = self.offset_bytes + row * self.row_stride_bytes + col * self.element_bytes
-            keys = tuple(range(address // self.granule_bytes,
-                               (address + self.element_bytes - 1) // self.granule_bytes + 1))
+            row, col = divmod(index, cols)
+            address = offset + row * row_stride + col * elem_bytes
+            keys = tuple(range(address // granule,
+                               (address + elem_bytes - 1) // granule + 1))
             submitted = engine.submit(
                 f"{name}:request{index}:issue", {self.issue_resource: self.participants},
                 after=(issue_tail,), caps={self.issue_resource: self.issue_rate * self.participants},
@@ -55,7 +62,7 @@ class QueuedStore:
                 owner=owner,
             )
             issue_tail = submitted
-            if col == self.cols - 1 and self.row_control_ms:
+            if col == cols - 1 and self.row_control_ms:
                 issue_tail = engine.submit(f"{name}:row{row}:control", after=(submitted,),
                                            latency=self.row_control_ms, owner=owner)
             dependencies = (submitted,) + tuple(last_by_granule[key] for key in keys
@@ -75,12 +82,12 @@ class QueuedStore:
 
             response = engine.submit(
                 f"{name}:request{index}:response",
-                {self.memory_resource: self.element_bytes * self.participants},
+                {self.memory_resource: elem_bytes * self.participants},
                 after=dependencies, latency=self.response_ms, on_complete=retire, owner=owner,
             )
             for key in keys:
                 last_by_granule[key] = response
 
-        for _ in range(min(self.outstanding, count)):
+        for _ in range(min(outstanding, count)):
             issue()
         return complete

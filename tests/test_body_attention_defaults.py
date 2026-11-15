@@ -23,7 +23,9 @@ def test_gqa_body_default_executes_private_pipes_and_preserves_explicit_envelope
     prior = predict(explicit, scope="body", tokens=4, context=128, sequences=2)
     assert all(row["program"] == "ResourceEnvelope" for row in prior["timeline"]
                if row["family"] == "attention")
-    assert prior["execution"]["work"] == report["execution"]["work"]
+    for key in ("flops", "hbm_bytes", "link_bytes"):
+        assert prior["execution"]["work"][key] == report["execution"]["work"][key]
+    assert report["execution"]["work"]["vector_ops"] >= prior["execution"]["work"]["vector_ops"]
     explicit["runtime"]["kernels"]["recipes"] = {
         "flash_attention_decode": {"kind": "staged_gqa_decode", "kv_splits": 2}}
     split = predict(explicit, scope="body", tokens=4, context=128, sequences=2)
@@ -73,7 +75,9 @@ def test_wide_head_defaults_fit_resident_and_overlapping_tile_buffers(dtype, sku
     assert report["body_forward_ms"] > 0
     raw["runtime"]["kernels"] = {"recipes": {"flash_attention": {"kind": "envelope"}}}
     control = predict(raw, scope="body", tokens=4, context=256, sequences=2)
-    assert control["execution"]["work"] == report["execution"]["work"]
+    for key in ("flops", "hbm_bytes", "link_bytes"):
+        assert control["execution"]["work"][key] == report["execution"]["work"][key]
+    assert report["execution"]["work"]["vector_ops"] >= control["execution"]["work"]["vector_ops"]
 
 
 @pytest.mark.parametrize("sku", ("Ascend910_9362", "Ascend950DT_9582"))
@@ -105,8 +109,7 @@ def test_dense_mla_body_default_respects_kernel_head_domain(model, sku):
     from mindie_sim.prediction.operator_analysis import operator_costs, target_graphs
     from mindie_sim.prediction.structure import parse_case
 
-    raw = compose_case(model, hardware=sku, tp=8, dp=1, num_devices=8)
-    raw["model"]["layers"] = 4
+    raw = compose_case(model, hardware=sku, tp=8, dp=1, num_devices=8, layers=4)
     parsed = parse_case(raw)
     report = operator_costs(parsed, target_graphs(
         parsed, phase="decode", tokens=1, context=4096, sequences=1, scope="body"))
@@ -119,17 +122,24 @@ def test_dense_mla_body_default_respects_kernel_head_domain(model, sku):
 ))
 def test_kimi_body_defaults_install_kda_and_attention_residual(sku, expected_kda):
     from mindie_sim.compose import compose_case
+    from mindie_sim.prediction import family_attnres
     from mindie_sim.prediction.body_defaults import attention_defaults
     from mindie_sim.prediction.structure import parse_case
 
     raw = compose_case("kimi-k3", hardware=sku, tp=8, dp=1, ep=8, num_devices=8, quant="w4a8", layers=8)
+    raw.setdefault("runtime", {}).setdefault("metadata", {})["image_id"] = family_attnres.SOURCE["image_id"]
     effective, report = attention_defaults(parse_case(raw), "decode", tokens=1)
     lowerings = effective.runtime.kernels.get("lowerings", {})
-    assert lowerings.get("kda") == expected_kda
-    assert lowerings.get("attention_residual") == "vllm_ascend_attn_res_prefix"
+    kda_entry = lowerings.get("kda")
+    assert (kda_entry["implementation"] if isinstance(kda_entry, dict) else kda_entry) == expected_kda
     by_fam = {row["family"]: row for row in report["selections"]}
     assert by_fam["kda_decode"]["selection"] == "default_installed"
-    assert by_fam["attention_residual"]["selection"] == "default_installed"
+    if sku == "Ascend950DT_9582":
+        assert lowerings.get("attention_residual") == "vllm_ascend_attn_res_prefix"
+        assert by_fam["attention_residual"]["selection"] == "default_installed"
+    else:
+        assert "attention_residual" not in lowerings
+        assert by_fam["attention_residual"]["selection"] == "preserved"
 
 
 @pytest.mark.parametrize("recipe", (

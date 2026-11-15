@@ -1,4 +1,5 @@
 """Selected native normalization keeps real outputs and independent declarations."""
+import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -34,8 +35,12 @@ def _ops(case, tokens=1):
 def _row(capture, kind, rows=1):
     import mindie_profiler
     from mindie_profiler.normalized import kernel_rows
-    path = Path(mindie_profiler.__file__).resolve().parents[1] / \
-        "tests/fixtures/fusion_contracts" / (capture + ".csv")
+    rel = Path("tests/fixtures/fusion_contracts") / (capture + ".csv")
+    path = Path(mindie_profiler.__file__).resolve().parents[1] / rel
+    if not path.is_file():
+        path = Path(__file__).resolve().parents[2] / "profiler" / rel
+    if not path.is_file():
+        pytest.skip(f"retained fusion fixture unavailable: {path}")
     return next(row for row in kernel_rows(path)
                 if row.kind == kind and row.input_shapes and row.input_shapes[0][0] == rows)
 

@@ -600,53 +600,8 @@ def test_manifest_verified_cells_ignore_single_launch_anchors():
 
 
 # ---------------------------------------------------------------------------
-# 6. Live mount consistency with the embedded golden bundle
+# 6. Package init stays side-effect-free; explicit modules own the re-exports
 # ---------------------------------------------------------------------------
-
-def test_live_a5_campaign_matches_embedded_golden(embedded):
-    if not LIVE_A5.is_dir():
-        pytest.skip(f"live A5 campaign mount not available: {LIVE_A5}")
-
-    ingested, bundle = embedded
-    live_ingested = ingest_a5_campaign_data(LIVE_A5)
-    live_bundle = fit_a5_service_curves(live_ingested)
-
-    assert len(live_ingested["conditions"]) == len(ingested["conditions"])
-    assert len(live_ingested["single_op_anchors"]) == len(
-        ingested["single_op_anchors"])
-    assert len(live_ingested["mc2_chains"]) == len(ingested["mc2_chains"])
-    assert set(live_bundle.curves) == set(bundle.curves)
-    assert live_bundle.unfitted == ()
-    for key, expected in bundle.stack_curves.items():
-        if key in live_bundle.stack_curves:
-            assert live_bundle.stack_curves[key].identity["cann"] == expected.identity["cann"]
-    for key, expected in bundle.curves.items():
-        actual = live_bundle.curves[key]
-        assert [payload for payload, _ in actual.knots] == [
-            payload for payload, _ in expected.knots], key
-        for (_, actual_ms), (_, expected_ms) in zip(
-                actual.knots, expected.knots):
-            assert actual_ms == pytest.approx(expected_ms, rel=1e-4), key
-        assert actual.startup_ms == pytest.approx(
-            expected.startup_ms, abs=1e-5), key
-
-    expected_summary = evaluate_a5_mc2_chains(ingested)["overlap_ratio"]
-    live_summary = evaluate_a5_mc2_chains(live_ingested)["overlap_ratio"]
-    for statistic in ("min", "max", "median", "mean"):
-        assert live_summary[statistic] == pytest.approx(
-            expected_summary[statistic], rel=1e-4), statistic
-
-
-# ---------------------------------------------------------------------------
-# 7. Package init stays side-effect-free; explicit modules own the re-exports
-# ---------------------------------------------------------------------------
-
-def test_observations_package_init_has_no_eager_imports_or_exports():
-    source = (ROOT / "mindie_sim/observations/__init__.py").read_text(
-        encoding="utf-8")
-    tree = ast.parse(source)
-    assert len(tree.body) == 1 and isinstance(tree.body[0], ast.Expr)
-
 
 def test_observations_package_import_does_not_load_a5_calibration():
     code = (

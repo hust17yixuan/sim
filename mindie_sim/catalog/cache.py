@@ -215,8 +215,96 @@ def index_scale_bytes(model: Any) -> float:
 
 
 def index_row_bytes(model: Any, index_dim: int) -> float:
-    """Index data plus one declared scale per row (the tree's cache layout)."""
+    """Physical index row bytes from an explicit source representation.
+
+    Missing ``cache_representations['index_k']`` retains the historical plain
+    int8/FP16 arithmetic exactly. A declared uint8 packed representation is
+    routed through the shared CacheFormat rather than inferred from a model
+    name, hardware label or source id.
+    """
+    raw = dict(getattr(model, "metadata", ())).get("cache_representations", {})
+    if "index_k" in raw:
+        return float(cache_format(model, "index_k").row_bytes(index_dim))
     return float(index_dim) * index_element_bytes(model) + index_scale_bytes(model)
+
+
+def cache_row_split(model: Any, region: str, width: int) -> tuple[float, float]:
+    """Split one declared cache row into payload and quant scale bytes.
+
+    Suffix elements are materialized data, not quantization metadata, so they
+    stay in the payload component.  The sum is exactly ``CacheFormat.row_bytes``
+    for the same declaration; no additional row or page rounding is applied
+    here (the caller's row count already carries allocator geometry).
+    """
+    fmt = cache_format(model, region)
+    quantized = int(width) - int(fmt.suffix_elements)
+    if quantized < 0:
+        raise ModelingError("cache_suffix_exceeds_row_width")
+    # Use the format's complete row price and remove only its declared row
+    # scales. This stays exact when the format owner adds row alignment,
+    # sub-byte payload packing, or another row-level term.
+    total = float(fmt.row_bytes(int(width)))
+    scale = (math.ceil(quantized / fmt.group_size) * dtype_bytes(fmt.scale_dtype)
+             if fmt.group_size else 0.0)
+    payload = total - scale
+    if payload < 0.0:
+        raise ModelingError("cache_row_split_negative_payload")
+    return payload, float(scale)
+
+
+def cache_component_split(
+    model: Any, plan: Any, parallel: ParallelSpec, component: str, total: float,
+) -> tuple[float, float]:
+    """Decompose one ``layer_cache_components`` value without rounding it again.
+
+    The split uses the declared row representation of that component.  States,
+    fixed rings and compressor scratch are already non-quantized storage, so
+    they remain payload.  For ``index_k`` the historical int8/FP16 row (one
+    scale per row) is preserved when no explicit representation is declared.
+    """
+    total = float(total)
+    if total <= 0.0:
+        return 0.0, 0.0
+    if component in {"mla_kv", "window", "compressed_kv"}:
+        payload, scale = cache_row_split(model, component, plan.cache_row_elements)
+    elif component == "gqa_kv":
+        width = 2 * local_kv_heads(plan.num_kv_heads, parallel.tp) * plan.head_dim
+        payload, scale = cache_row_split(model, "gqa_kv", width)
+    elif component == "index_k":
+        raw = dict(getattr(model, "metadata", ())).get("cache_representations", {})
+        if "index_k" in raw:
+            payload, scale = cache_row_split(model, "index_k", plan.index_dim)
+        else:
+            payload = float(plan.index_dim) * index_element_bytes(model)
+            scale = index_scale_bytes(model)
+    else:
+        # Recurrent/conv state, compressor scratch, index pool tail and draft
+        # KV are declared in their materialized dtype; they have no row scale.
+        return total, 0.0
+    row_total = payload + scale
+    if row_total <= 0.0:
+        return total, 0.0
+    return total * (payload / row_total), total * (scale / row_total)
+
+
+def layer_cache_decomposition(
+    model: Any, plan: Any, parallel: ParallelSpec, sequence_tokens: int, *,
+    capacity_padded: bool = True, interleave: int = 128,
+) -> dict[str, dict[str, float]]:
+    """Per-component payload/scale decomposition for one layer's cache."""
+    components = layer_cache_components(
+        model, plan, parallel, sequence_tokens,
+        capacity_padded=capacity_padded, interleave=interleave,
+    )
+    result: dict[str, dict[str, float]] = {}
+    for name, value in components.items():
+        payload, scale = cache_component_split(model, plan, parallel, name, value)
+        result[name] = {
+            "total": float(value),
+            "payload": float(payload),
+            "scale": float(scale),
+        }
+    return result
 
 
 def _facts(model: Any) -> dict[str, Any]:
@@ -288,12 +376,71 @@ def _context_shard_blocks(seq: int, block: int, cp: int) -> int:
     return int(math.ceil(blocks / int(cp)) * int(block))
 
 
+def owned_block_rows(rows: int, block: int, cp: int, rank: int) -> int:
+    """Exact token rows this physical rank owns under block interleave.
+
+    Block ``b`` belongs to rank ``b % cp``.  The final block is partial, so the
+    per-rank counts sum to ``rows`` instead of ``cp * ceil(rows/cp)``.  This is
+    the physical-row input for one rank, not a stage average.
+    """
+    rows = max(0, int(rows))
+    block = max(1, int(block))
+    cp = max(1, int(cp))
+    rank = int(rank)
+    if not 0 <= rank < cp:
+        raise ModelingError(f"cache_owner_rank_out_of_range:{rank}")
+    if cp == 1:
+        return block_round(rows, block)
+    blocks = int(math.ceil(rows / block)) if rows else 0
+    if rank >= blocks:
+        return 0
+    count = (blocks - 1 - rank) // cp + 1
+    last = rank + (count - 1) * cp
+    owned = count * block
+    tail = rows - last * block
+    if tail < block:
+        owned -= block - tail
+    return int(owned)
+
+
+def owned_token_rows(rows: int, owner_spans, rank: int) -> int | None:
+    """Rows owned by ``rank`` from an explicit half-open token partition.
+
+    ``owner_spans`` is the T05 placement fact: one ``(start, end)`` token row
+    interval per physical rank.  The result is the intersection with the
+    component's valid row span, not ``rows / cp``.
+    """
+    if owner_spans is None:
+        return None
+    spans = tuple((int(lo), int(hi)) for lo, hi in owner_spans)
+    rank = int(rank)
+    if not 0 <= rank < len(spans):
+        raise ModelingError(f"cache_owner_rank_out_of_range:{rank}")
+    rows = max(0, int(rows))
+    covered = sum(max(0, min(rows, hi) - min(rows, lo)) for lo, hi in spans)
+    lo, hi = spans[rank]
+    owned = int(max(0, min(rows, hi) - min(rows, lo)))
+    if rows > covered and rank == len(spans) - 1:
+        # A declared partition that does not cover the requested span still
+        # has to account for the extra rows.  Charge them to the last owner
+        # instead of silently making them free.
+        owned += rows - covered
+    return owned
+
+
 def layer_cache_components(model, plan, parallel, sequence_tokens, *, capacity_padded=True,
-                           interleave=128):
+                           interleave=128, rank=None, owner_spans=None):
     seq = max(0, int(sequence_tokens))
     tp, cp = parallel.tp, parallel.cp
     result = {}
     def local_rows(rows, block=interleave):
+        if rank is not None:
+            owned = owned_token_rows(rows, owner_spans, rank)
+            if owned is not None:
+                return owned
+            if capacity_padded:
+                return owned_block_rows(rows, block, cp, rank)
+            return rows / cp
         return (_context_shard_blocks(rows, block, cp) if capacity_padded
                 else rows / cp)
     if plan.attention in {"kda", "gdn"}:
@@ -306,7 +453,12 @@ def layer_cache_components(model, plan, parallel, sequence_tokens, *, capacity_p
         if 0 <= plan.kv_owner_layer_id < plan.index:
             return result
         rows = min(seq, plan.window) if plan.window else seq
-        result["gqa_kv"] = kv_bytes_for(model, local_rows(rows) * 2 * local_kv_heads(plan.num_kv_heads, tp) * plan.head_dim)
+        width = 2 * local_kv_heads(plan.num_kv_heads, tp) * plan.head_dim
+        # One row representation owns both the total and its decomposition.
+        # An explicit ``cache_representations['gqa_kv']`` is a storage format,
+        # not a post-hoc ratio applied to a default KV element width.
+        result["gqa_kv"] = local_rows(rows) * cache_format(
+            model, "gqa_kv").row_bytes(width)
         return result
     if plan.attention != "mla":
         raise ModelingError(f"cache_attention_unknown:{plan.attention}")
@@ -328,7 +480,14 @@ def layer_cache_components(model, plan, parallel, sequence_tokens, *, capacity_p
         index_ratio = max(1, plan.compress_ratio, plan.index_kpool)
         rows = completed_rows(seq, index_ratio)
         if parallel.cp_plan == "dsa_cp":
-            rows = index_k_capacity_rows(rows, cp, index_ratio) if capacity_padded else rows / cp
+            if rank is not None:
+                rows = (
+                    index_k_owned_block_rows(rows, cp, index_ratio)[int(rank)]
+                    if capacity_padded else
+                    index_k_ownership_rows(rows, cp, index_ratio)[int(rank)]
+                )
+            else:
+                rows = index_k_capacity_rows(rows, cp, index_ratio) if capacity_padded else rows / cp
         result["index_k"] = rows * index_row_bytes(model, plan.index_dim)
         if plan.index_kpool > 1 and seq:
             # Raw normalized keys and gates remain FP32 in a bounded ring;
@@ -455,8 +614,10 @@ __all__ = [
     "candidate_valid_rows", "block_round", "index_element_bytes",
     "index_row_bytes", "index_scale_bytes", "kv_bytes_for", "kv_element_bytes",
     "local_kv_heads",
-    "index_selection_cost", "attention_rows", "layer_cache_components",
-    "stage_cache_components", "request_cache_breakdown",
+    "index_selection_cost", "attention_rows", "cache_row_split",
+    "cache_component_split", "layer_cache_components",
+    "layer_cache_decomposition", "stage_cache_components",
+    "request_cache_breakdown",
     "state_bytes_per_request_per_rank", "cache_bytes_per_token_estimate",
     "peak_live_tokens", "live_request_cache_peak",
 ]

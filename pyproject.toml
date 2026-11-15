@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mindie-sim"
-version = "0.9.11"
+version = "0.9.12"
 description = "Hardware-neutral causal performance simulation, primitive calibration and independent validation"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["ijson>=3.4,<4"]
 
 [project.optional-dependencies]
-test = ["pytest>=8,<10", "numpy>=1.26"]
+test = ["pytest>=8,<10", "pytest-xdist>=3.6,<4", "numpy>=1.26", "tiktoken>=0.7"]
 profiling = ["mindie-profiler>=0.5.0"]
 
 [project.scripts]
@@ -21,11 +21,20 @@ mindie-sim = "mindie_sim.__main__:main"
 include = ["mindie_sim*"]
 
 [tool.setuptools.package-data]
-mindie_sim = ["model_configs/*.json", "catalog/configs/*.json", "backends/profiles/*.json"]
+mindie_sim = [
+    "model_configs/*.json",
+    "catalog/configs/*.json",
+    "backends/profiles/*.json",
+    "observations/*.json",
+    "op_formulas/*.json",
+    "opflow/*.json",
+    "prediction/runtime/*.c",
+    "prediction/runtime/*.h",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["."]
+pythonpath = [".", "tests"]
 markers = [
     "live_npu: standing A2/A3 Ascend NPU non-destructive live integration",
 ]

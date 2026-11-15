@@ -1,4 +1,5 @@
 """Declared precision boundaries compared with original native capture rows."""
+import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 from pathlib import Path
 
 import pytest
@@ -35,7 +36,12 @@ def test_real_norm_mx_contract_requires_both_norm_and_quantization(profiler_api)
     from mindie_profiler.normalized import kernel_rows
     from mindie_profiler.tensor_contracts import observed_contract
 
-    root = Path(mindie_profiler.__file__).resolve().parents[1] / "tests/fixtures/fusion_contracts"
+    rel = Path("tests/fixtures/fusion_contracts")
+    root = Path(mindie_profiler.__file__).resolve().parents[1] / rel
+    if not root.is_dir():
+        root = Path(__file__).resolve().parents[2] / "profiler" / rel
+    if not root.is_dir():
+        pytest.skip(f"retained fusion fixtures unavailable: {root}")
     rows = (row for path in sorted(root.glob("*.csv")) for row in kernel_rows(path))
     row = next(row for row in rows if row.kind == "RmsNormDynamicMxQuant")
     op = declaration("rmsnorm_quant", output="fp8_e4m3", scale_dtype="fp8_e8m0",

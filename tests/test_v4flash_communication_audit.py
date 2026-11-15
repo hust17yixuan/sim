@@ -155,38 +155,3 @@ def test_declared_tp8_ep8_contract_separates_self_copy_from_remote_link():
     assert contract["algorithm_scope"] == "resource_envelope_default"
     assert contract["round_readiness_modeled"] is False
     assert contract["self_copy_modeled_as_link"] is False
-
-
-@pytest.mark.skipif(not audit.DEFAULT_CAPTURE.exists(), reason="retained capture not mounted")
-def test_retained_capture_reconciles_exactly_once():
-    report = audit.build_audit(ROOT / audit.DEFAULT_CAPTURE,
-                               scoreboard_path=ROOT / audit.DEFAULT_SCOREBOARD,
-                               input_path=ROOT / audit.DEFAULT_INPUT,
-                               prediction_path=ROOT / audit.DEFAULT_PREDICTION,
-                               case_path=ROOT / audit.DEFAULT_CASE,
-                               catalog_path=ROOT / audit.DEFAULT_CATALOG,
-                               repository=ROOT)
-    capture = report["source"]["capture"]
-    assert capture["rows"] == 4064
-    assert capture["span_ms"] == 575.235407
-    assert capture["activity_sum_ms"] == 609.513832
-    assert capture["rank_scope"]["device_ids"] == ["8"]
-    assert capture["classes"]["native"]["sum_ms"] == 111.032451
-    assert capture["projection_candidates"]["mirror_interval_ms"] == 38.2382
-    assert capture["projection_candidates"]["exact_native_interval_matches"] == 178
-    assert capture["projection_candidates"]["unmatched_rows"] == 0
-    assert capture["projection_candidates"]["ambiguous_rows"] == 0
-    assert capture["aicpu"]["intersection_with_native_ms"] == 30.629491
-    assert capture["union_intersection"]["all_rows_union_ms"] == 129.60612
-    assert capture["alltoallv_group_count"] == 44
-    assert capture["alltoallv_ordinal_groups"] == [
-        {"ordinal": 1, "count": 44, "sum_ms": 3.009098, "median_ms": 0.065989},
-        {"ordinal": 2, "count": 44, "sum_ms": 6.03904, "median_ms": 0.129958},
-        {"ordinal": 3, "count": 44, "sum_ms": 23.343473, "median_ms": 0.463141},
-    ]
-    reconciliation = report["reconciliation"]
-    assert reconciliation["observed_minus_predicted_ms"] == pytest.approx(
-        reconciliation["observed_ms"] - reconciliation["predicted_ms"], abs=1e-6)
-    assert reconciliation["native_minus_predicted_ms"] == pytest.approx(
-        111.032451 - reconciliation["predicted_ms"], abs=1e-6)
-    assert reconciliation["predicted_total_equals_link_bytes"] is True

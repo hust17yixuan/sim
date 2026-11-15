@@ -1,4 +1,5 @@
 """Independent paged declarations against original mixed-step A3/A5 tensors."""
+import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 from copy import deepcopy
 from dataclasses import replace
 import json
@@ -27,8 +28,10 @@ def observed(capture, kind, tokens, profiler_api, *, paged=True):
     from mindie_profiler.normalized import kernel_rows
     from mindie_profiler.tensor_contracts import observed_contract
 
-    path = (Path(mindie_profiler.__file__).resolve().parents[1]
-            / "tests/fixtures/mixed_step_body" / (capture + ".csv"))
+    rel = Path("tests/fixtures/mixed_step_body") / (capture + ".csv")
+    path = Path(mindie_profiler.__file__).resolve().parents[1] / rel
+    if not path.is_file():
+        path = Path(__file__).resolve().parents[2] / "profiler" / rel
     if not path.is_file():
         pytest.skip(f"retained mixed-step capture is unavailable: {path}")
     return next(observed_contract(row) for row in kernel_rows(path)
@@ -138,8 +141,10 @@ def test_real_paged_and_recurrent_events_form_cohorts_without_layer_or_step_bind
     from mindie_profiler.structure_mapping import map_structure
     from mindie_sim.structure import export_structure
 
-    path = (Path(mindie_profiler.__file__).resolve().parents[1]
-            / "tests/fixtures/mixed_step_body/a3_qwen36.csv")
+    rel = Path("tests/fixtures/mixed_step_body/a3_qwen36.csv")
+    path = Path(mindie_profiler.__file__).resolve().parents[1] / rel
+    if not path.is_file():
+        path = Path(__file__).resolve().parents[2] / "profiler" / rel
     if not path.is_file():
         pytest.skip(f"retained mixed-step capture is unavailable: {path}")
     rows = [row for row in kernel_rows(path, rank_id="rank_0", rank_index=0)

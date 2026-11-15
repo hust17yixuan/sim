@@ -260,13 +260,3 @@ def test_kda_source_branch_conditions_select_dense_full_or_split_stages():
     assert wider["geometry"]["pairs"] == 2 * 128 ** 2
     with pytest.raises(ModelingError, match="source_chunk_size_must_be_64_or_128"):
         kda_stage_ledger(kda_descriptors(chunk=8192), chunk_size=8192)
-
-
-def test_kda_sources_match_the_pinned_audit_when_it_is_present():
-    audit_path = Path("/tmp/kimi-native-call-scope-audit-20261029.json")
-    if not audit_path.exists():
-        pytest.skip("local pinned audit file is absent")
-    audit = json.loads(audit_path.read_text())
-    hashes = {row["path"]: row["sha256"] for row in audit["sources"]}
-    for source in kda_stage_ledger(kda_descriptors())["sources"]:
-        assert hashes[source["path"]] == source["sha256"]

@@ -1,4 +1,5 @@
 """Source-derived QKV preprocessing boundaries and real capture limitations."""
+import pytest as _pytest; _pytest.importorskip("mindie_profiler")
 from dataclasses import replace
 from itertools import product
 import json
@@ -113,8 +114,10 @@ def test_real_qwen_capture_missing_outputs_does_not_become_a_fusion_contract(pro
     from mindie_profiler.normalized import kernel_rows
     from mindie_profiler.tensor_contracts import observed_contract, observed_contract_diagnostic
 
-    fixture = (Path(mindie_profiler.__file__).resolve().parents[1] /
-               "tests/fixtures/fusion_contracts/a5_qwen38.csv")
+    rel = Path("tests/fixtures/fusion_contracts/a5_qwen38.csv")
+    fixture = Path(mindie_profiler.__file__).resolve().parents[1] / rel
+    if not fixture.is_file():
+        fixture = Path(__file__).resolve().parents[2] / "profiler" / rel
     if not fixture.is_file():
         pytest.skip("retained A5 fusion fixture is not available")
     row = next(row for row in kernel_rows(fixture)

@@ -114,7 +114,10 @@ def _deepseek_plans(c: Mapping[str, Any], *, v41: bool) -> list[LayerPlan]:
             indexer_type = (
                 "full" if owns_kv and owns_topk else ("shared" if indexer else "none")
             )
-            architecture = {0: "swa_only", 1: "dsa_shared_compressed_1", 2: "dsa_shared_compressed_2"}[ratio]
+            # Paper-aligned schedule names: ratio 0 is the SWA window branch,
+            # ratios 1/2 are the cross-layer shared Compressed Sparse
+            # Attention v2 (candidate-block filtering) schedule.
+            architecture = {0: "swa", 1: "csa2", 2: "csa2"}[ratio]
             index_status = "exact_config_source_ids"
         else:
             kv_source = index if ratio > 0 else -1
@@ -127,7 +130,9 @@ def _deepseek_plans(c: Mapping[str, Any], *, v41: bool) -> list[LayerPlan]:
             candidate_source = -1
             indexer = ratio == 4
             indexer_type = "c4" if ratio == 4 else "none"
-            architecture = {0: "swa_only", 4: "dsa_compressed_4", 128: "dsa_compressed_128"}[ratio]
+            # Paper-aligned schedule names: 4 is single-stage Compressed
+            # Sparse Attention, 128 is Hierarchically Compressed Attention.
+            architecture = {0: "swa", 4: "csa", 128: "hca"}[ratio]
             index_status = "exact_native_compression_schedule"
         plans.append(LayerPlan(
             index=index, attention="mla", ffn="moe",
