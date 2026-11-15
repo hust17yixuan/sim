@@ -436,7 +436,7 @@ print(json.dumps(report))
 
 def test_r9_3_universal_wheel_ships_every_runtime_resource():
     """All workspace package files ship byte-identically and the loaders work."""
-    workspace = {str(path.relative_to(ROOT)): path.read_bytes()
+    workspace = {path.relative_to(ROOT).as_posix(): path.read_bytes()
                  for path in _package_files()}
     assert len(workspace) >= PACKAGE_FILES
     base = Path(tempfile.mkdtemp(prefix="nr-s3-r9-wheel-"))

@@ -42,7 +42,7 @@ class Budget:
     per_pass: int = 32
     total: int = 128
     wall_s: float = 30.0
-    started: float = field(default_factory=time.monotonic)
+    started: float = field(default_factory=time.perf_counter)
     started_rss: int = field(default_factory=_peak_rss_bytes)
     used_total: int = 0
     used_pass: int = 0
@@ -53,7 +53,7 @@ class Budget:
         self.used_pass = 0
 
     def wall_exceeded(self) -> bool:
-        return time.monotonic() - self.started > self.wall_s
+        return time.perf_counter() - self.started > self.wall_s
 
     def rss_exceeded(self) -> bool:
         return _peak_rss_bytes() - self.started_rss > MAX_PEAK_BYTES

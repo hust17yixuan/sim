@@ -362,7 +362,7 @@ def test_setuptools_build_py_discovers_catalog_configs():
     command = _build_py(distribution)
     command.finalize_options()
     rows = command.get_data_files_without_manifest()
-    discovered = {f"mindie_sim/{name}" for _, _, _, names in rows for name in names}
+    discovered = {f"mindie_sim/{Path(name).as_posix()}" for _, _, _, names in rows for name in names}
     assert _catalog_config_names() <= discovered
 
 

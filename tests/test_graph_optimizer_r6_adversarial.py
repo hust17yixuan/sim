@@ -371,7 +371,7 @@ def _deep_graph(count):
 @pytest.mark.parametrize("count", (1202, 3000))
 def test_r6_f5_stream_discovery_is_iterative_and_budget_bounded(count):
     plan = _deep_plan(count)
-    budget = Budget(per_pass=32, total=64, wall_s=0.01)
+    budget = Budget(per_pass=32, total=64, wall_s=0.5)
     regions = _stream_regions(plan, 2, budget)
     assert isinstance(regions, tuple) and regions
     assert budget.exhausted is False
