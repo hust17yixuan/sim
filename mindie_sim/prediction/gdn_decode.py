@@ -24,6 +24,10 @@ from .gdn_prefill import decode_core, rearrange_qkv
 from .graph import GraphPolicy
 from .lowering import Builder
 from .mechanism import PlannedRecipe
+from .recover_ssm_work import (
+    GDN_ARCH35_RECOVER_SSM_RECIPE, build_gdn_arch35_recover_ssm,
+    emit_commit_op, recover_ssm_enabled, rewrite_gdn_analytical_scan,
+)
 from .tensors import TensorLowering
 
 SOURCE = {"path": "data/observations/sources/gdn-image-c3d00a196905/gdn.py.txt",
@@ -33,7 +37,8 @@ SOURCE = {"path": "data/observations/sources/gdn-image-c3d00a196905/gdn.py.txt",
 
 def recipes():
     return {CONV: PlannedRecipe(conv_plan), GATING: PlannedRecipe(gating_plan),
-            gdn_recurrent.IMPLEMENTATION: PlannedRecipe(gdn_recurrent.build)}
+            gdn_recurrent.IMPLEMENTATION: PlannedRecipe(gdn_recurrent.build),
+            GDN_ARCH35_RECOVER_SSM_RECIPE: PlannedRecipe(build_gdn_arch35_recover_ssm)}
 
 
 def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
@@ -276,18 +281,31 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
                             "state_checkpoint_versions": checkpoint_versions}.items())
     b.ops[-1] = replace(scan, metadata=state_metadata)
     scan = b.ops[-1]
+    use_recover_ssm = recover_ssm_enabled(runtime) and speculative
     if recurrent_implementation == "arch35_fp32":
-        b.ops[-1] = replace(scan, recipe=gdn_recurrent.IMPLEMENTATION, source_boundary="kernel",
+        recipe_name = GDN_ARCH35_RECOVER_SSM_RECIPE if use_recover_ssm else gdn_recurrent.IMPLEMENTATION
+        extra_meta = {"recover_ssm": True, "recover_ssm_stage": "verify_compact_record"} if use_recover_ssm else {}
+        b.ops[-1] = replace(scan, recipe=recipe_name, source_boundary="kernel",
                            metadata=tuple({**dict(scan.metadata), "source": gdn_recurrent.SOURCE,
                                "implementation_scope": "source_resident_qkv_and_state_pipeline",
                                "recurrence_selection": recurrent_implementation,
                                "unmodeled_features": ("scalar_metadata_issue_and_cache_latency",),
+                               **extra_meta,
                            }.items()))
     elif recurrent_implementation == "analytical":
-        b.ops[-1] = replace(scan, metadata=tuple({**dict(scan.metadata),
-                           "recurrence_selection": recurrent_implementation}.items()))
+        updated_scan = replace(scan, metadata=tuple({**dict(scan.metadata),
+                               "recurrence_selection": recurrent_implementation}.items()))
+        if use_recover_ssm:
+            updated_scan = rewrite_gdn_analytical_scan(
+                updated_scan, active_views=active, heads=heads, dk=dk, dv=dv,
+                state_dtype=plan.recurrent_state_dtype, kg_dtype=model.activation_dtype)
+        b.ops[-1] = updated_scan
     else:
         raise ModelingError("gdn_decode_recurrent_implementation_unknown:" + recurrent_implementation)
+    if use_recover_ssm:
+        emit_commit_op(b, name="recover_ssm_commit", deps=(scan.op_id,), views=active,
+                       heads=heads, dk=dk, dv=dv, state_dtype=plan.recurrent_state_dtype,
+                       kg_dtype=model.activation_dtype, runtime=runtime, attention_kind="gdn")
     copied = tensors.copy_into(core, tensors.result(zero, (tokens, heads, dv)).narrow(0, 0, core_tokens),
                                "core_output_copy")
     # gdn.py flattens token and head axes before norm. This crosses the

@@ -141,6 +141,7 @@ class Software:
     mc2_chunks: int = 4
     mtp_acceptance_length: float = 1
     mtp_acceptance_by_output_tokens: tuple[tuple[int, float], ...] = ()
+    recover_ssm: bool = False
     dspark: object = None
     engram_cpu_offload: bool = False
     vllm_impl: str = ""
@@ -256,6 +257,8 @@ class Software:
             raise ModelingError("moe_requires_registered_recipe_and_positive_mc2_chunks")
         if result.final_norm_scope not in {"all", "selected"}:
             raise ModelingError("final_norm_scope_requires_all_or_selected")
+        if not isinstance(result.recover_ssm, bool):
+            raise ModelingError("runtime_recover_ssm_invalid")
         return result
 
     def to_dict(self):

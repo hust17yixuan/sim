@@ -19,6 +19,7 @@ from mindie_sim.prediction.engine import Allocation
 from mindie_sim.prediction.mechanism import OperatorPlan, Work
 from mindie_sim.prediction.ownership import read_role, unit_group
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
+from mindie_sim.prediction.recover_ssm_work import record_head_bytes, record_slice_bytes
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec, ProgramFragment, StateEffect
 from mindie_sim.schema.subgraphs import PortSet
@@ -32,22 +33,15 @@ from .kda_state_selection import (
 IMPLEMENTATION = RECIPE = "vllm_ascend_recurrent_kda_arch35"
 SOURCE = {
     "repository": "vllm-project/vllm-ascend",
-    "revision": "8c30e4f491f73cba737a1dacc522894e437cdf3d",
-    "source_state": "committed",
-    "kernel": {
-        "path": "csrc/attention/recurrent_kda/op_kernel/arch35/recurrent_kda.h",
-        "sha256": "f35dd2c5fb604d6d9711c11139c755414d49fb27fc6aea0f3a4bec3d3adb0199",
-        "lines": ((151, 198), (235, 270), (375, 596), (736, 920)),
-    },
-    "host": {
-        "path": "csrc/attention/recurrent_kda/op_host/recurrent_kda_tiling_processor.h",
-        "sha256": "c9eac28bd528eb03bdeb456c4fdbed4951f716937570ee9d810e0fb5b3ef3fbd",
-        "lines": ((592, 621), (648, 756)),
-    },
-    "caller": {
-        "path": "vllm_ascend/ops/kda.py",
-        "sha256": "ca2f56280746f45a347578e7191decda716557c93aca69b5c3baf7b22a578803",
-    },
+    "revision": "8c30e4f491f73cba737a1dacc522894e437cdf3d", "source_state": "committed",
+    "kernel": {"path": "csrc/attention/recurrent_kda/op_kernel/arch35/recurrent_kda.h",
+               "sha256": "f35dd2c5fb604d6d9711c11139c755414d49fb27fc6aea0f3a4bec3d3adb0199",
+               "lines": ((151, 198), (235, 270), (375, 596), (736, 920))},
+    "host": {"path": "csrc/attention/recurrent_kda/op_host/recurrent_kda_tiling_processor.h",
+             "sha256": "c9eac28bd528eb03bdeb456c4fdbed4951f716937570ee9d810e0fb5b3ef3fbd",
+             "lines": ((592, 621), (648, 756))},
+    "caller": {"path": "vllm_ascend/ops/kda.py",
+               "sha256": "ca2f56280746f45a347578e7191decda716557c93aca69b5c3baf7b22a578803"},
     "scope": "selected_source_kernel_not_capture_binary_identity",
 }
 _BYTES = {"bf16": 2, "fp16": 2, "fp32": 4}
@@ -95,10 +89,13 @@ class Params:
     #: Stable state identity per sequence.  None derives a layer/request
     #: identity in the lowerer; an occurrence name is never the state key.
     state_targets: tuple | None = None
+    recover_ssm: bool = False
 
     @classmethod
     def parse(cls, raw):
         p = cls(**{**raw, "lengths": tuple(raw["lengths"])})
+        if not isinstance(p.recover_ssm, bool):
+            raise ModelingError("recurrent_kda_recover_ssm_invalid")
         if not p.lengths or any(not isinstance(q, int) or not 1 <= q <= 8 for q in p.lengths):
             raise ModelingError("recurrent_kda_requires_nonempty_q1_to_q8_sequences")
         if (not 1 <= p.key_heads <= p.heads <= 256 or p.heads % p.key_heads
@@ -241,7 +238,8 @@ def head_work(p, q, parts, read, *, include_beta=True, delta_broadcast=False):
     vector = (q*(3*k+v) + gate
               + (6*q*k if p.use_qk_l2norm else 0) + k*v
               + q*((8+int(delta_broadcast))*k+1)*v + 2*q*parts*int(p.use_beta_sigmoid))
-    outgoing = q*(state + v*2)
+    state_out = record_head_bytes(k, v, p.dtype) if (p.recover_ssm and q > 1) else state
+    outgoing = q*(state_out + v*2)
     result = Work(resources={"hbm": incoming + outgoing, read: incoming,
                              "mte3": outgoing, "vector": vector})
     return result + beta_work(p, q, read) if include_beta else result
@@ -283,6 +281,8 @@ def _head_stages(p, q, repeat, profile, context, placement, read,
     last_write = None
     attention_writes, state_writes = [], []
     for part, n in enumerate(widths):
+        state_slice = (record_slice_bytes(k, n, part, p.dtype)
+                       if (p.recover_ssm and q > 1) else k*n*_BYTES[p.state_dtype])
         resident = vec(f"state_resident{part}", k*n, state_load, last_compute)
         if part+1 < len(widths):
             state_load = mem(f"state_load{part+1}", k*widths[part+1]*_BYTES[p.state_dtype], read, resident)
@@ -316,16 +316,16 @@ def _head_stages(p, q, repeat, profile, context, placement, read,
                     write("attention", previous_token, producer, n*2)
                 pending_attn = token, last_compute
             if profile["state_slots"] == 1:
-                write("state", token, exported, k*n*_BYTES[p.state_dtype])
+                write("state", token, exported, state_slice)
             else:
                 if pending_state is not None:
                     previous_token, producer = pending_state
-                    write("state", previous_token, producer, k*n*_BYTES[p.state_dtype])
+                    write("state", previous_token, producer, state_slice)
                 pending_state = token, exported
         if pending_attn is not None:
             write("attention", *pending_attn, n*2)
         if pending_state is not None:
-            write("state", *pending_state, k*n*_BYTES[p.state_dtype])
+            write("state", *pending_state, state_slice)
     return tuple(stages)
 
 
@@ -389,8 +389,10 @@ def build(op, geometry, *, compact=True, execution=SourceExecution()):
         metadata_values += p.heads*sum(p.lengths)*profile["parts"] + resolved_sequences
     accepted_loads = validated_sequences + resolved_sequences if p.has_accepted_tokens else 0
     metadata_values += accepted_loads
-    plan_metadata = {"execution_class": "vector",
-                     "state_accesses": state_accesses(op)}
+    spec_recover = bool(p.recover_ssm and any(q > 1 for q in p.lengths))
+    plan_metadata = {"execution_class": "vector", "state_accesses": state_accesses(op)}
+    if spec_recover:
+        plan_metadata["recover_ssm"] = True
     contract = dict(op.metadata).get("kda_state_contract")
     if contract is not None:
         plan_metadata["state_contract"] = contract
@@ -398,8 +400,7 @@ def build(op, geometry, *, compact=True, execution=SourceExecution()):
     plan_metadata["state_fragments"] = {
         "read": "state_read" if fragments["read"] is not None else None,
         "write": "state_publish" if fragments["write"] is not None else None,
-        "commits": len(fragments["commits"]),
-        "rollbacks": len(fragments["rollbacks"]),
+        "commits": len(fragments["commits"]), "rollbacks": len(fragments["rollbacks"]),
     }
     plan_metadata["kda_recurrent_schedule"] = {
             **profile, "logical_heads": len(p.lengths)*p.heads,
@@ -411,7 +412,8 @@ def build(op, geometry, *, compact=True, execution=SourceExecution()):
             "beta_load_scope": "head" if execution.beta_per_head else "owner_sequence",
             "delta_update": "UB_broadcast_MulAddDst_query_Mul" if execution.delta_broadcast else "fused_MicroAPI_ProcessKQ",
             "ownership": "task_id=(sequence*HV+head);owner=task_id%launched_aiv",
-            "state_residency": "one_initial_load_per_head;checkpoint_write_every_query",
+            "state_residency": ("one_initial_load_per_head;recover_ssm_compact_record_then_single_commit"
+                                if spec_recover else "one_initial_load_per_head;checkpoint_write_every_query"),
             "head_handoff": "conservative_serial_head_retirement",
             "contention_approximation": "serial_cycle_fluid_rephasing" if compact else "none",
             "scalar_metadata_getvalue_bytes": scalar_bytes*metadata_values,
@@ -499,54 +501,34 @@ def state_contract(*, lengths, targets=(), requests=(), selection=None,
         effects.append(_state_effect(target, "rollback", version,
                                      "acceptance_trace"))
     acceptance_view = {
-        "accepted_offsets": records["accepted_offsets"],
-        "advances": records["advances"],
-        "commit_versions": records["commit_versions"],
-        "rejected_versions": records["rejected_versions"],
-        "pending": records["pending_acceptance"],
-        "commit_policy": records["commit_policy"],
+        "accepted_offsets": records["accepted_offsets"], "advances": records["advances"],
+        "commit_versions": records["commit_versions"], "rejected_versions": records["rejected_versions"],
+        "pending": records["pending_acceptance"], "commit_policy": records["commit_policy"],
         "candidate_write_point": records["candidate_write_point"],
     }
     history_selection = {
-        "basis": ("exact_selection" if selection is not None
-                  else "caller_context_checkpoint"),
-        "address_basis": (None if selection is None
-                          else selection.get("address_basis")),
-        "initial_slots": (None if selection is None
-                          else selection.get("initial_slots")),
-        "checkpoint_slots": checkpoint_slots,
-        "accepted_offsets": records["accepted_offsets"],
+        "basis": "exact_selection" if selection is not None else "caller_context_checkpoint",
+        "address_basis": None if selection is None else selection.get("address_basis"),
+        "initial_slots": None if selection is None else selection.get("initial_slots"),
+        "checkpoint_slots": checkpoint_slots, "accepted_offsets": records["accepted_offsets"],
         "retained_versions": records["retained_versions"],
         "overwritten_versions": records["overwritten_versions"],
     }
     current_geometry = {
-        "queries": records["queries"],
-        "contexts": records["contexts"],
-        "version_basis": records["version_basis"],
-        "targets": targets,
-        "request_ids": tuple(requests),
-        "state_layout": "V,K",
-        "state_dtype": state_dtype,
+        "queries": records["queries"], "contexts": records["contexts"],
+        "version_basis": records["version_basis"], "targets": targets,
+        "request_ids": tuple(requests), "state_layout": "V,K", "state_dtype": state_dtype,
     }
     contract = {
-        **records,
-        "initial_slots": (None if selection is None
-                          else selection.get("initial_slots")),
+        **records, "initial_slots": None if selection is None else selection.get("initial_slots"),
         "checkpoint_slots": checkpoint_slots,
-        "address_basis": (None if selection is None
-                          else selection.get("address_basis")),
-        "state_dtype": state_dtype,
-        "state_layout": "V,K",
-        "request_ids": tuple(requests),
-        "owner": owner,
-        "read_bindings": tuple(binding_record(b) for b in bindings),
+        "address_basis": None if selection is None else selection.get("address_basis"),
+        "state_dtype": state_dtype, "state_layout": "V,K", "request_ids": tuple(requests),
+        "owner": owner, "read_bindings": tuple(binding_record(b) for b in bindings),
         "write_bindings": tuple(binding_record(b) for b in write_bindings),
-        "history_selection": history_selection,
-        "current_geometry": current_geometry,
-        "acceptance": acceptance_view,
-        "decisions": tuple(decisions),
-        "ready": tuple(ready),
-        "grants": tuple(grants),
+        "history_selection": history_selection, "current_geometry": current_geometry,
+        "acceptance": acceptance_view, "decisions": tuple(decisions),
+        "ready": tuple(ready), "grants": tuple(grants),
     }
     return contract, tuple(effects)
 def _fragment(name, effects, ports=None):
@@ -657,94 +639,69 @@ def state_accesses(op):
     params = dict(op.metadata).get("kda_recurrent_params", {})
     if contract is None:
         return ()
-    dk = int(params.get("dk", 128))
-    dv = int(params.get("dv", 128))
-    state_byte = {"fp32": 4, "bf16": 2}.get(
-        str(params.get("state_dtype", "fp32")), 4)
+    dk, dv = int(params.get("dk", 128)), int(params.get("dv", 128))
+    state_byte = {"fp32": 4, "bf16": 2}.get(str(params.get("state_dtype", "fp32")), 4)
+    use_recover = bool(params.get("recover_ssm", False))
+    rec_head = record_head_bytes(dk, dv, str(params.get("dtype", "bf16")))
     request_ids = tuple(contract.get("request_ids", ()))
     result = []
-    read_bindings = tuple(contract.get("read_bindings", ()))
-    for index, binding in enumerate(read_bindings):
+    for index, binding in enumerate(tuple(contract.get("read_bindings", ()))) :
         target = binding["target"]
-        request = (request_ids[index] if index < len(request_ids)
-                   else str(index))
+        request = request_ids[index] if index < len(request_ids) else str(index)
         span = _binding_span(binding)
-        elements = 1
-        for start, end in span:
-            elements *= end - start
-        source = binding.get("ready") or binding["producer"]
+        elements = math.prod(end - start for start, end in span)
         result.append({
-            "occurrence": f"{op.op_id}:read:{index}",
-            "producer": binding["producer"], "request": request,
-            "stage": op.stage, "layer": op.layer,
-            "direction": "read", "position": "state",
-            "output": target, "storage": binding["storage"],
-            "owner": binding.get("owner", f"kda.layer[{op.layer}]"),
+            "occurrence": f"{op.op_id}:read:{index}", "producer": binding["producer"],
+            "request": request, "stage": op.stage, "layer": op.layer,
+            "direction": "read", "position": "state", "output": target,
+            "storage": binding["storage"], "owner": binding.get("owner", f"kda.layer[{op.layer}]"),
             "representation": binding.get("representation", "state"),
-            "persistent": True, "temporary": False,
-            "state_version": binding["state_version"], "span": span,
-            "bytes": float(elements * state_byte),
-            "source": source, "reader": "", "grant": binding.get("grant") or "",
-            "decision": None, "last_use": "next_decode_read", "rank": None,
-            "scope": "target", "generation": binding.get("generation"),
+            "persistent": True, "temporary": False, "state_version": binding["state_version"],
+            "span": span, "bytes": float(elements * state_byte),
+            "source": binding.get("ready") or binding["producer"], "reader": "",
+            "grant": binding.get("grant") or "", "decision": None, "last_use": "next_decode_read",
+            "rank": None, "scope": "target", "generation": binding.get("generation"),
             "slot": binding.get("slot"), "window": binding.get("window"),
             "offset": binding.get("offset"), "physical_key": binding["storage"],
-            "request_slot": binding.get("slot"), "rows": 1,
-            "row_stride": dk * dv, "tier": binding.get("tier", "hbm"),
-            "source_ready": binding.get("ready"),
-            "grant_ready": binding.get("grant"),
-            "last_use_event": "next_decode_read",
+            "request_slot": binding.get("slot"), "rows": 1, "row_stride": dk * dv,
+            "tier": binding.get("tier", "hbm"), "source_ready": binding.get("ready"),
+            "grant_ready": binding.get("grant"), "last_use_event": "next_decode_read",
         })
     committed = set(contract.get("commit_versions", ()))
-    decisions = contract.get("decisions", ())
     targets = tuple(contract.get("targets", ()))
-    for write_index, binding in enumerate(
-            tuple(contract.get("write_bindings", ()))):
+    for write_index, binding in enumerate(tuple(contract.get("write_bindings", ()))) :
         target = binding["target"]
         sequence = targets.index(target) if target in targets else 0
-        request = (request_ids[sequence] if sequence < len(request_ids)
-                   else str(sequence))
-        version = binding["state_version"]
-        shape = tuple(binding["layout"]["shape"])
-        if len(shape) == 4 and shape[0] == 1:
-            heads, head_axis = shape[1], 1
-        else:
-            heads, head_axis = shape[0], 0
-        slot = binding.get("slot")
-        commit = version in committed
+        request = request_ids[sequence] if sequence < len(request_ids) else str(sequence)
+        version, shape = binding["state_version"], tuple(binding["layout"]["shape"])
+        heads, head_axis = (shape[1], 1) if (len(shape) == 4 and shape[0] == 1) else (shape[0], 0)
+        slot, commit = binding.get("slot"), version in committed
         decision_event = _decision_name(contract, target, version)
         base_span = _binding_span(binding)
+        is_spec = use_recover and int(binding.get("window") or 1) > 1
+        out_bytes = float(rec_head if is_spec else dk * dv * state_byte)
+        out_repr = "recover_ssm_record" if is_spec else binding.get("representation", "state")
         for head in range(heads):
             span = list(base_span)
             span[head_axis] = (head, head + 1)
             result.append({
                 "occurrence": f"{op.op_id}:write:{write_index}:{head}",
                 "producer": binding["producer"], "request": request,
-                "stage": op.stage, "layer": op.layer,
-                "direction": "write", "position": "state",
+                "stage": op.stage, "layer": op.layer, "direction": "write", "position": "state",
                 "output": target, "storage": binding["storage"],
                 "owner": binding.get("owner", f"kda.layer[{op.layer}]"),
-                "representation": binding.get("representation", "state"),
-                "persistent": True, "temporary": False,
-                "state_version": version, "span": tuple(span),
-                "bytes": float(dk * dv * state_byte),
-                "source": binding["producer"], "reader": "",
-                "grant": binding.get("grant") or "",
-                "decision": ("token_commit" if commit
-                             else "candidate_hold"),
-                "last_use": ("next_decode_read" if commit
-                             else "last_reader"),
-                "rank": None, "scope": "target",
-                "generation": version, "slot": slot,
+                "representation": out_repr, "persistent": True, "temporary": False,
+                "state_version": version, "span": tuple(span), "bytes": out_bytes,
+                "source": binding["producer"], "reader": "", "grant": binding.get("grant") or "",
+                "decision": "token_commit" if commit else "candidate_hold",
+                "last_use": "next_decode_read" if commit else "last_reader",
+                "rank": None, "scope": "target", "generation": version, "slot": slot,
                 "window": binding.get("window"), "offset": binding.get("offset"),
-                "physical_key": f"{binding['storage']}:head:{head}",
-                "request_slot": slot, "rows": 1, "row_stride": dk * dv,
-                "tier": binding.get("tier", "hbm"),
-                "source_ready": binding.get("ready"),
-                "grant_ready": binding.get("grant"),
+                "physical_key": f"{binding['storage']}:head:{head}", "request_slot": slot,
+                "rows": 1, "row_stride": dk * dv, "tier": binding.get("tier", "hbm"),
+                "source_ready": binding.get("ready"), "grant_ready": binding.get("grant"),
                 "decision_event": decision_event,
-                "last_use_event": ("next_decode_read" if commit
-                                   else "last_reader"),
+                "last_use_event": "next_decode_read" if commit else "last_reader",
             })
     return tuple(result)
 def _value_versions(values, targets, count):
@@ -772,15 +729,17 @@ def make_op(params, *, op_id="kda_recurrent", deps=(), requests=(), stage=0,
             state_generation=None):
     p = Params.parse(params)
     shape = (sum(p.lengths), p.heads, p.dk, p.dv)
+    spec_recover = bool(p.recover_ssm and any(q > 1 for q in p.lengths))
     metadata = {
         "kda_recurrent_params": dict(p.__dict__), "native_kind": "RecurrentKda",
         "implementation": IMPLEMENTATION, "source": SOURCE,
         "invocation_class": "vector", "program_kind": "recurrent_vector",
         "heads": p.heads, "key_heads": p.key_heads, "dk": p.dk, "dv": p.dv,
         "sequence_tokens": p.lengths, "state_dtype": p.state_dtype,
-        "state_mutation": "inplace_per_query_checkpoint",
+        "state_mutation": "recover_ssm_compact_record" if spec_recover else "inplace_per_query_checkpoint",
         "source_binding": "explicit_arch35_kernel_selection_not_binary_equivalence",
         "caller_materializations": "outside_selected_kernel",
+        **({"recover_ssm": True} if spec_recover else {}),
     }
     selection = resolve_state_selection(p.state_selection, p.lengths)
     if selection is not None:

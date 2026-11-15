@@ -11,6 +11,9 @@
 """
 from __future__ import annotations
 
+import base64
+import csv
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -18,11 +21,33 @@ import shutil
 import subprocess
 import sys
 import tempfile
-
-from pip._vendor.distlib.wheel import Wheel
+import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 NATIVE = ("c", "auto")
+
+
+def _verify_wheel(wheel: Path) -> None:
+    try:
+        from distlib.wheel import Wheel
+    except ModuleNotFoundError:
+        Wheel = None
+    if Wheel is not None:
+        Wheel(str(wheel)).verify()
+        return
+    with zipfile.ZipFile(wheel) as archive:
+        files = {n: archive.read(n) for n in archive.namelist() if not n.endswith("/")}
+    rec_name = next(n for n in files if n.endswith(".dist-info/RECORD"))
+    rows = list(csv.reader(files[rec_name].decode("utf-8").splitlines()))
+    assert {r[0] for r in rows} == set(files)
+    for name, digest, size in rows:
+        if name == rec_name:
+            assert digest == "" and size == ""
+            continue
+        algo, expected = digest.split("=", 1)
+        actual = base64.urlsafe_b64encode(
+            hashlib.new(algo, files[name]).digest()).rstrip(b"=").decode("ascii")
+        assert actual == expected and int(size) == len(files[name]), name
 
 def _wheel_env(base):
     env = dict(os.environ)
@@ -127,9 +152,8 @@ def test_r11_fixes_hold_on_the_installed_pep517_wheel():
     """The built wheel reproduces both R11 closures from its shipped sources."""
     base = Path(tempfile.mkdtemp(prefix="nr-s3-r11-wheel-"))
     try:
-        from pip._vendor.distlib.wheel import Wheel
         wheel = _wheel(base)
-        Wheel(str(wheel)).verify()
+        _verify_wheel(wheel)
         extract = base / "installed"
         install = subprocess.run(
             [sys.executable, "-B", "-m", "pip", "install", "--no-deps",

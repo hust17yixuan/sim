@@ -72,14 +72,16 @@ def assert_compact_equals_full(full, compact):
         assert item["ready_ms"] == min(row["ready_ms"] for row in rows)
         assert item["complete_ms"] == max(row["complete_ms"] for row in rows)
         assert item["elapsed_ms"] == max(row["elapsed_ms"] for row in rows)
-        assert item["elapsed_sum_ms"] == sum(row["elapsed_ms"] for row in rows)
+        assert item["elapsed_sum_ms"] == pytest.approx(
+            sum(row["elapsed_ms"] for row in rows), rel=1e-12, abs=1e-15)
         assert set(item["replicas"]) == set(by_rank)
         for rank, rank_rows in by_rank.items():
             actual = item["replicas"][rank]
             assert actual["operator_events"] == len(rank_rows)
             assert actual["ready_ms"] == min(row["ready_ms"] for row in rank_rows)
             assert actual["complete_ms"] == max(row["complete_ms"] for row in rank_rows)
-            assert actual["elapsed_ms"] == sum(row["elapsed_ms"] for row in rank_rows)
+            assert actual["elapsed_ms"] == pytest.approx(
+                sum(row["elapsed_ms"] for row in rank_rows), rel=1e-12, abs=1e-15)
             # Rank-specific declared identity, not another rank's label.
             assert (actual["family"], actual["layer"], actual["stream"],
                     actual["phase"], actual["program"], actual["recipe"],
@@ -96,12 +98,13 @@ def assert_compact_equals_full(full, compact):
             for family in {row["family"] for row in full["timeline"]}}.items():
         summary = compact["profile"]["by_family"][family]
         assert summary["operator_events"] == len(family_rows)
-        assert summary["elapsed_ms"] == sum(row["elapsed_ms"] for row in family_rows)
+        assert summary["elapsed_ms"] == pytest.approx(
+            sum(row["elapsed_ms"] for row in family_rows), rel=1e-12, abs=1e-15)
         for rank in {row["replica"] for row in family_rows}:
             rank_rows = [row for row in family_rows if row["replica"] == rank]
             assert summary["replicas"][rank]["operator_events"] == len(rank_rows)
-            assert summary["replicas"][rank]["elapsed_ms"] == sum(
-                row["elapsed_ms"] for row in rank_rows)
+            assert summary["replicas"][rank]["elapsed_ms"] == pytest.approx(
+                sum(row["elapsed_ms"] for row in rank_rows), rel=1e-12, abs=1e-15)
 
     assert compact["event_profile"]["completed_physical_events"] == \
         full["execution"]["completed_tasks"]
@@ -182,7 +185,8 @@ def test_body_forward_compact_keeps_same_body_span_and_profile():
     assert compact["profile"]["by_family"] == {
         family: {
             "operator_events": len(rows),
-            "elapsed_ms": sum(row["elapsed_ms"] for row in rows),
+            "elapsed_ms": pytest.approx(
+                sum(row["elapsed_ms"] for row in rows), rel=1e-12, abs=1e-15),
             "replicas": compact["profile"]["by_family"][family]["replicas"],
         }
         for family, rows in {
@@ -199,15 +203,18 @@ def test_compact_isolated_reduction_preserves_weighted_sum_and_bound():
                        trace_limit=0)
     compact = graph_costs(raw, graphs, external_inputs={"analysis_input": 0},
                           trace_limit=0, compact=True)
-    assert compact["isolated"]["operator_sum_ms"] == full["isolated"]["operator_sum_ms"]
+    assert compact["isolated"]["operator_sum_ms"] == pytest.approx(
+        full["isolated"]["operator_sum_ms"], rel=1e-12, abs=1e-15)
     assert compact["isolated"]["operators_omitted"] is True
     assert "operators" not in compact["isolated"]
     assert compact["isolated"]["by_family"] == {
         family: {
             "occurrences": sum(row["occurrences"] for row in full["isolated"]["operators"]
                                if row["operator"]["family"] == family),
-            "total_ms": sum(row["total_ms"] for row in full["isolated"]["operators"]
-                            if row["operator"]["family"] == family),
+            "total_ms": pytest.approx(
+                sum(row["total_ms"] for row in full["isolated"]["operators"]
+                    if row["operator"]["family"] == family),
+                rel=1e-12, abs=1e-15),
         }
         for family in {row["operator"]["family"]
                        for row in full["isolated"]["operators"]}

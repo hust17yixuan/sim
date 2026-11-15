@@ -10,7 +10,7 @@
 """
 from __future__ import annotations
 
-import signal
+import threading
 
 import pytest
 
@@ -25,18 +25,27 @@ from test_prediction_system import case, linear_work
 
 
 def _predict_bounded(case_obj, *, lower, timeout_s: int = 3):
-    def _on_alarm(_signum, _frame):
+    result: list[dict] = []
+    errors: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            result.append(predict(case_obj, lower=lower))
+        except TimeoutError as exc:
+            errors.append(exc)
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    worker.join(timeout=timeout_s)
+    if worker.is_alive():
         raise TimeoutError(
             f"predict() exceeded {timeout_s}s (Scheduler infinite loop under async_scheduling delayed KV release)"
         )
-
-    old_handler = signal.signal(signal.SIGALRM, _on_alarm)
-    signal.alarm(timeout_s)
-    try:
-        return predict(case_obj, lower=lower)
-    finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old_handler)
+    if errors:
+        raise errors[0]
+    return result[0]
 
 
 def test_memory_accounts_for_async_workspace_and_delayed_release_policy():

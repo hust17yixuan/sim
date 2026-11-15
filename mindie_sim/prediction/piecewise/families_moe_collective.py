@@ -1349,15 +1349,12 @@ def _compile_collective(ctx: CompiledOperator,
     wire = _frac(theta.find("wire_bytes", theta.find("bytes_per_token", 0.0)), 0.0)
     mtu = max(1, _int(theta.find("mtu_bytes"), DEFAULT_MTU))
     chunks = max(1, _int(theta.find("chunks"), 1))
-    boundary = str(theta.find("reduction_boundary", "") or "").strip().lower()
+    explicit_boundary = str(theta.find("reduction_boundary", "") or "").strip().lower()
+    boundary = explicit_boundary
     if not boundary:
         rec = str(theta.find("moe_recipe", theta.find("recipe", "")) or "").strip().lower()
         boundary = "token_rows" if rec in {"tp_join_reduce", "local_expert_reduce"} else ("expert_rows" if rec in {"alltoall", "mc2"} else "")
     is_etp = name == "etp_allreduce" or ctx.kind in {"F3", "routed_experts"}
-    if is_etp:
-        routed = boundary != "token_rows"
-    else:
-        routed = False
     sp_rows = str(theta.find("sp_rows", "") or "")
     phase_scope = str(theta.find("phase_scope", "") or "")
     if phase_scope not in {"", "prefill", "decode"}:
@@ -1369,6 +1366,16 @@ def _compile_collective(ctx: CompiledOperator,
         raise ModelingError(f"collective_row_binding_invalid:{row_binding}")
     if row_binding and sp_rows:
         raise ModelingError("collective_row_binding_excludes_sp_rows")
+    if kind == "alltoallv" and not row_binding and not sp_rows:
+        routed = (ctx.kind in {"F2", "moe_token_dispatcher"}
+                  or _int(theta.find("k", theta.find("top_k", 1)), 1) > 1)
+    elif is_etp:
+        routed = (False if boundary == "token_rows"
+                  else True if boundary == "expert_rows"
+                  else (_int(theta.find("ep", 1), 1) > 1
+                        and _moe_route_shape(ctx, theta)[1] > 1))
+    else:
+        routed = explicit_boundary == "expert_rows"
     if row_binding and routed:
         raise ModelingError("collective_row_binding_excludes_etp")
     route = _moe_route_shape(ctx, theta) if routed else None

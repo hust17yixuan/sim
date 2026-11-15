@@ -70,10 +70,12 @@ class RecoverSsmConfig:
     mamba_block_size: int = 0
     kv_block_size: int = 128
     swa_bounded_replay: bool = False
+    generic_backend: bool = False
 
     def __post_init__(self) -> None:
         for name in ("use_replayssm", "enable_prefix_caching",
-                     "enable_stochastic_rounding", "swa_bounded_replay"):
+                     "enable_stochastic_rounding", "swa_bounded_replay",
+                     "generic_backend"):
             strict_bool(name, getattr(self, name))
         for name in ("speculative_k", "pp", "dcp", "pcp", "tp",
                      "mamba_block_size", "kv_block_size"):
@@ -114,11 +116,10 @@ class RecoverSsmConfig:
         """Whether this configuration executes the GLM AscendC KDA kernel.
 
         The ``K + 1 <= 7`` token cap lives in the GLM KDA constructor
-        (``models/glm5next/kda.py:266-276``), not in generic standard
-        linear-state mathematics.  It therefore applies to RecoverSSM
-        execution or a GLM model type, never to a generic standard path.
+        (``models/glm5next/kda.py:266-276``), not in generic rank-1 associative
+        linear-state mathematics (GDN, Mamba, GLA, DeltaNet, RetNet, Lightning).
         """
-        return bool(self.use_replayssm or self.model_type in GLM_MODEL_TYPES)
+        return bool(self.model_type in GLM_MODEL_TYPES)
 
     @property
     def speculative_window(self) -> int:
@@ -169,17 +170,19 @@ class RecoverSsmValidation:
 
 @typed_inputs
 def validate_recoverssm(config: RecoverSsmConfig, *,
-                        strict: bool = False) -> RecoverSsmValidation:
+                        strict: bool = False,
+                        allow_generic_model: bool = False) -> RecoverSsmValidation:
     """Replicate ``validate_glm_recoverssm`` with explicit diagnostic codes."""
     if not isinstance(config, RecoverSsmConfig):
         raise ModelingError("linear_state_recoverssm_config_invalid")
     strict_bool("strict", strict, reason="linear_state")
+    strict_bool("allow_generic_model", allow_generic_model, reason="linear_state")
     expected = config.expected_cache_mode
     model_is_glm = config.model_type in GLM_MODEL_TYPES
     active = config.use_replayssm
     codes: list[str] = []
     if active:
-        if not model_is_glm:
+        if not model_is_glm and not config.generic_backend and not allow_generic_model:
             codes.append("recoverssm_requires_glm5_next_model")
         if config.speculative_k < 1:
             codes.append("recoverssm_requires_speculative_decoding")

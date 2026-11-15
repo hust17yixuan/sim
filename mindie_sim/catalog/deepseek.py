@@ -180,6 +180,12 @@ def _aux_deepseek(c: Mapping[str, Any], *, v41: bool, d: Mapping[str, Any]) -> A
     layers = len(targets) if targets else nextn
     if layers <= 0:
         return AuxiliarySpec()
+    body_layers = int(_require(c, "num_hidden_layers"))
+    ratios = [int(v) for v in (c.get("compress_ratios") or ())]
+    draft_ratios = (
+        tuple(ratios[body_layers : body_layers + layers])
+        if len(ratios) >= body_layers + layers else ()
+    )
     # The native V4.1 MTP module is the DSpark module: it uses
     # dspark_n_routed_experts, not an additional ordinary E384 branch.
     draft_experts = _int(c, "dspark_n_routed_experts", experts) if v41 else experts
@@ -196,6 +202,8 @@ def _aux_deepseek(c: Mapping[str, Any], *, v41: bool, d: Mapping[str, Any]) -> A
         expert_intermediate_size=moe_i,
         num_shared_experts=shared if draft_experts else 0,
         target_layer_ids=targets or tuple(range(max(0, layers))),
+        draft_compress_ratios=draft_ratios,
+        sliding_window=_int(c, "sliding_window", 0),
         block_size=max(1, block), markov_rank=markov,
         confidence_enabled=bool(markov),
         confidence_executes=False,

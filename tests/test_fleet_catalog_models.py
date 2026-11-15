@@ -27,12 +27,17 @@ import builtins
 from dataclasses import replace
 import ipaddress
 import json
+import os
 import re
+import sys
 from pathlib import Path
 
 import pytest
 
 try:  # Imported before the offline-root fixture scans installed distributions.
+    _dh = sys.modules.get("_distutils_hack")
+    if _dh is not None and hasattr(_dh, "DISTUTILS_FINDER"):
+        _dh.DISTUTILS_FINDER.__dict__.pop("spec_for_distutils", None)
     from setuptools.command.build_py import build_py as _build_py
     from setuptools.dist import Distribution as _Distribution
 except ModuleNotFoundError:  # pragma: no cover - minimal offline test envs
@@ -106,10 +111,18 @@ SPARSE_LAYERS = {
 }
 
 
-def _forbid(path: object) -> None:
-    text = str(path)
-    if text.startswith(("/Volumes/data", "/private/Volumes/data")):
-        raise AssertionError(f"offline_catalog_read_attempted:{text}")
+_RESOLVED_ROOT = ROOT.resolve()
+
+
+def _forbid(path: object, extra_roots: tuple[Path, ...] = ()) -> None:
+    if not isinstance(path, (str, os.PathLike)):
+        return
+    resolved = Path(path).resolve(strict=False)
+    if any(resolved.is_relative_to(root) for root in (_RESOLVED_ROOT, *extra_roots)):
+        return
+    for candidate in (str(path), str(resolved)):
+        if candidate.startswith(("/Volumes/data", "/private/Volumes/data")):
+            raise AssertionError(f"offline_catalog_read_attempted:{path}")
 
 
 @pytest.fixture(autouse=True)
@@ -117,18 +130,19 @@ def _isolated_offline_roots(monkeypatch, tmp_path):
     for name in ("MINDIE_CONFIG_HOME", "MINDIE_DATA_HOME",
                  "MINDIE_DIAGNOSTICS_ROOT", "HOME"):
         monkeypatch.setenv(name, str(tmp_path / name.lower()))
+    allowed = (tmp_path.resolve(strict=False),)
     real_read_text, real_open, real_path_open = Path.read_text, builtins.open, Path.open
 
     def guarded_read_text(self, *args, **kwargs):
-        _forbid(self)
+        _forbid(self, allowed)
         return real_read_text(self, *args, **kwargs)
 
     def guarded_open(file, *args, **kwargs):
-        _forbid(file)
+        _forbid(file, allowed)
         return real_open(file, *args, **kwargs)
 
     def guarded_path_open(self, *args, **kwargs):
-        _forbid(self)
+        _forbid(self, allowed)
         return real_path_open(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "read_text", guarded_read_text)

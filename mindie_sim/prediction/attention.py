@@ -596,5 +596,9 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                            candidate_id=candidate_id)
 
 
-ATTENTION_BUILDERS = {"gqa": gqa, "mla": mla, "gdn": linear, "kda": linear,
-                      "projection_only": projection_only, "unmodeled": unmodeled}
+ATTENTION_BUILDERS = {
+    "gqa": gqa, "mla": mla, "gdn": linear, "kda": linear,
+    "mamba": linear, "gla": linear, "deltanet": linear,
+    "lightning": linear, "retnet": linear,
+    "projection_only": projection_only, "unmodeled": unmodeled,
+}

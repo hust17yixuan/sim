@@ -358,7 +358,7 @@ def _validate_nested(value, path, seen=None):
                         minimum = 1
                     if item < minimum:
                         raise ModelingError(f"nr_s7_{label}_invalid:range")
-                if name in {"attention", "attention_kind"} and item not in {"mla", "gqa", "mha", "mqa", "dsa", "swa", "csa", "csa2", "hca", "kda", "gdn", "mamba", "projection_only", "unmodeled"}:
+                if name in {"attention", "attention_kind"} and item not in {"mla", "gqa", "mha", "mqa", "dsa", "swa", "csa", "csa2", "hca", "kda", "gdn", "mamba", "gla", "deltanet", "lightning", "retnet", "projection_only", "unmodeled"}:
                     raise ModelingError(f"nr_s7_{label}_invalid:kind")
             if "Software" in owner_kinds:
                 if type(item) is int and item < 1:

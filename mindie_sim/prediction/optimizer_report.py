@@ -12,7 +12,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
-import resource
+try:
+    import resource
+except ImportError:  # pragma: no cover - Windows has no POSIX resource module
+    resource = None  # type: ignore[assignment]
+import sys
 import time
 
 from mindie_sim.prediction.engine_plan import (
@@ -24,11 +28,13 @@ MAX_PEAK_BYTES = 512 * 1024 * 1024
 
 
 def _peak_rss_bytes() -> int:
+    if resource is None:
+        return 0
     try:
         value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     except (AttributeError, ValueError):
         return 0
-    return int(value if value > 10**7 else value * 1024)
+    return int(value if sys.platform == "darwin" else value * 1024)
 
 
 @dataclass
@@ -37,6 +43,7 @@ class Budget:
     total: int = 128
     wall_s: float = 30.0
     started: float = field(default_factory=time.monotonic)
+    started_rss: int = field(default_factory=_peak_rss_bytes)
     used_total: int = 0
     used_pass: int = 0
     exhausted: bool = False
@@ -48,18 +55,21 @@ class Budget:
     def wall_exceeded(self) -> bool:
         return time.monotonic() - self.started > self.wall_s
 
+    def rss_exceeded(self) -> bool:
+        return _peak_rss_bytes() - self.started_rss > MAX_PEAK_BYTES
+
     def can_evaluate(self) -> bool:
         if self.used_total >= self.total or self.used_pass >= self.per_pass:
             self.exhausted = True
             return False
-        if self.wall_exceeded() or _peak_rss_bytes() > MAX_PEAK_BYTES:
+        if self.wall_exceeded() or self.rss_exceeded():
             self.exhausted = True
             return False
         return True
 
     def can_discover(self) -> bool:
         """Bound discovery even when no evaluation is charged for a candidate."""
-        if self.wall_exceeded() or _peak_rss_bytes() > MAX_PEAK_BYTES:
+        if self.wall_exceeded() or self.rss_exceeded():
             self.exhausted = True
             return False
         return True

@@ -304,14 +304,15 @@ class NativeCallBinding:
 
 
 def _kernel_evidence(kernels):
-    """Positive evidence count controls partial: zero resolved never binds."""
-    resolved = [row.get("evidence") for row in kernels
-                if row.get("evidence") in _POSITIVE_EVIDENCE]
-    if not resolved:
+    """Zero evidenced kernels stay unresolved; mixed or binary-only is partial."""
+    if not kernels:
         return "unresolved"
-    if len(resolved) < len(kernels):
-        return "partial"
-    return "established" if all(ev == "established" for ev in resolved) else "source_declared"
+    evidences = [row.get("evidence") for row in kernels]
+    if all(ev in (None, "", "unresolved") for ev in evidences):
+        return "unresolved"
+    if all(ev in _POSITIVE_EVIDENCE for ev in evidences):
+        return "established" if all(ev == "established" for ev in evidences) else "source_declared"
+    return "partial"
 
 
 def _evidence(api, source, kernels, core):

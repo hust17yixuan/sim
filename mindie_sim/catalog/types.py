@@ -238,51 +238,34 @@ class QuantSpec:
     })
 
     def linear_method(self, category: str) -> str:
-        """Authoritative runtime linear method for one resolved role.
-
-        MX requires both E8M0 (or ue8m0) weight scales in blocks of 32 and
-        group-32 dynamic activation scales.  A regular FP8/INT8 row, even at
-        group 32 with BF16/FP32 scales, is not MX.
-        """
+        """Authoritative runtime linear method for one resolved role."""
         resolved = self.for_category(category)
         wf = str(resolved.weight_format or "").lower().replace("-", "_")
         af = str(resolved.activation_format or "").lower().replace("-", "_")
         sf = str(resolved.scale_format or "").lower().replace("-", "_")
         block = resolved.weight_block
         group = int(block[1] if isinstance(block, (tuple, list)) and len(block) > 1 else 0)
-        act_group = int(resolved.activation_group_size or 0)
-        mx_scale = sf in {"fp8_e8m0", "ue8m0"} and group == 32 and act_group == 32
+        mx_scale = sf in {"fp8_e8m0", "ue8m0"} and group == 32 and int(resolved.activation_group_size or 0) == 32
         if mx_scale and wf in {"mxfp4", "mx_fp4", "mxfp4_e2m1"}:
             return "mx_fp4"
-        if mx_scale and wf in {"mxfp8", "mx_fp8", "mxfp8_e4m3",
-                               "fp8_e4m3", "fp8_e5m2"} and af in {
-                                   "mxfp8", "mx_fp8", "mxfp8_e4m3",
-                                   "fp8_e4m3", "fp8_e5m2"}:
+        if mx_scale and wf in {"mxfp8", "mx_fp8", "mxfp8_e4m3", "fp8_e4m3", "fp8_e5m2"} and af in {
+                "mxfp8", "mx_fp8", "mxfp8_e4m3", "fp8_e4m3", "fp8_e5m2"}:
             return "mx_fp8"
         if wf in {"int8", "w8a8"} or af in {"int8"}:
             return "w8a8"
         if wf in {"int4", "w4a8", "int4_weight"}:
             return "w4a8"
-        if wf in {"fp8", "fp8_e4m3", "fp8_e5m2"}:
-            return "fp8"
-        return "dense"
+        return "fp8" if wf in {"fp8", "fp8_e4m3", "fp8_e5m2"} else "dense"
 
-    def output_format_for(self, category: str, default: str = "",
-                          *, prequant: str = "") -> str:
+    def output_format_for(self, category: str, default: str = "", *, prequant: str = "") -> str:
         resolved = self.for_category(category)
         if resolved.output_format:
             return resolved.output_format
-        method = resolved.linear_method(category)
-        if method in self._MX_METHODS:
+        if resolved.linear_method(category) in self._MX_METHODS:
             return prequant or resolved.native_format or default
-        # A 4-bit payload is dequantized before the output epilogue; no linear
-        # result is stored as MXFP4/FP4/INT4.  Without this declaration the
-        # matrix program fell back to the low-precision activation format,
-        # undercounting the written result (and mislabeling its ABI).
         if str(resolved.format_for(category)).lower() in self._FOUR_BIT_WEIGHT_FORMATS:
             return prequant or resolved.native_format or default
         return default
-
 
     def format_for(self, category: str, *, source: bool = False) -> str:
         resolved = self.for_category(category)
@@ -291,11 +274,7 @@ class QuantSpec:
         cat = str(category)
         family = cat.split(".", 1)[0]
         if source and family == "norm" and self.norm_gamma_declared("norm"):
-            # Source/theory query only; resident ``format_for("norm")`` stays
-            # on the actual selected kernel format.
             return self.norm_gamma_format("norm", source=True)
-        # Native source FP32 categories are never downgraded by a vector/gate
-        # exclusion.  Exclusions describe "do not quantize", not "cast to BF16".
         if family in _FP32_CATEGORIES:
             return "fp32"
         if family in {"conv_weight_bf16", "linear_param_bf16"}:
@@ -304,20 +283,17 @@ class QuantSpec:
             return self.native_format
         if cat == "mla_absorb":
             return self.format_for("mla", source=source)
-        cat = family
-        if cat in _BF16_CATEGORIES:
+        if family in _BF16_CATEGORIES:
             return self.native_format
-        if cat == "conv_weight_f32":
-            return "fp32"
-        if cat in _EXPERT_CATEGORIES:
+        if family in _EXPERT_CATEGORIES:
             return self.expert_weight_format
-        if cat in _SHARED_CATEGORIES:
+        if family in _SHARED_CATEGORIES:
             return "bf16" if self.weight_format == "bf16" else self.weight_format
-        if cat in _FP8_CATEGORIES:
+        if family in _FP8_CATEGORIES:
             return self.weight_format
-        if cat == "engram_table":
+        if family == "engram_table":
             return self.engram_table_format
-        if cat == "norm_f32":
+        if family == "norm_f32":
             return "fp32"
         return self.weight_format if self.weight_format != "bf16" else "bf16"
 
@@ -333,34 +309,18 @@ class QuantSpec:
             return "bf16"
         if cat == "engram_table":
             return "fp8_e4m3" if self.weight_format != "bf16" else "bf16"
-        if cat == "engram_gate":
-            return self.weight_format if self.weight_format != "bf16" else "bf16"
-        if cat == "dspark_input":
-            return self.weight_format if self.weight_format != "bf16" else "bf16"
-        if cat == "engram_table":
+        if cat in {"engram_gate", "dspark_input"}:
             return self.weight_format if self.weight_format != "bf16" else "bf16"
         return self.format_for(cat, source=True)
 
     def norm_gamma_declared(self, role: str = "norm") -> bool:
-        """Whether a fixed norm role has an explicit stored/runtime declaration."""
         role = str(role)
-        storage = dict(self.norm_storage)
-        runtime = dict(self.norm_runtime)
+        storage, runtime = dict(self.norm_storage), dict(self.norm_runtime)
         if role in storage or role in runtime:
             return True
-        return role in _NORM_GENERIC_ROLES and (
-            "norm" in storage or "norm" in runtime)
+        return role in _NORM_GENERIC_ROLES and ("norm" in storage or "norm" in runtime)
 
     def norm_gamma_format(self, role: str = "norm", *, source: bool = False) -> str:
-        """Checkpoint or selected-kernel gamma format for one fixed norm role.
-
-        A runtime declaration is the actual loaded/kernel gamma format.  A
-        checkpoint-only declaration never upgrades the runtime: absent an
-        explicit runtime ABI the selected kernel keeps the model's native
-        format (BF16 for the signed GLM RmsNorm/AddRmsNormBias ABI).  The
-        generic ``norm`` key covers layer norms (attention/FFN/KV-A/Q-A/
-        indexer/final), never shared-head/Engram/hyper-connection norms.
-        """
         role = str(role)
         table = dict(self.norm_storage if source else self.norm_runtime)
         if role in table:
@@ -369,10 +329,8 @@ class QuantSpec:
             return table["norm"]
         return self.native_format or "bf16"
 
-    def norm_gamma_bytes(self, width: int, role: str = "norm", *,
-                         source: bool = False) -> float:
-        return float(int(width)) * float(
-            dtype_bytes(self.norm_gamma_format(role, source=source)))
+    def norm_gamma_bytes(self, width: int, role: str = "norm", *, source: bool = False) -> float:
+        return float(int(width)) * float(dtype_bytes(self.norm_gamma_format(role, source=source)))
 
     def execution_weight_scale_format(self) -> str:
         return self.runtime_weight_scale_format or self.scale_format
@@ -489,43 +447,28 @@ class QuantSpec:
 
     @property
     def engram_table_format(self) -> str:
-        mode = self.engram_table_mode
-        if mode == "device_bf16":
+        if self.engram_table_mode == "device_bf16":
             return "bf16"
-        if mode == "device_int8_fp32":
-            return "int8"
-        return "fp8_e4m3"
+        return "int8" if self.engram_table_mode == "device_int8_fp32" else "fp8_e4m3"
 
     def logical_parameters(self, rows: int, cols: int) -> int:
         return int(rows) * int(cols)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "name": self.name, "weight_format": self.weight_format,
-            "native_format": self.native_format,
-            "int8_weight_metadata": self.int8_weight_metadata,
-            "activation_format": self.activation_format,
-            "expert_weight_format": self.expert_weight_format,
-            "weight_block": list(self.weight_block),
-            "expert_block": self.expert_block,
-            "scale_format": self.scale_format, "scale_bytes": self.scale_bytes,
-            "kv_dtype": self.kv_dtype, "index_dtype": self.index_dtype,
-            "index_scale_dtype": self.index_scale_dtype,
-            "exclusions": list(self.exclusions),
-            "engram_table_mode": self.engram_table_mode,
-            "activation_group_size": self.activation_group_size,
-            "activation_scale_format": self.activation_scale_format,
-            "activation_scale_pack": self.activation_scale_pack,
-            "runtime_weight_scale_format": self.runtime_weight_scale_format,
+            "name": self.name, "weight_format": self.weight_format, "native_format": self.native_format,
+            "int8_weight_metadata": self.int8_weight_metadata, "activation_format": self.activation_format,
+            "expert_weight_format": self.expert_weight_format, "weight_block": list(self.weight_block),
+            "expert_block": self.expert_block, "scale_format": self.scale_format, "scale_bytes": self.scale_bytes,
+            "kv_dtype": self.kv_dtype, "index_dtype": self.index_dtype, "index_scale_dtype": self.index_scale_dtype,
+            "exclusions": list(self.exclusions), "engram_table_mode": self.engram_table_mode,
+            "activation_group_size": self.activation_group_size, "activation_scale_format": self.activation_scale_format,
+            "activation_scale_pack": self.activation_scale_pack, "runtime_weight_scale_format": self.runtime_weight_scale_format,
             "runtime_weight_scale_bytes": self.runtime_weight_scale_bytes,
             "runtime_activation_scale_format": self.runtime_activation_scale_format,
-            "runtime_int8_weight_metadata": self.runtime_int8_weight_metadata,
-            "output_format": self.output_format,
-            "norm_storage": {role: fmt for role, fmt in self.norm_storage},
-            "norm_runtime": {role: fmt for role, fmt in self.norm_runtime},
-            "category_overrides": {
-                category: dict(fields) for category, fields in self.category_overrides
-            },
+            "runtime_int8_weight_metadata": self.runtime_int8_weight_metadata, "output_format": self.output_format,
+            "norm_storage": dict(self.norm_storage), "norm_runtime": dict(self.norm_runtime),
+            "category_overrides": {cat: dict(fields) for cat, fields in self.category_overrides},
             "source": dict(self.source), "notes": list(self.notes),
         }
 
@@ -566,59 +509,41 @@ class VisionSpec:
 
     @property
     def query_width(self) -> int:
-        """Single-Q projection width; packed QKV rows are three times this."""
         return self.qkv_width // 3
 
     @property
     def head_dim(self) -> int:
-        if self.num_heads <= 0 or self.qkv_width <= 0:
-            return 0
-        return self.query_width // self.num_heads
+        return 0 if self.num_heads <= 0 or self.qkv_width <= 0 else self.query_width // self.num_heads
 
     def merged_tokens(self, patch_tokens: int) -> int:
         return max(1, int(math.ceil(int(patch_tokens) / max(1, self.merge_area))))
 
     def patch_tokens_for_media(self, media_tokens: int) -> int:
-        """Media tokens are post-merge text positions; return pre-merge patches."""
         return max(1, int(media_tokens) * max(1, self.merge_area))
 
     def validate(self) -> None:
         for name, value in (
-            ("layers", self.layers), ("hidden_size", self.hidden_size),
-            ("intermediate_size", self.intermediate_size),
-            ("num_heads", self.num_heads), ("qkv_width", self.qkv_width),
-            ("patch_size", self.patch_size), ("merge_area", self.merge_area),
-            ("out_hidden_size", self.out_hidden_size),
+            ("layers", self.layers), ("hidden_size", self.hidden_size), ("intermediate_size", self.intermediate_size),
+            ("num_heads", self.num_heads), ("qkv_width", self.qkv_width), ("patch_size", self.patch_size),
+            ("merge_area", self.merge_area), ("out_hidden_size", self.out_hidden_size),
         ):
             if int(value) <= 0:
                 raise ModelingError(f"catalog_vision_field_invalid:{name}")
         if self.qkv_width % 3 != 0 or self.query_width % self.num_heads != 0:
-            raise ModelingError(
-                f"catalog_vision_qkv_not_divisible:{self.qkv_width}%3/"
-                f"{self.query_width}%{self.num_heads}"
-            )
+            raise ModelingError(f"catalog_vision_qkv_not_divisible:{self.qkv_width}%3/{self.query_width}%{self.num_heads}")
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "kind": self.kind, "layers": self.layers,
-            "hidden_size": self.hidden_size,
-            "intermediate_size": self.intermediate_size,
-            "num_heads": self.num_heads, "head_dim": self.head_dim,
-            "query_width": self.query_width,
-            "qkv_width": self.qkv_width, "qkv_packed_rows": self.qkv_width,
-            "patch_size": self.patch_size,
-            "in_channels": self.in_channels, "temporal_patch": self.temporal_patch,
+            "kind": self.kind, "layers": self.layers, "hidden_size": self.hidden_size,
+            "intermediate_size": self.intermediate_size, "num_heads": self.num_heads, "head_dim": self.head_dim,
+            "query_width": self.query_width, "qkv_width": self.qkv_width, "qkv_packed_rows": self.qkv_width,
+            "patch_size": self.patch_size, "in_channels": self.in_channels, "temporal_patch": self.temporal_patch,
             "merge_area": self.merge_area, "downsample_ratio": self.downsample_ratio,
-            "out_hidden_size": self.out_hidden_size,
-            "aligner_hidden_size": self.aligner_hidden_size,
-            "aligner_input_width": self.aligner_input_width,
-            "patch_input_width": self.patch_input_width,
-            "pos_embed_tokens": self.pos_embed_tokens,
-            "deepstack": self.deepstack, "gated_mlp": self.gated_mlp,
-            "activation": self.activation, "norm_type": self.norm_type,
-            "norm_eps": self.norm_eps, "bias": self.bias,
-            "image_token_id": self.image_token_id,
-            "video_token_id": self.video_token_id,
+            "out_hidden_size": self.out_hidden_size, "aligner_hidden_size": self.aligner_hidden_size,
+            "aligner_input_width": self.aligner_input_width, "patch_input_width": self.patch_input_width,
+            "pos_embed_tokens": self.pos_embed_tokens, "deepstack": self.deepstack, "gated_mlp": self.gated_mlp,
+            "activation": self.activation, "norm_type": self.norm_type, "norm_eps": self.norm_eps,
+            "bias": self.bias, "image_token_id": self.image_token_id, "video_token_id": self.video_token_id,
             "source": dict(self.source),
         }
 
@@ -655,6 +580,9 @@ class DraftSpec:
     expert_intermediate_size: int = 0
     num_shared_experts: int = 0
     target_layer_ids: tuple[int, ...] = ()
+    draft_compress_ratios: tuple[int, ...] = ()
+    sliding_window: int = 0
+    index_share_for_mtp_iteration: bool = False
     block_size: int = 1
     markov_rank: int = 0
     confidence_enabled: bool = False
@@ -674,11 +602,21 @@ class DraftSpec:
     source: tuple[tuple[str, str], ...] = ()
     notes: tuple[str, ...] = ()
 
+    def __post_init__(self) -> None:
+        for key in ("target_layer_ids", "draft_compress_ratios", "pp_capability"):
+            raw = getattr(self, key)
+            if isinstance(raw, (list, tuple)) and not isinstance(raw, tuple):
+                object.__setattr__(self, key, tuple(int(v) for v in raw))
+        if isinstance(self.notes, list):
+            object.__setattr__(self, "notes", tuple(str(v) for v in self.notes))
+        if isinstance(self.source, Mapping):
+            object.__setattr__(self, "source", tuple(sorted((str(k), str(v)) for k, v in self.source.items())))
+        elif isinstance(self.source, list):
+            object.__setattr__(self, "source", tuple((str(k), str(v)) for k, v in self.source))
+
     @property
     def input_width(self) -> int:
-        if self.kind in {"dspark", "mtp_dspark"} and self.target_layer_ids:
-            return int(len(self.target_layer_ids) * self.hidden_size)
-        if self.kind == "standalone_draft" and self.target_layer_ids:
+        if self.kind in {"dspark", "mtp_dspark", "standalone_draft"} and self.target_layer_ids:
             return int(len(self.target_layer_ids) * self.hidden_size)
         return int(2 * self.hidden_size)
 
@@ -692,10 +630,8 @@ class DraftSpec:
 
     def validate(self) -> None:
         for name, value in (
-            ("layers", self.layers), ("hidden_size", self.hidden_size),
-            ("intermediate_size", self.intermediate_size),
-            ("num_heads", self.num_heads), ("num_kv_heads", self.num_kv_heads),
-            ("head_dim", self.head_dim),
+            ("layers", self.layers), ("hidden_size", self.hidden_size), ("intermediate_size", self.intermediate_size),
+            ("num_heads", self.num_heads), ("num_kv_heads", self.num_kv_heads), ("head_dim", self.head_dim),
         ):
             if int(value) <= 0:
                 raise ModelingError(f"catalog_draft_field_invalid:{name}")
@@ -710,42 +646,30 @@ class DraftSpec:
         if self.confidence_enabled:
             expected = self.hidden_size + self.markov_rank
             if self.confidence_input_width not in {0, expected}:
-                raise ModelingError(
-                    f"catalog_dspark_confidence_width_invalid:{self.confidence_input_width}!={expected}"
-                )
+                raise ModelingError(f"catalog_dspark_confidence_width_invalid:{self.confidence_input_width}!={expected}")
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "kind": self.kind, "layers": self.layers,
-            "hidden_size": self.hidden_size,
-            "intermediate_size": self.intermediate_size,
-            "attention_kind": self.attention_kind,
-            "num_heads": self.num_heads, "num_kv_heads": self.num_kv_heads,
-            "head_dim": self.head_dim, "q_width": self.q_width,
-            "kv_width": self.kv_width, "q_lora_rank": self.q_lora_rank,
-            "kv_lora_rank": self.kv_lora_rank,
-            "qk_nope_head_dim": self.qk_nope_head_dim,
-            "qk_rope_head_dim": self.qk_rope_head_dim,
-            "v_head_dim": self.v_head_dim, "o_lora_rank": self.o_lora_rank,
-            "o_groups": self.o_groups, "num_experts": self.num_experts,
-            "top_k": self.top_k,
-            "expert_intermediate_size": self.expert_intermediate_size,
-            "num_shared_experts": self.num_shared_experts,
-            "target_layer_ids": list(self.target_layer_ids),
+            "kind": self.kind, "layers": self.layers, "hidden_size": self.hidden_size,
+            "intermediate_size": self.intermediate_size, "attention_kind": self.attention_kind,
+            "num_heads": self.num_heads, "num_kv_heads": self.num_kv_heads, "head_dim": self.head_dim,
+            "q_width": self.q_width, "kv_width": self.kv_width, "q_lora_rank": self.q_lora_rank,
+            "kv_lora_rank": self.kv_lora_rank, "qk_nope_head_dim": self.qk_nope_head_dim,
+            "qk_rope_head_dim": self.qk_rope_head_dim, "v_head_dim": self.v_head_dim,
+            "o_lora_rank": self.o_lora_rank, "o_groups": self.o_groups, "num_experts": self.num_experts,
+            "top_k": self.top_k, "expert_intermediate_size": self.expert_intermediate_size,
+            "num_shared_experts": self.num_shared_experts, "target_layer_ids": list(self.target_layer_ids),
+            "draft_compress_ratios": list(self.draft_compress_ratios), "sliding_window": self.sliding_window,
+            "index_share_for_mtp_iteration": self.index_share_for_mtp_iteration,
             "block_size": self.block_size, "markov_rank": self.markov_rank,
-            "confidence_enabled": self.confidence_enabled,
-            "confidence_executes": self.confidence_executes,
+            "confidence_enabled": self.confidence_enabled, "confidence_executes": self.confidence_executes,
             "confidence_input_width": self.confidence_input_width,
             "target_shared_embedding": self.target_shared_embedding,
-            "target_shared_lm_head": self.target_shared_lm_head,
-            "base_logits": self.base_logits,
-            "markov_replicated": self.markov_replicated,
-            "noncausal_query_block": self.noncausal_query_block,
-            "pp_capability": list(self.pp_capability),
-            "input_width": self.input_width,
-            "proposal_tokens": self.proposal_tokens,
-            "vocab_size": self.vocab_size, "activation_dtype": self.activation_dtype,
-            "source": dict(self.source), "notes": list(self.notes),
+            "target_shared_lm_head": self.target_shared_lm_head, "base_logits": self.base_logits,
+            "markov_replicated": self.markov_replicated, "noncausal_query_block": self.noncausal_query_block,
+            "pp_capability": list(self.pp_capability), "input_width": self.input_width,
+            "proposal_tokens": self.proposal_tokens, "vocab_size": self.vocab_size,
+            "activation_dtype": self.activation_dtype, "source": dict(self.source), "notes": list(self.notes),
         }
 
 
@@ -760,9 +684,8 @@ class EngramTableSpec:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "layer_id": self.layer_id, "table_id": self.table_id,
-            "rows": self.rows, "width": self.width,
-            "source_dtype": self.source_dtype, "scale_dtype": self.scale_dtype,
+            "layer_id": self.layer_id, "table_id": self.table_id, "rows": self.rows,
+            "width": self.width, "source_dtype": self.source_dtype, "scale_dtype": self.scale_dtype,
         }
 
 
@@ -814,31 +737,23 @@ class EngramSpec:
     def table_storage_bytes(self, *, source: bool = False, node_rows: int | None = None) -> float:
         total = 0.0
         for table in self.tables:
-            rows = table.rows
-            if node_rows is not None and node_rows > 1:
-                rows = int(math.ceil(rows / node_rows))
-            if source:
+            rows = int(math.ceil(table.rows / node_rows)) if node_rows is not None and node_rows > 1 else table.rows
+            if source or self.storage_mode not in {"device_bf16", "device_int8_fp32"}:
                 total += rows * (table.width + _ceil_div(table.width, 32))
             elif self.storage_mode == "device_bf16":
                 total += rows * table.width * 2
-            elif self.storage_mode == "device_int8_fp32":
-                total += rows * (table.width + _ceil_div(table.width, 32) * 4)
             else:
-                total += rows * (table.width + _ceil_div(table.width, 32))
+                total += rows * (table.width + _ceil_div(table.width, 32) * 4)
         return float(total)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "tables": [table.to_dict() for table in self.tables],
             "max_ngram": self.max_ngram, "heads": self.heads, "width": self.width,
-            "columns_per_table": self.columns_per_table,
-            "lookups_per_token_per_table": self.lookups_per_token_per_table,
-            "lookups_per_token": self.lookups_per_token,
-            "pad_token_id": self.pad_token_id, "no_dedup": self.no_dedup,
+            "columns_per_table": self.columns_per_table, "lookups_per_token_per_table": self.lookups_per_token_per_table,
+            "lookups_per_token": self.lookups_per_token, "pad_token_id": self.pad_token_id, "no_dedup": self.no_dedup,
             "storage_mode": self.storage_mode, "row_bytes": self.row_bytes,
-            "host_response_bytes": self.host_response_bytes,
-            "id_bytes": self.id_bytes,
-            "source": dict(self.source),
+            "host_response_bytes": self.host_response_bytes, "id_bytes": self.id_bytes, "source": dict(self.source),
         }
 
 
@@ -856,31 +771,22 @@ class AuxiliarySpec:
     def enabled_draft(self, mode: str) -> DraftSpec | None:
         if mode in {"dspark", "verify", "draft_verify"}:
             return self.dspark or self.mtp
-        if mode in {"mtp", "draft"}:
-            return self.mtp or self.dspark
-        return None
+        return (self.mtp or self.dspark) if mode in {"mtp", "draft"} else None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "mtp": self.mtp.to_dict() if self.mtp else None,
             "dspark": self.dspark.to_dict() if self.dspark else None,
-            "external_draft_key": self.external_draft_key,
-            "standalone_draft": self.standalone_draft,
-            "include_vision_weights": self.include_vision_weights,
-            "notes": list(self.notes),
+            "external_draft_key": self.external_draft_key, "standalone_draft": self.standalone_draft,
+            "include_vision_weights": self.include_vision_weights, "notes": list(self.notes),
         }
 
 
-def merge_source(
-    base: Mapping[str, Any], extra: Mapping[str, Any] | None = None,
-) -> tuple[tuple[str, str], ...]:
+def merge_source(base: Mapping[str, Any], extra: Mapping[str, Any] | None = None) -> tuple[tuple[str, str], ...]:
     items = {str(k): str(v) for k, v in dict(base).items() if v is not None}
     if extra:
         items.update({str(k): str(v) for k, v in dict(extra).items() if v is not None})
     return tuple(sorted(items.items()))
 
 
-__all__ = [
-    "QuantSpec", "VisionSpec", "DraftSpec", "EngramTableSpec", "EngramSpec",
-    "AuxiliarySpec", "merge_source",
-]
+__all__ = ["QuantSpec", "VisionSpec", "DraftSpec", "EngramTableSpec", "EngramSpec", "AuxiliarySpec", "merge_source"]

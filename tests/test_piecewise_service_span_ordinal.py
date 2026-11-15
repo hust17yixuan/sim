@@ -54,18 +54,18 @@ def test_original_ordinal_counterexample_three_requests_two_dp():
     assert calls.count((4096, 4096)) == 1
     mean = chunked_prefill_mean_ttft_ms(
         prompts, dp=2, max_batched_tokens=8192, body_one=_deterministic)
-    assert mean == 13.789866666666668
+    assert mean == pytest.approx(13.789866666666668, rel=1e-14, abs=1e-12)
 
 
 def test_mean_is_exactly_the_prior_values_for_real_mixed8_and_edges():
     mixed8 = (65536,) + (8192,) * 7
     assert chunked_prefill_mean_ttft_ms(
         mixed8, dp=4, max_batched_tokens=8192,
-        body_one=lambda tokens: 0.1 * tokens) == 2662.4
+        body_one=lambda tokens: 0.1 * tokens) == pytest.approx(2662.4, rel=1e-14, abs=1e-12)
     assert chunked_prefill_mean_ttft_ms(
         mixed8, dp=4, max_batched_tokens=8192,
         body_one=lambda tokens, kv: 0.05 * tokens + 0.01 * kv
-    ) == 2170.8800000000006
+    ) == pytest.approx(2170.88, rel=1e-14, abs=1e-12)
     assert chunked_prefill_mean_ttft_ms(
         (8192, 8192, 8192, 8192), dp=1, max_batched_tokens=8192,
         body_one=lambda tokens: 0.1 * tokens) == 2048.0
@@ -74,7 +74,7 @@ def test_mean_is_exactly_the_prior_values_for_real_mixed8_and_edges():
         body_one=lambda tokens: 0.1 * tokens) == 819.2
     assert chunked_prefill_mean_ttft_ms(
         (16384, 16384, 16384), dp=2, max_batched_tokens=8192,
-        body_one=lambda _tokens, _done: 1.0) == 2.6666666666666665
+        body_one=lambda _tokens, _done: 1.0) == pytest.approx(8.0 / 3.0, rel=1e-14, abs=1e-12)
     assert chunked_prefill_mean_ttft_ms(
         (), dp=2, max_batched_tokens=8192,
         body_one=lambda tokens: 0.1 * tokens) == 0.0

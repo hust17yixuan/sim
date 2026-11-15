@@ -448,11 +448,31 @@ def test_r9_3_universal_wheel_ships_every_runtime_resource():
         assert wheel.name == f"mindie_sim-{ver}-py3-none-any.whl", wheel
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
-            from pip._vendor.distlib.wheel import Wheel
-        Wheel(str(wheel)).verify()
+            try:
+                from distlib.wheel import Wheel
+            except ModuleNotFoundError:
+                Wheel = None
+        if Wheel is not None:
+            Wheel(str(wheel)).verify()
         with zipfile.ZipFile(wheel) as archive:
             entries = {name: archive.read(name) for name in archive.namelist()
                        if not name.endswith("/")}
+        if Wheel is None:
+            import base64
+            import csv
+            import hashlib
+            rec_name = dist_dir + "RECORD"
+            rows = list(csv.reader(entries[rec_name].decode("utf-8").splitlines()))
+            assert {r[0] for r in rows} == set(entries)
+            for name, digest, size in rows:
+                if name == rec_name:
+                    assert digest == "" and size == ""
+                    continue
+                algo, expected = digest.split("=", 1)
+                actual = base64.urlsafe_b64encode(
+                    hashlib.new(algo, entries[name]).digest()
+                ).rstrip(b"=").decode("ascii")
+                assert actual == expected and int(size) == len(entries[name]), name
         package = {name: data for name, data in entries.items()
                    if name.startswith("mindie_sim/")}
         metadata = entries[dist_dir + "WHEEL"].decode()

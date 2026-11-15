@@ -53,7 +53,7 @@ ROOT = Path(__file__).parents[1]
 
 
 def test_catalog_key_config_alias_inventory_is_preserved():
-    assert len(CATALOG) == 29
+    assert len(CATALOG) == 36
     assert len(ARCHITECTURE_PRESET_CATALOG) == 5
     for key in (*CATALOG, *ARCHITECTURE_PRESET_CATALOG):
         assert load_model(key).layers > 0

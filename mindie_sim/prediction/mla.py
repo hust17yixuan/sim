@@ -391,8 +391,11 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             "allgather", "pcp")
     if plan.indexer or plan.owns_topk or plan.index_query_per_layer:
         if index_store is None:
-            index_store = owner(index_cache_ids, plan.index_k_owner_layer_id, "index_cache",
-                                sum(index_selection_cost(model, plan, v.kv_len).index_read_bytes for v in views))
+            if plan.scope == "draft" and plan.index_k_owner_layer_id < 0:
+                index_store = deps
+            else:
+                index_store = owner(index_cache_ids, plan.index_k_owner_layer_id, "index_cache",
+                                    sum(index_selection_cost(model, plan, v.kv_len).index_read_bytes for v in views))
         q_index = b.matrix("index_q", (q_norm,), q, plan.index_heads * plan.index_dim,
                            plan.q_lora_rank, category="indexer_fp8")
         if plan.index_kpool == 1:
@@ -441,8 +444,11 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                                dtype=quant.index_dtype, shape=(q, plan.index_heads))
         selection_deps = [q_index, weights, index_store]
         if plan.candidate_filter:
-            selection_deps.append(owner(candidate_ids, plan.candidate_source_layer_id, "candidate",
-                                        valid * plan.candidate_topk_blocks * 4))
+            if plan.scope == "draft" and plan.candidate_source_layer_id < 0:
+                selection_deps.append(deps)
+            else:
+                selection_deps.append(owner(candidate_ids, plan.candidate_source_layer_id, "candidate",
+                                            valid * plan.candidate_topk_blocks * 4))
         shard = cp if parallel.cp_plan == "dsa_cp" else 1
         if plan.index_kpool > 1:
             from . import index_pool

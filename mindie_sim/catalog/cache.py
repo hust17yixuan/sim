@@ -342,9 +342,14 @@ def index_selection_cost(model, plan, sequence_tokens):
     return IndexReadCost(scored, selected, candidates, width, scored * width, writes, writes * width)
 
 
+_LINEAR_ATTENTION_KINDS = frozenset({
+    "kda", "gdn", "mamba", "gla", "deltanet", "lightning", "retnet",
+})
+
+
 def attention_rows(model, plan, sequence_tokens):
     seq = max(0, int(sequence_tokens))
-    if plan.attention in {"kda", "gdn"} or plan.cache_kind == "recurrent_unmodeled":
+    if plan.attention in _LINEAR_ATTENTION_KINDS or plan.cache_kind == "recurrent_unmodeled":
         return 0, 0, 0
     if plan.cache_kind == "dense":
         return min(seq, plan.window) if plan.window else seq, 0, 0
@@ -443,7 +448,7 @@ def layer_cache_components(model, plan, parallel, sequence_tokens, *, capacity_p
             return rows / cp
         return (_context_shard_blocks(rows, block, cp) if capacity_padded
                 else rows / cp)
-    if plan.attention in {"kda", "gdn"}:
+    if plan.attention in _LINEAR_ATTENTION_KINDS:
         result["recurrent_state"] = plan.recurrent_state_elements / tp * dtype_bytes(plan.recurrent_state_dtype)
         result["conv_state"] = plan.conv_state_elements / tp * dtype_bytes(plan.conv_state_dtype)
         return result
@@ -554,7 +559,7 @@ def request_cache_breakdown(
 def state_bytes_per_request_per_rank(model: Any, parallel: ParallelSpec) -> float:
     total = 0.0
     for plan in model.layer_plans:
-        if plan.attention in {"kda", "gdn"}:
+        if plan.attention in _LINEAR_ATTENTION_KINDS:
             recurrent, conv = _local_state_sharded(plan, parallel.tp)
             total += (
                 recurrent * dtype_bytes(plan.recurrent_state_dtype)

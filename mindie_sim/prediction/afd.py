@@ -292,7 +292,8 @@ def _pipeline_model(
         mode = "serial" if eff_m == 1 else "full_overlap"
         steady_ms = serial_ms if eff_m == 1 else max(attn_stage_ms, ffn_stage_ms, af_comm_ms)
     engine.advance()
-    step_ms, bubble_ms = float(engine.now), max(0.0, float(engine.now) - steady_ms)
+    step_ms = float(engine.now)
+    bubble_ms = 0.0 if eff_m == 1 else max(0.0, step_ms - steady_ms)
     return {
         "m_steps": m_steps, "effective_m_steps": eff_m, "mode": mode, "serial_step_ms": serial_ms,
         "request_latency_ms": serial_ms, "steady_state_ms": steady_ms,

@@ -31,7 +31,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from typing import Any, Sequence
 
@@ -64,6 +64,11 @@ def _num(name: str, value: Any, *, minimum: float = 0.0,
                          reason="linear_state")
 
 
+LINEAR_STATE_KINDS = frozenset({
+    "kda", "gdn", "mamba", "gla", "deltanet", "lightning", "retnet",
+})
+
+
 @typed_inputs(errors={"index": "linear_state_layer_index_invalid"})
 @dataclass(frozen=True)
 class LinearLayer:
@@ -87,7 +92,7 @@ class LinearLayer:
 
     def __post_init__(self) -> None:
         strict_text("layer_name", self.name, reason="linear_state")
-        if not isinstance(self.kind, str) or self.kind not in {"kda", "gdn", "mamba"}:
+        if not isinstance(self.kind, str) or self.kind not in LINEAR_STATE_KINDS:
             raise ModelingError(f"linear_state_layer_kind_invalid:{self.kind}")
         # A raw boolean or fraction is not a layer index; validate before any
         # arithmetic consumes the value.
@@ -440,22 +445,26 @@ def linear_state_memory(config: RecoverSsmConfig, layers: Sequence[LinearLayer],
 @typed_inputs
 def compare_linear_state_memory(config: RecoverSsmConfig, layers: Sequence[LinearLayer], *,
                                 sequence_tokens: int, active_sequences: int = 1,
-                                page_stride_bytes: int | None = None) -> dict[str, Any]:
+                                page_stride_bytes: int | None = None,
+                                allow_generic_model: bool = False) -> dict[str, Any]:
     """Standard vs RecoverSSM capacity; a stride applies only to RecoverSSM."""
+    strict_bool("allow_generic_model", allow_generic_model, reason="linear_state")
     if page_stride_bytes is not None:
         _int("page_stride_bytes", page_stride_bytes, minimum=1)
-    validate_recoverssm(config, strict=False)
+    validate_recoverssm(config, strict=False, allow_generic_model=allow_generic_model)
     standard = linear_state_memory(
         config.with_replayssm(False), layers,
         sequence_tokens=sequence_tokens, active_sequences=active_sequences,
         page_stride_bytes=None)
     # Check the model before constructing a counterfactual that enables GLM's
     # seven-token kernel cap. An unavailable backend cannot reject standard.
-    if config.model_type not in {"glm5_next", "glm5_next_text"}:
+    generic_ok = bool(config.generic_backend or allow_generic_model)
+    if config.model_type not in {"glm5_next", "glm5_next_text"} and not generic_ok:
         codes = ["recoverssm_requires_glm5_next_model"]
     else:
-        replay_config = config.with_replayssm(True)
-        codes = list(validate_recoverssm(replay_config, strict=False).codes)
+        replay_config = replace(config.with_replayssm(True), generic_backend=True) if generic_ok else config.with_replayssm(True)
+        codes = list(validate_recoverssm(
+            replay_config, strict=False, allow_generic_model=generic_ok).codes)
     if codes:
         return {"standard": standard.to_dict(), "recoverssm": None,
                 "applicable": False,
@@ -544,7 +553,7 @@ def linear_layers_from_model(model: Any, *, tp: int = 1) -> tuple[LinearLayer, .
     layers: list[LinearLayer] = []
     for plan in plans:
         kind = strict_text("attention", getattr(plan, "attention", None))
-        if kind not in {"kda", "gdn", "mamba"}:
+        if kind not in LINEAR_STATE_KINDS:
             continue
         index = strict_int("plan_index", getattr(plan, "index", -1),
                            minimum=0, reason="linear_state_catalog")
@@ -609,9 +618,9 @@ def __getattr__(name: str) -> Any:
 
 __all__ = ["CACHE_MODES", "GLM_KDA_ACTIVATION_DTYPE", "GLM_KDA_HEAD_DIM",
            "GLM_MODEL_TYPES", "GlmKdaExecution", "KDA_MAX_RECURRENT_TOKENS",
-           "LayerPageGeometry", "LinearLayer", "LinearStateMemoryPlan",
-           "RECOVERSSM_KV_CONNECTORS", "RecoverSsmConfig",
-           "RecoverSsmValidation", "accepted_token_pmf",
+           "LINEAR_STATE_KINDS", "LayerPageGeometry", "LinearLayer",
+           "LinearStateMemoryPlan", "RECOVERSSM_KV_CONNECTORS",
+           "RecoverSsmConfig", "RecoverSsmValidation", "accepted_token_pmf",
            "boundary_crossings", "compare_linear_state_memory",
            "expected_accepted_tokens", "linear_layers_from_model",
            "linear_state_memory", "validate_glm_kda_execution",

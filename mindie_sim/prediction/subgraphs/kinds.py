@@ -167,7 +167,7 @@ def attention_kind(layer: Any) -> str:
         return latent_attention_kind(layer)
     if declared == "gdn":
         return GDN_LINEAR_ATTN
-    if declared == "kda":
+    if declared in {"kda", "mamba", "gla", "deltanet", "lightning", "retnet"}:
         return KDA_LINEAR_ATTN
     return standard_attention_kind(layer)
 

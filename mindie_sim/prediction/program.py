@@ -2573,7 +2573,7 @@ def _fold_kernel_stages(stages: tuple[Stage, ...]) -> tuple[Stage, ...]:
     return tuple(cur)
 
 
-def coalesce_execution_program(program):
+def coalesce_execution_program(program, *, unroll_limit: int = 64):
     """Unwrap single-tile pipelines and coalesce symmetric cohorts for Execution.
 
     Used only when ``Engine.trace`` is disabled (or a bounded summary ring on a
@@ -2581,7 +2581,7 @@ def coalesce_execution_program(program):
     resource service, allocations, and timestamps.
     """
     if type(program).__name__ == "_FloorJoinProgram":
-        body = coalesce_execution_program(program.body)
+        body = coalesce_execution_program(program.body, unroll_limit=unroll_limit)
         eff_min = (program.effective_minimum()
                    if hasattr(program, "effective_minimum") else program.minimum_ms)
         if eff_min <= 0.0:
@@ -2615,7 +2615,7 @@ def coalesce_execution_program(program):
         return replace(program, body=body)
 
     if type(program).__name__ == "NativeProgram":
-        inner = coalesce_execution_program(program.program)
+        inner = coalesce_execution_program(program.program, unroll_limit=unroll_limit)
         if inner is program.program:
             return program
         return replace(program, program=inner)
@@ -2629,7 +2629,7 @@ def coalesce_execution_program(program):
                 and stage.latency <= 0.0 and not stage.placement
                 and stage.fragment is None):
             return replace(stage, program=None)
-        nested = coalesce_execution_program(stage.program)
+        nested = coalesce_execution_program(stage.program, unroll_limit=unroll_limit)
         return stage if nested is stage.program else replace(stage, program=nested)
 
     if isinstance(program, KernelProgram):
@@ -2671,7 +2671,6 @@ def coalesce_execution_program(program):
             # Unrolling is a task-shape optimization only; it must not turn a
             # slot-bounded pipeline into one flat submission of every tile.
             # Cap the materialized window so live tasks stay O(slots).
-            unroll_limit = 64
             if (program.slots == 1
                     and program.count * len(raw_tiles[0]) <= unroll_limit
                     and all(len({s.name for s in tile}) == len(tile)
@@ -2729,16 +2728,29 @@ def coalesce_execution_program(program):
         return program
 
     if isinstance(program, ParallelProgram):
-        children = tuple(coalesce_execution_program(child)
+        children = tuple(coalesce_execution_program(child, unroll_limit=unroll_limit)
                          for child in program.programs)
         merged = coalesce_programs(children, widen_pipelines=True)
-        if len(merged) > 1 and len(merged) < len(children) and any(
-            isinstance(m, KernelProgram)
-            and any(not s.coupled and (set(s.work) - set(s.placement))
-                    for s in m.stages)
-            for m in merged
-        ):
+        reverted_unplaced = (
+            len(merged) > 1 and len(merged) < len(children) and any(
+                isinstance(m, KernelProgram)
+                and any(not s.coupled and (set(s.work) - set(s.placement))
+                        for s in m.stages)
+                for m in merged
+            )
+        )
+        if reverted_unplaced:
             merged = children
+        if (len(merged) > 1 and sum(
+                len(m.stages) for m in merged if isinstance(m, KernelProgram)
+        ) > unroll_limit):
+            child_limit = unroll_limit // max(1, len(program.programs))
+            children = tuple(
+                coalesce_execution_program(child, unroll_limit=child_limit)
+                for child in program.programs
+            )
+            merged = (children if reverted_unplaced
+                      else coalesce_programs(children, widen_pipelines=True))
         if (len(merged) == 1 and isinstance(merged[0], KernelProgram)
                 and not any(s.acquire or s.free for s in merged[0].stages)):
             return merged[0]

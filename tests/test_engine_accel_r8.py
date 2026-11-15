@@ -277,7 +277,7 @@ def test_r8_3_workspace_has_zero_build_or_cache_artifacts():
     """The release gate rejects every compiled binary, cache and egg metadata."""
     offenders = []
     for path in ROOT.rglob("*"):
-        relative = str(path.relative_to(ROOT))
+        relative = path.relative_to(ROOT).as_posix()
         if path.is_dir():
             if path.name in ARTIFACT_DIRS or path.name.endswith(".egg-info"):
                 offenders.append(relative)

@@ -596,7 +596,7 @@ def test_p2_23_occurrence_ids_and_spans_identify_the_source():
     assert settings["--tensor-parallel-size"].span.line_start == 3
     assert len(report.setting_ids) == len(set(report.setting_ids))
     source = _parse(script, source=str(Path("/tmp/deploy.sh")))
-    assert source.source.name == "/tmp/deploy.sh"
+    assert Path(source.source.name).as_posix() == "/tmp/deploy.sh"
     assert source.source.source_kind == "file"
     assert len(source.source.sha256) == 64
     document = parse_document("docker run image sh -c 'vllm serve /m \\\n"
