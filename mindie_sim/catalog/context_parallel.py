@@ -839,6 +839,11 @@ def cp_layer_scope(
                            else CP_INDEXER_POLICY),
         "indexer_cache_sharded": False,
     }
+    from .paired_sfa import execution
+    if plan in {CP_PLAN_DCP, CP_PLAN_PCP_DCP} and execution(model).get("dcp_indexer_sharded"):
+        scope.update(indexer_cache_sharded=True,
+                     indexer_policy="token_sharded_candidate_topk",
+                     output_merge="head_alltoall_lse")
     if plan == CP_PLAN_PCP:
         scope.update({
             "prefill_cp_plan": "pcp",

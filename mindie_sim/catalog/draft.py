@@ -14,6 +14,11 @@ from dataclasses import replace
 def draft_quant(model, draft):
     """Use the draft's declared representation in both work and residency."""
     quant = model.quant
+    from .paired_sfa import independent_draft
+    if independent_draft(draft):
+        return replace(quant, weight_format="bf16", expert_weight_format="bf16",
+                       activation_format="bf16", kv_dtype="bf16",
+                       category_overrides=())
     if not draft.weight_category:
         return quant
     fmt = quant.format_for(draft.weight_category)

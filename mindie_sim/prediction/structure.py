@@ -32,7 +32,8 @@ def normalize_model(model: ModelSpec) -> ModelSpec:
     if model.layer_plans:
         if len(model.layer_plans) != model.layers:
             raise ModelingError("layer_plan_count_differs_from_layers")
-        return replace(model, quant=quant)
+        from mindie_sim.catalog.paired_sfa import normalize_formats
+        return normalize_formats(replace(model, quant=quant))
     dimensions = {
         "num_heads": model.num_heads, "num_kv_heads": model.num_kv_heads or model.num_heads,
         "head_dim": model.head_dim, "intermediate_size": model.intermediate_size,

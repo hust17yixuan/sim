@@ -31,6 +31,9 @@ ONE = 1
 
 
 def _reference_attention_plan(model, draft, index: int) -> LayerPlan | None:
+    from .paired_sfa import independent_draft
+    if independent_draft(draft):
+        return None
     if model.auxiliary is not None and model.auxiliary.standalone_draft:
         return None
     matching = [p for p in model.layer_plans if p.attention == draft.attention_kind]
@@ -175,5 +178,4 @@ def draft_layer_plans(model, kind="mtp"):
         )
     }
     return tuple(_draft_layer_plan(model, draft, index, plan_fields) for index in range(draft.layers))
-
 

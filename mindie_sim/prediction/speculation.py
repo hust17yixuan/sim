@@ -17,6 +17,11 @@ from .structure import stage_map
 from .implementation_selection import resolve, LoweringRegion
 
 
+ONE = 1
+TWO = 2
+ZERO = 0
+
+
 def _tag_draft_ops(ops, rows_by_request, *, step=0):
     """Attach the actual draft producer identity and materialized row counts.
 
@@ -40,9 +45,11 @@ from mindie_sim.catalog.draft_geometry import (  # noqa: F401
 
 
 def draft_program(frontend, model, runtime, views, ready, *, global_views=None, prefill=False,
-                  replica=0, replay_scope="none"):
+                  replica=ZERO, replay_scope="none"):
     kind = dict(runtime.metadata).get("draft_mode", "mtp")
     draft = optional_draft_spec(model, kind)
+    from mindie_sim.catalog.paired_sfa import independent_draft
+    external_context = independent_draft(draft)
     selected_view = lambda view: view.phase == "prefill" if prefill else bool(view.draft_proposal_tokens)
     active = tuple(view for view in views if selected_view(view))
     all_active = tuple(view for view in (global_views or views) if selected_view(view))
@@ -60,6 +67,13 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
         quant=draft_quant(model, draft), activation_dtype=draft.activation_dtype,
         compute_dtype=draft.activation_dtype,
     )
+    if external_context:
+        metadata = dict(draft_model.metadata)
+        metadata.pop("cache_allocator", None)
+        metadata["cache_representations"] = {"mla_kv": {"dtype": "bf16"}}
+        metadata["attention_execution"] = {
+            **metadata.get("attention_execution", {}), "dcp_indexer_sharded": False}
+        draft_model = replace(draft_model, kv_dtype="bf16", metadata=tuple(metadata.items()))
     regions, previous = [], ready
     stage = runtime.parallel.pp - 1
     # Feature projection shards its output; the draft body consumes a complete
@@ -80,6 +94,8 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
         global_proposals = tuple(proposal(view) for view in all_active
                                  if not serial or view.draft_proposal_tokens > step)
         rows = sum(view.q_len for view in proposal_views)
+        feature_rows = (sum(view.q_len if prefill else view.draft_proposal_tokens + ONE
+                            for view in selected) if external_context else rows)
         selected_runtime, selections = resolve(
             runtime, proposal_views, padded_tokens=rows, replay_scope=replay_scope,
             global_views=global_proposals, model_scope="draft")
@@ -99,16 +115,16 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
             if source_stage != stage:
                 transfer = comm_op(
                     op_id=prefix + f"features_from{layer_id}", deps=(previous,), stage=stage,
-                    layer=-1, requests=requests, family="pp_p2p", phase="draft",
-                    recipe="draft_feature_transfer", link_bytes=rows * model.hidden_size * 2,
-                    shape=(rows, model.hidden_size),
+                    layer=-ONE, requests=requests, family="pp_p2p", phase="draft",
+                    recipe="draft_feature_transfer", link_bytes=feature_rows * model.hidden_size * TWO,
+                    shape=(feature_rows, model.hidden_size),
                     metadata=(("group_axis", "pp"), ("source_stage", source_stage),
                               ("destination_stage", stage)))
                 ops.append(transfer)
                 feature_deps.append(transfer.op_id)
         projection = gemm_op(
-            op_id=prefix + "features", deps=tuple(feature_deps), stage=stage, layer=-1, requests=requests,
-            m=rows, n=(draft.hidden_size + tp - 1) // tp, k=draft.input_width, quant=draft_model.quant,
+            op_id=prefix + "features", deps=tuple(feature_deps), stage=stage, layer=-ONE, requests=requests,
+            m=feature_rows, n=(draft.hidden_size + tp - ONE) // tp, k=draft.input_width, quant=draft_model.quant,
             category=draft.input_projection_category, phase="draft", family="gemm",
             recipe="draft_features",
         )
@@ -135,19 +151,26 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
             ops.append(projection)
         elif rows:
             ops.append(projection)
-            if tp > 1:
+            if tp > ONE:
                 gathered = comm_op(
                     op_id=prefix + "features_gather", deps=(projection.op_id,), stage=stage,
-                    layer=-1, requests=requests, family="allgather", phase="draft",
-                    recipe="draft_features_gather", link_bytes=rows * draft.hidden_size * 2 * (tp - 1) / tp,
-                    shape=(rows, draft.hidden_size), metadata=(("group_axis", "tp"), ("steps", tp - 1)))
+                    layer=-ONE, requests=requests, family="allgather", phase="draft",
+                    recipe="draft_features_gather", link_bytes=feature_rows * draft.hidden_size * TWO * (tp - ONE) / tp,
+                    shape=(feature_rows, draft.hidden_size), metadata=(("group_axis", "tp"), ("steps", tp - ONE)))
                 ops.append(gathered)
                 projection = gathered
         global_tokens = sum(view.q_len if prefill else 1 if serial else view.draft_proposal_tokens
                             for view in all_active if not serial or view.draft_proposal_tokens > step)
+        body_ready = projection.op_id if rows else previous
+        if external_context and rows:
+            from .draft_context import prepare
+            body_ready = prepare(
+                ops, projection=projection, model=draft_model, draft=draft,
+                rows=feature_rows, query_rows=rows, prefix=prefix,
+                stage=stage, requests=requests)
         body, previous = frontend.body(
             draft_model, selected_runtime, proposal_views, prefix=prefix,
-            ready=projection.op_id if rows else previous,
+            ready=body_ready,
             tokens=rows, mode="draft_prefill" if prefill else "draft",
             stages=(stage,) * draft.layers, global_tokens=global_tokens, replica=replica,
         )

@@ -525,7 +525,10 @@ def layer_cache_components(model, plan, parallel, sequence_tokens, *, capacity_p
     if plan.owns_index_k:
         index_ratio = max(1, plan.compress_ratio, plan.index_kpool)
         rows = completed_rows(seq, index_ratio)
-        if parallel.cp_plan == "dsa_cp":
+        from .paired_sfa import execution
+        if execution(model).get("dcp_indexer_sharded") and cp > ONE:
+            rows = local_rows(rows)
+        elif parallel.cp_plan == "dsa_cp":
             if rank is not None:
                 rows = (
                     index_k_owned_block_rows(rows, cp, index_ratio)[int(rank)]

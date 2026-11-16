@@ -29,6 +29,9 @@ POWER_CUBIC = 3
 TWO_THIRDS = 2.0 / 3.0
 
 
+ONE = 1
+
+
 def _sum_valid_powers(tokens: int, chunk: int, power: int) -> int:
     """Closed form of sum(min(chunk, tokens - i*chunk)**power)."""
     full, remainder = divmod(int(tokens), int(chunk))
@@ -51,6 +54,10 @@ def _serving_kda_source(runtime, model, views, plan):
 
 def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
            padded_tokens, policy=None, runtime=None, **_):
+    from mindie_sim.catalog.paired_sfa import execution
+    from dataclasses import replace
+    if execution(model).get("recurrent_context_sharded") is False:
+        parallel = replace(parallel, cp=ONE, dcp=ONE, cp_plan="none")
     if (runtime and plan.attention == "gdn" and views
             and all(view.phase == "decode" for view in views)):
         selected = select(runtime.kernels.get("lowerings", {}), "gdn_decode")

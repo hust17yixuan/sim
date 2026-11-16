@@ -41,6 +41,9 @@ from mindie_sim.schema.model import LayerPlan, ModelSpec
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 
 
+ZERO = 0
+
+
 def _set_facts(model: ModelSpec, facts: Sequence[tuple[str, Any]]) -> None:
     # Frozen dataclass: build the final tuple once through object.__setattr__.
     from .hf_config import json_sequences
@@ -142,6 +145,8 @@ def build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
         qk_norm=(plan.qk_norm or (family == "qwen" and plan.attention == "gqa"))
         if family == "qwen" else False,
     ) for plan in plans]
+    if family == "kimi" and c.get("dsa_config"):
+        plans = [replace(plan, index_query_per_layer=plan.indexer) for plan in plans]
     # V4.1 uses source-layer sets for compressed KV; its adapter has already
     # resolved them. The dense helper expects one owner entry per layer.
     owner_config = c
@@ -209,6 +214,15 @@ def build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
         tie_word_embeddings=bool(c.get("tie_word_embeddings", False)),
         metadata=native_coverage(config, coverage_gaps, plans=plans, quant=quant),
     )
+    if family == "kimi" and c.get("dsa_config"):
+        model = replace(model, metadata=model.metadata + (
+            ("cache_allocator", "paired_sfa"),
+            ("attention_execution", {
+                "dcp_query_gather": True, "dcp_indexer_sharded": True,
+                "dcp_output_merge": "alltoall", "recurrent_context_sharded": False,
+                "index_rope_dim": int(c["dsa_config"].get("index_rope_dim", ZERO)),
+            }),
+        ))
     # Set the activation dtype only for vector/residual math. Quantized GEMM
     # ops carry their own activation/compute dtype explicitly.
     facts = [

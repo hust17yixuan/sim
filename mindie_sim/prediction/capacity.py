@@ -385,8 +385,15 @@ class Memory:
         _declared = int(_draft_meta.get("draft_proposal_tokens", ZERO) or ZERO)
         self.query_tokens = (resolve_speculative_query_tokens(case.runtime)
                              if _declared > ZERO else ONE)
+        if dict(case.model.metadata).get("cache_allocator") == "paired_sfa" and _declared > ZERO:
+            self.query_tokens = _declared + ONE
+        from mindie_sim.catalog.paired_sfa import page_groups
+        paired_groups = page_groups(case, self.layer_stage, self.query_tokens)
+        self.paired_sfa = bool(paired_groups)
+        if paired_groups and self.policy.cache_page_groups:
+            raise ValueError("paired_sfa_and_explicit_cache_page_groups_conflict")
         self.pages = CachePages(
-            self.policy.cache_page_groups,
+            paired_groups or self.policy.cache_page_groups,
             {layer.index: set(layer_cache_components(
                 case.model, layer, p, case.runtime.max_model_len,
                 capacity_padded=False, runtime=case.runtime,
@@ -1268,7 +1275,9 @@ class Memory:
                     value for name, value in components.items() if name not in covered)
         from mindie_sim.catalog.draft import optional_draft_spec
         mode = self.draft_kind
-        if mode and model.auxiliary is not None:
+        if self.paired_sfa and mode and not padded:
+            result[-ONE] += self._paired_draft_bytes(tokens)
+        elif mode and model.auxiliary is not None and not self.paired_sfa:
             draft = optional_draft_spec(model, mode)
             row = ((draft.kv_cache_elements or draft.kv_lora_rank + draft.qk_rope_head_dim) if draft.attention_kind == "mla"
                    else 2 * local_kv_heads(draft.num_kv_heads, p.tp) * draft.head_dim)
@@ -1309,7 +1318,7 @@ class Memory:
                 stage = stages[self.layer_stage[layer.index]]
                 for name in owned.get(layer_index, ()):
                     part = None
-                    if name in {"gqa_kv", "mla_kv", "window"}:
+                    if not self.paired_sfa and name in {"gqa_kv", "mla_kv", "window"}:
                         part = self._group_token_component(
                             model, layer, p, group, name, valid_tokens,
                             alloc_tokens, components,
@@ -1336,7 +1345,24 @@ class Memory:
                     detail["alloc_scale"] += alloc_scale
                     detail["valid_payload"] += valid_payload
                     detail["valid_scale"] += valid_scale
+        if self.paired_sfa and self.draft_kind:
+            value = self._paired_draft_bytes(tokens, rank=rank)
+            stage = stages[-1]
+            for name in ("alloc_payload", "valid_payload"):
+                stage[name] += value
+            stage["components"]["draft_kv"] = {
+                "alloc_payload": value, "alloc_scale": ZERO,
+                "valid_payload": value, "valid_scale": ZERO}
         return stages
+
+    def _paired_draft_bytes(self, tokens: int, *, rank=None) -> float:
+        from mindie_sim.catalog.draft import optional_draft_spec
+        from mindie_sim.catalog.paired_sfa import draft_row
+        draft = optional_draft_spec(self.case.model, self.draft_kind)
+        rows = tokens / self.case.runtime.parallel.cp
+        if rank is not None and self.rank_token_owners is not None:
+            rows = owned_token_rows(tokens, self.rank_token_owners, rank)
+        return rows * draft_row(self.case.model, draft) * draft.layers
 
     def _group_token_component(
         self, model, layer, parallel, group, name: str, valid_tokens: int,
@@ -1424,7 +1450,7 @@ class Memory:
                 detail["total"] += float(value)
         from mindie_sim.catalog.draft import optional_draft_spec
         mode = self.draft_kind
-        if mode and model.auxiliary is not None:
+        if mode and model.auxiliary is not None and not self.paired_sfa:
             draft = optional_draft_spec(model, mode)
             row = ((draft.kv_cache_elements or draft.kv_lora_rank + draft.qk_rope_head_dim)
                    if draft.attention_kind == "mla" else
@@ -1435,7 +1461,7 @@ class Memory:
                 draft_tokens = owned_token_rows(
                     draft_tokens, self.rank_token_owners, rank)
             value = draft_tokens * row * dtype_bytes(model.kv_dtype) * draft.layers
-            stage = stages[-1]
+            stage = stages[-ONE]
             stage["payload"] += float(value)
             stage["total"] += float(value)
             detail = stage["components"].setdefault(
@@ -1451,7 +1477,7 @@ class Memory:
         Without one the legacy stage-level per-rank value is retained, so old
         callers and even CP=2 slices are unchanged.
         """
-        if self.rank_token_owners is None:
+        if self.paired_sfa or self.rank_token_owners is None:
             return list(self.cache_bytes(tokens, padded=padded))
         case, model, p = self.case, self.case.model, self.case.runtime.parallel
         result = (

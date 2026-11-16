@@ -148,7 +148,8 @@ def _kimi_plans(config: Mapping[str, Any]) -> list[LayerPlan]:
                 native_layer_id=index + 1, scope="body",
                 kv_owner_layer_id=index, **activation,
             ))
-    return plans
+    from .paired_sfa import sparse_plans
+    return sparse_plans(c, plans)
 
 
 def _aux_kimi(c: Mapping[str, Any], config: Mapping[str, Any]) -> AuxiliarySpec:

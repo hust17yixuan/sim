@@ -1627,6 +1627,7 @@ class RecipeBook:
         from .mc2_graph import recipes as native_moe_recipes
         from .hccl_graph import recipes as hccl_recipes
         from .sparse_kv_offload import recipes as sparse_kv_offload_recipes
+        from .latent_dcp import recipes as latent_dcp_recipes
         from .matrix import TiledMatmul, HierarchicalMatmul
         from .matrix_mapping import MappedMatmul
         from .matrix_phase import PhaseMatmul
@@ -1807,6 +1808,7 @@ class RecipeBook:
                     for name, value in values.items()}
         explicit = {**native_moe_recipes(raw), **hccl_recipes(raw),
                     **sparse_kv_offload_recipes(),
+                    **latent_dcp_recipes(),
                     **implementation_recipes(raw.get("lowerings", {})),
                     **kda_recurrent_recipes(),
                     **attn_res_recipes(),

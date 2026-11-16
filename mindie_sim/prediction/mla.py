@@ -29,6 +29,12 @@ from mindie_sim.catalog.cache_format import cache_format
 from mindie_sim.catalog.ops import compute_dtype_for
 
 
+CANDIDATE_BYTES = 8
+DEFAULT_INTERLEAVE = 128
+ONE = 1
+ROPE_OPS = 6
+
+
 def _semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
                               shard, prefix, padded_tokens):
     valid = sum(view.q_len for view in views)
@@ -176,8 +182,12 @@ def _sparse_over_parts(parts, plan, query_tile, *, dense):
 
 def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         padded_tokens, cache_ids, topk_ids, index_cache_ids, candidate_ids,
-        stage_of, cp_interleave_size=128, runtime=None, policy=None):
+        stage_of, cp_interleave_size=DEFAULT_INTERLEAVE, runtime=None, policy=None):
     b = Builder(prefix, plan, stage, views, model, mode)
+    from . import latent_dcp
+    from mindie_sim.catalog.paired_sfa import execution
+    gathered_dcp = latent_dcp.enabled(model, parallel, views, runtime)
+    index_rope = int(execution(model).get("index_rope_dim", plan.qk_rope_head_dim))
     prolog = (select(runtime.kernels.get("lowerings", {}), "mla_prolog")
               if runtime else None)
     if prolog:
@@ -253,8 +263,8 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     store = packed_store or (representation_store(b, "kv_store", (rotary,), math.ceil(valid / cp),
                                   plan.cache_row_elements, "window")
              if plan.cache_kind == "window_compressed" else
-             b.store("kv_store", (rotary,), math.ceil(valid / cp),
-                     plan.cache_row_elements * dtype_bytes(quant.kv_dtype), quant.kv_dtype))
+             representation_store(b, "kv_store", (rotary,), math.ceil(valid / cp),
+                                  plan.cache_row_elements, "mla_kv"))
     # This lowering writes the local KV row. Shared long-KV consumers still do.
     produced, owns_kv = store, store is not None
     if pcp_prefill and owns_kv:
@@ -282,6 +292,10 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             b.ops, prefix=prefix, plan=plan, model=model, parallel=parallel, quant=quant,
             tokens=q, members=(q_a, q_norm, q_b, kv_a, kv, rotary, produced, q_ready),
             q_a=q_a, q_b=q_b, kv_a=kv_a, q_absorb=q_ready, **prolog.options)
+    if gathered_dcp:
+        q_ready, rotary = latent_dcp.query_gather(
+            b, q_ready, rotary, q, heads, plan.kv_lora_rank + plan.qk_rope_head_dim, cp)
+        heads *= cp
     long_store = store if plan.cache_kind == "dense" else None
     compressed_latent = None
     index_store, topk, candidate = None, None, None
@@ -330,7 +344,7 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         raise ModelingError("pooled_indexer_context_partition_not_declared")
     pool_binding = (select(runtime.kernels.get("lowerings", {}), "pool_key_indexer")
                     if runtime and plan.index_kpool > 1 else None)
-    if plan.owns_index_k and plan.index_kpool > 1:
+    if plan.owns_index_k and plan.index_kpool > ONE:
         from . import index_pool
         pool_module = pool_binding.module if pool_binding else index_pool
         producer_options = (pool_binding.options if pool_binding and
@@ -352,7 +366,7 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                          for v in views for q_len, c in _visible_parts(v))
         input_rows = index_rows if plan.index_input == "compressed" else valid
         input_width = plan.head_dim if plan.index_input == "compressed" else h
-        if plan.compress_ratio > 1 and plan.index_input == "hidden":
+        if plan.compress_ratio > ONE and plan.index_input == "hidden":
             normalized = compressor(
                 b, name="index_compress", source=deps, tokens=valid, padded_tokens=q,
                 valid_rows=index_rows, width=plan.index_dim, plan=plan, model=model)
@@ -363,12 +377,13 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             # compressor above has RMS normalization and its own parameters.
             normalized = index_layer_norm(
                 b, source=projected, rows=index_rows, width=plan.index_dim)
-            normalized = b.vector(
-                "index_rotary", (normalized,), index_rows * plan.qk_rope_head_dim, 6,
-                family="rotary", shape=(index_rows, plan.index_dim),
-                read_bytes_override=index_rows * (
-                    plan.index_dim * dtype_bytes(model.activation_dtype) + plan.qk_rope_head_dim * 8),
-                write_bytes_override=index_rows * plan.index_dim * dtype_bytes(model.activation_dtype))
+            if index_rope:
+                normalized = b.vector(
+                    "index_rotary", (normalized,), index_rows * index_rope, ROPE_OPS,
+                    family="rotary", shape=(index_rows, plan.index_dim),
+                    read_bytes_override=index_rows * (
+                        plan.index_dim * dtype_bytes(model.activation_dtype) + index_rope * CANDIDATE_BYTES),
+                    write_bytes_override=index_rows * plan.index_dim * dtype_bytes(model.activation_dtype))
         normalized = index_representation(
             b, "index_key", normalized, index_rows, plan.index_dim,
             quant=quant, model=model, rotate_basis=plan.compress_ratio > 1)
@@ -398,9 +413,9 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                                     sum(index_selection_cost(model, plan, v.kv_len).index_read_bytes for v in views))
         q_index = b.matrix("index_q", (q_norm,), q, plan.index_heads * plan.index_dim,
                            plan.q_lora_rank, category="indexer_fp8")
-        if plan.index_kpool == 1:
+        if plan.index_kpool == ONE and index_rope:
             q_index = b.vector(
-                "index_query_rotary", (q_index,), valid * plan.index_heads * plan.qk_rope_head_dim, 6,
+                "index_query_rotary", (q_index,), valid * plan.index_heads * index_rope, ROPE_OPS,
                 family="rotary", shape=(valid, plan.index_heads, plan.index_dim))
         q_index = index_representation(
             b, "index_query", q_index, (q if plan.index_kpool > 1 else valid) * plan.index_heads, plan.index_dim,
@@ -449,7 +464,8 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             else:
                 selection_deps.append(owner(candidate_ids, plan.candidate_source_layer_id, "candidate",
                                             valid * plan.candidate_topk_blocks * 4))
-        shard = cp if parallel.cp_plan == "dsa_cp" else 1
+        shard = cp if (parallel.cp_plan == "dsa_cp" or
+                       execution(model).get("dcp_indexer_sharded")) else ONE
         if plan.index_kpool > 1:
             from . import index_pool
             pool_module = pool_binding.module if pool_binding else index_pool
@@ -494,7 +510,11 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                 topk = _semantic_index_selection(
                     b, deps=selection_deps, views=views, plan=plan, model=model,
                     quant=quant, parallel=parallel, shard=shard, prefix=prefix, padded_tokens=q)
-        if shard > 1:
+        if shard > ONE:
+            if gathered_dcp:
+                topk = b.work("candidate_pack", (topk,), (valid, plan.index_topk),
+                              read=valid * plan.index_topk * CANDIDATE_BYTES,
+                              write=valid * plan.index_topk * CANDIDATE_BYTES, family="elementwise")
             gathered = b.communicate("candidate_gather", (topk,), valid * plan.index_topk * 8 * (cp - 1),
                                      "allgather", "cp")
             topk = b.vector("candidate_merge", (gathered,), valid * plan.index_topk * cp,
@@ -596,7 +616,7 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         # split charged both ports the mean (13056B here), hiding Qread+out.
         q_read = query * heads * qk_dim * dtype_bytes(model.activation_dtype)
         out_write = query * heads * latent_dim * dtype_bytes(model.activation_dtype)
-        cache_read = sweeps * plan.cache_row_elements * dtype_bytes(quant.kv_dtype)
+        cache_read = sweeps * cache_format(model, "mla_kv").row_bytes(plan.cache_row_elements)
         if plan.cache_kind == "window_compressed":
             original_rows = sum(
                 min(view.kv_len if plan.noncausal_attention else c_part + min(q_part, start + query_tile), plan.window)
@@ -664,7 +684,7 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                 b.ops[-1] = indexed.module.lower_op(
                     b.ops[-1], selection=indexed, view=view, views=views,
                     plan=plan, parallel=parallel)
-        if cp > 1:
+        if cp > ONE and not gathered_dcp:
             merged, last = dcp_partial_merge_ops(
                 prefix=prefix + f".request{index}", view=view, cp=cp, local_heads=heads,
                 v_dim=latent_dim, stage=stage, layer=plan.index, mode=mode, deps=(last,),
@@ -673,6 +693,10 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             )
             b.ops.extend(merged)
         outputs.append(last)
+    if gathered_dcp:
+        outputs = latent_dcp.attention_batch(
+            b, outputs, views, plan=plan, heads=heads,
+            local_heads=logical_heads, cp=cp, rows=q)
     if mixed_quant:
         outputs = mixed_quant.module.lower_attention(
             b.ops, outputs, selection=mixed_quant, views=views, plan=plan,

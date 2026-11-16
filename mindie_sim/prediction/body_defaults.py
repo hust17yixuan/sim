@@ -18,6 +18,9 @@ from mindie_sim.schema.common import dtype_bytes
 _GDN_CALLER = "vllm_ascend_gdn_decode"
 
 
+ONE = 1
+
+
 def _gdn_source_options(binding):
     if binding == _GDN_CALLER:
         return {}
@@ -445,7 +448,7 @@ def _attnres_default(case, phase, kernels):
             "reason": reason or "supported_tensor_and_resource_geometry"}
 
 
-def attention_defaults(case, phase, *, tokens=1):
+def attention_defaults(case, phase, *, tokens=ONE):
     kernels = deepcopy(case.runtime.kernels)
     records = []
     required = {"mte1", "mte2_aic", "mte2_aiv", "mte3", "fixpipe", "vector", "hbm"}
@@ -469,11 +472,14 @@ def attention_defaults(case, phase, *, tokens=1):
                      any(k in recipes for k in ("flash_attention", "flash_attention_decode")))) or
                     (family == "indexed_mla" and ("indexed_attention" in lowerings or
                      "indexed_attention" in programs)))
+        from mindie_sim.catalog.paired_sfa import execution
         reason = ("explicit_implementation_preserved" if explicit else
-                  "partitioned_attention_domain" if phase != "decode" and parallel.pcp != 1 else
+                  "gathered_head_attention_contract" if family == "indexed_mla"
+                  and execution(case.model).get("dcp_query_gather") else
+                  "partitioned_attention_domain" if phase != "decode" and parallel.pcp != ONE else
                   "decode_profile_only" if phase != "decode" else
                   "independent_copy_pipes_not_declared" if not pipes else
-                  "partitioned_attention_domain" if parallel.cp != 1 else "")
+                  "partitioned_attention_domain" if parallel.cp != ONE else "")
         if not reason and family == "gqa_decode":
             if case.model.activation_dtype not in floating:
                 reason = "gqa_activation_precision_outside_fattention_domain"
