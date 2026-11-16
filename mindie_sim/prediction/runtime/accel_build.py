@@ -5,16 +5,26 @@
   subprocess, and publish it under an immutable content+generation address.
 [Invariants] The wheel ships source only: no build-time native extension, no
   compiler download and no network.  The cache key hashes every shipped source
-  byte, compiler identity/version, platform/pointer-width/endianness identity and
-  every semantic flag.  A validated library path is never overwritten: each
-  build publishes a fresh generation file plus an atomic readiness manifest.
-  Temporary names are unique per process, thread and monotonic tick.  A build
-  failure never tombstones the key and never changes simulation semantics.
+  byte, the resolved compiler binary/version, platform/pointer-width/endianness
+  identity and every semantic flag; the caller's raw ``PATH`` is not an input,
+  so every virtualenv resolving the same system compiler shares one artifact.
+  A validated library path is never overwritten: each build publishes a fresh
+  generation file plus an atomic readiness manifest.  Temporary names are unique
+  per process, thread and monotonic tick, and failed publications remove their
+  snapshot, temporary and candidate files.  A build failure never tombstones
+  the key and never changes simulation semantics.
 [Timeouts & Locks] One argv-list subprocess with no shell; compile budget 20 s,
-  compiler probe 15 s, ABI validation 15 s.  Publication is an atomic ``os.link``
-  into a fresh generation path; an existing library inode is never replaced.
-[Side-Effect Policy] Reads the packaged sources and environment; writes only the
-  content-addressed cache directory.  No model, hardware or network access.
+  compiler probe 15 s, ABI validation 15 s.  Cache inspection, hit refresh,
+  publication and retention share one cross-process advisory lock file with a
+  bounded wait; a hit refreshes its mtime under that lock before pruning, and
+  the loader keeps the lock across ``ctypes.CDLL``.  Publication is an atomic
+  ``os.link`` into a fresh generation path; an existing library inode is never
+  replaced.  Retention is bounded by ``MAX_CACHED_ARTIFACTS`` and evicts
+  oldest-first via atomic rename; a mapped Windows library defers eviction
+  without failing.
+[Side-Effect Policy] Reads the packaged sources and environment; writes and
+  prunes only the content-addressed cache directory.  No model, hardware or
+  network access.
 """
 from __future__ import annotations
 
@@ -30,6 +40,8 @@ import tempfile
 import threading
 import time
 
+from . import accel_cache
+from .accel_cache import MAX_CACHED_ARTIFACTS, library_extension
 from .accel_tables import PROBE_GOLDEN
 
 SOURCE_NAMES = (
@@ -46,6 +58,9 @@ COMPILE_TIMEOUT_SECONDS = 20.0
 PROBE_TIMEOUT_SECONDS = 15.0
 VALIDATE_TIMEOUT_SECONDS = 15.0
 MAX_DIAGNOSTIC_BYTES = 2000
+IDENTITY_MARKER_HEX = 16
+INVALID_GENERATION = -1
+GENERATION_PART = 0
 _BASE_FLAGS = (
     "-std=c11", "-O3", "-fPIC", "-fno-fast-math", "-ffp-contract=off",
     "-fno-strict-aliasing",
@@ -54,6 +69,15 @@ _STATUS_MEMO: dict[tuple, dict] = {}
 _IDENTITY_MEMO: dict[tuple, str] = {}
 _MEMO_LOCK = threading.Lock()
 _SUBPROCESS_KWARGS = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+#: Retention and locking live in the small coordinator module; these aliases
+#: preserve the established private API used by cache tests and diagnostics.
+MAX_COMPILER_MARKERS = accel_cache.MAX_COMPILER_MARKERS
+STALE_TEMP_SECONDS = accel_cache.STALE_TEMP_SECONDS
+_artifact_paths = accel_cache.artifact_paths
+_mtime_ns = accel_cache._mtime_ns
+_keep_names = accel_cache._keep_names
+_discard_path = accel_cache._discard_path
+_prune_engine_cache = accel_cache.prune_engine_cache
 
 
 def source_dir() -> Path:
@@ -80,14 +104,6 @@ def source_snapshot() -> tuple[bytes, dict[str, bytes]]:
 def source_bytes() -> bytes:
     """Digest over every shipped source byte (the cache-key preimage)."""
     return source_snapshot()[0]
-
-
-def library_extension() -> str:
-    if sys.platform == "darwin":
-        return ".dylib"
-    if os.name == "nt":
-        return ".dll"
-    return ".so"
 
 
 def compiler_flags() -> list[str]:
@@ -141,26 +157,49 @@ def _unique_temp(directory: Path, prefix: str, suffix: str) -> Path:
     return Path(name)
 
 
-def _identity_paths(compiler: str) -> str:
-    """Environment paths that can change which toolchain answers ``cc``."""
-    return "|".join(os.environ.get(name, "") for name in ("PATH", "SDKROOT"))
-
-
-def _compiler_identity(compiler: str, *, persist: bool = False) -> str:
+def _resolve_compiler(compiler: str) -> str:
+    """Resolve a compiler name to the executable that PATH actually selects."""
+    found = shutil.which(compiler) or compiler
     try:
-        stat = os.stat(compiler)
+        return str(Path(found).resolve())
+    except TimeoutError:
+        raise
+    except OSError:
+        return os.path.abspath(found)
+
+
+def _compiler_context(compiler: str) -> tuple[str, str, str]:
+    """Resolved binary, Stat footprint and SDK root for a toolchain identity.
+
+    The caller's ``PATH`` is deliberately absent: distinct virtualenvs or
+    benchmark slots that resolve the same system compiler must share one cache
+    key.  Only the selected executable and explicit SDK root are inputs.
+    """
+    resolved = _resolve_compiler(compiler)
+    try:
+        stat = os.stat(resolved)
         footprint = f"{stat.st_size}:{stat.st_mtime_ns}"
     except TimeoutError:
         raise
     except OSError:
         footprint = "unknown"
-    key = (compiler, footprint, _identity_paths(compiler))
+    sdkroot = os.environ.get("SDKROOT", "")
+    if sdkroot:
+        sdkroot = os.path.normpath(os.path.abspath(
+            os.path.expanduser(sdkroot)))
+    return resolved, footprint, sdkroot
+
+
+def _compiler_identity(compiler: str, *, persist: bool = False) -> str:
+    resolved, footprint, sdkroot = _compiler_context(compiler)
+    platform_identity = _platform_identity()
+    key = (resolved, footprint, sdkroot, platform_identity)
     with _MEMO_LOCK:
         cached = _IDENTITY_MEMO.get(key)
     if cached is not None:
         return cached
     marker_key = hashlib.sha256(
-        f"{compiler}|{footprint}|{key[2]}".encode()).hexdigest()[:16]
+        "|".join(("compiler-identity-v3", *key)).encode()).hexdigest()[:IDENTITY_MARKER_HEX]
     marker = cache_root() / f"compiler-{marker_key}.id"
     if persist:
         try:
@@ -176,7 +215,7 @@ def _compiler_identity(compiler: str, *, persist: bool = False) -> str:
     version = "unknown"
     try:
         completed = subprocess.run(
-            [compiler, "--version"], capture_output=True, text=True,
+            [resolved, "--version"], capture_output=True, text=True,
             timeout=PROBE_TIMEOUT_SECONDS, check=False, **_SUBPROCESS_KWARGS)
         lines = (completed.stdout or completed.stderr or "").splitlines()
         if lines:
@@ -187,19 +226,30 @@ def _compiler_identity(compiler: str, *, persist: bool = False) -> str:
         version = "timeout"
     except OSError:
         version = "unavailable"
-    identity = f"{Path(compiler).name}|{footprint}|{version}|{key[2]}"
+    identity = (
+        f"{resolved}|{footprint}|{version}|{sdkroot}|{platform_identity}")
     with _MEMO_LOCK:
         _IDENTITY_MEMO[key] = identity
     if persist:
+        temporary = None
         try:
             marker.parent.mkdir(parents=True, exist_ok=True)
             temporary = _unique_temp(marker.parent, "identity", ".tmp")
             temporary.write_text(identity)
             os.replace(temporary, marker)
+            temporary = None
         except TimeoutError:
             raise
         except OSError:
             pass
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except TimeoutError:
+                    raise
+                except OSError:
+                    pass
     return identity
 
 
@@ -288,14 +338,31 @@ def _manifest_path(destination: Path) -> Path:
     return destination.with_suffix(destination.suffix + ".json")
 
 
+def _manifest_generation(candidate: Path, digest: str) -> int:
+    """Numeric generation from ``<digest>-<generation>.<ext>.json``."""
+    prefix = digest + "-"
+    if not candidate.name.startswith(prefix):
+        return INVALID_GENERATION
+    text = candidate.name[len(prefix):].partition(".")[GENERATION_PART]
+    try:
+        return int(text)
+    except ValueError:
+        return INVALID_GENERATION
+
+
 def _read_manifest(digest: str) -> Path | None:
+    """Newest valid generation for ``digest``; malformed JSON is ignored.
+
+    Sorting is numeric (generation 10 ahead of 9), never lexicographic, and a
+    non-object payload such as ``[1]`` is treated as absent.
+    """
     root = cache_root()
-    for candidate in sorted(root.glob(f"{digest}-*.json"), reverse=True):
-        try:
-            payload = json.loads(candidate.read_text())
-        except TimeoutError:
-            raise
-        except (OSError, ValueError):
+    candidates = sorted(root.glob(f"{digest}-*.json"),
+                        key=lambda item: (_manifest_generation(item, digest),
+                                          item.name), reverse=True)
+    for candidate in candidates:
+        payload = accel_cache.read_manifest_payload(candidate)
+        if payload is None:
             continue
         path = Path(str(payload.get("library", "")))
         if payload.get("digest") == digest and path.is_file():
@@ -303,11 +370,19 @@ def _read_manifest(digest: str) -> Path | None:
     return None
 
 
+def _touch_hit(path: Path) -> None:
+    """Refresh a hit before pruning so it is never the oldest artifact."""
+    accel_cache.touch_artifact(path)
+
+
 def _publish(compiler: str, flags: list[str], destination_dir: Path,
              files: dict[str, bytes], digest: str) -> tuple[bool, str, Path | None]:
     """Compile an immutable snapshot and publish it under a fresh generation."""
     snapshot_dir = None
     temporary = None
+    manifest_temp = None
+    candidate = None
+    published = False
     try:
         destination_dir.mkdir(parents=True, exist_ok=True)
         snapshot_dir = Path(tempfile.mkdtemp(
@@ -348,41 +423,48 @@ def _publish(compiler: str, flags: list[str], destination_dir: Path,
         valid, reason = _validate(temporary)
         if not valid:
             return False, reason, None
-        candidate = None
-        for generation in range(100001):
-            target = destination_dir / (
-                f"{digest.hex() if isinstance(digest, bytes) else digest}"
-                f"-{generation}{library_extension()}")
+        # Publication and retention are one metadata mutation: hold the
+        # cross-process lock so a concurrent hit cannot observe a library that
+        # is about to be pruned and another builder cannot race the manifest.
+        with accel_cache.cache_lock(destination_dir):
+            for generation in range(100001):
+                target = destination_dir / (
+                    f"{digest.hex() if isinstance(digest, bytes) else digest}"
+                    f"-{generation}{library_extension()}")
+                try:
+                    os.link(temporary, target)
+                except FileExistsError:
+                    continue
+                except TimeoutError:
+                    raise
+                except OSError as error:
+                    return False, f"publication_failed:{error}", None
+                candidate = target
+                break
+            if candidate is None:
+                return False, "cache_generation_exhausted", None
             try:
-                os.link(temporary, target)
-            except FileExistsError:
-                continue
+                os.unlink(temporary)
+                temporary = None
             except TimeoutError:
                 raise
             except OSError as error:
                 return False, f"publication_failed:{error}", None
-            candidate = target
-            break
-        if candidate is None:
-            return False, "cache_generation_exhausted", None
-        try:
-            os.unlink(temporary)
-            temporary = None
-        except TimeoutError:
-            raise
-        except OSError as error:
-            return False, f"publication_failed:{error}", None
-        try:
-            manifest = _manifest_path(candidate)
-            payload = json.dumps({"digest": digest, "library": str(candidate)})
-            handle = _unique_temp(destination_dir, "manifest", ".tmp")
-            handle.write_text(payload)
-            os.replace(handle, manifest)
-        except TimeoutError:
-            raise
-        except OSError as error:
-            return False, f"publication_failed:{error}", None
-        return True, "", candidate
+            try:
+                manifest = _manifest_path(candidate)
+                payload = json.dumps({"digest": digest, "library": str(candidate)})
+                manifest_temp = _unique_temp(destination_dir, "manifest", ".tmp")
+                manifest_temp.write_text(payload)
+                os.replace(manifest_temp, manifest)
+                manifest_temp = None
+            except TimeoutError:
+                raise
+            except OSError as error:
+                return False, f"publication_failed:{error}", None
+            published = True
+            _prune_engine_cache(destination_dir, keep_key=candidate,
+                                max_artifacts=MAX_CACHED_ARTIFACTS)
+            return True, "", candidate
     finally:
         if snapshot_dir is not None:
             try:
@@ -398,12 +480,28 @@ def _publish(compiler: str, flags: list[str], destination_dir: Path,
                 raise
             except OSError:
                 pass
+        if manifest_temp is not None:
+            try:
+                manifest_temp.unlink(missing_ok=True)
+            except TimeoutError:
+                raise
+            except OSError:
+                pass
+        if candidate is not None and not published:
+            _discard_path(candidate)
+            _discard_path(_manifest_path(candidate))
 
 
-def _memo_key(digest: bytes) -> tuple:
+def _memo_key(digest: bytes, compiler: str | None,
+              identity: str | None) -> tuple:
+    """Memoize by source, resolved compiler identity, flags and cache root.
+
+    ``PATH`` is intentionally not part of this key: it only selects the
+    compiler, and the resolved identity already captures that choice.
+    """
     return (
-        digest, str(cache_root()), os.environ.get("MINDIE_SIM_CC", ""),
-        os.environ.get("PATH", ""), tuple(compiler_flags()),
+        digest, str(cache_root()), compiler, identity,
+        tuple(compiler_flags()),
     )
 
 
@@ -420,11 +518,11 @@ def build_accel(*, check_only: bool = False, force: bool = False) -> dict:
         raise
     except OSError as error:
         return _failure("source_unavailable", detail=str(error), check_only=check_only)
-    key = _memo_key(data)
     compiler, reason = discover_compiler()
     identity = None
     if compiler is not None:
         identity = _compiler_identity(compiler, persist=not check_only)
+    key = _memo_key(data, compiler, identity)
     # A success memo is reusable only while its exact artifact still exists
     # and the current compiler identity is byte-identical to the memoized one.
     if not force and not check_only:
@@ -432,12 +530,17 @@ def build_accel(*, check_only: bool = False, force: bool = False) -> dict:
             cached_status = _STATUS_MEMO.get(key)
         if cached_status is not None:
             path = cached_status.get("cache_path")
-            if (cached_status.get("ok") and path and Path(path).is_file()
-                    and compiler is not None
+            if (cached_status.get("ok") and path and compiler is not None
                     and cached_status.get("compiler_identity") == identity):
-                result = dict(cached_status)
-                result["cache_hit"] = True
-                return result
+                with accel_cache.cache_lock(cache_root()):
+                    if Path(path).is_file():
+                        _touch_hit(Path(path))
+                        _prune_engine_cache(
+                            cache_root(), keep_key=Path(path),
+                            max_artifacts=MAX_CACHED_ARTIFACTS)
+                        result = dict(cached_status)
+                        result["cache_hit"] = True
+                        return result
     if compiler is None:
         status = _failure(reason, check_only=check_only)
         with _MEMO_LOCK:
@@ -460,16 +563,27 @@ def build_accel(*, check_only: bool = False, force: bool = False) -> dict:
             "toolchain_ready": True, "library_ready": existing is not None,
         }
     if existing is not None and not force:
-        status = {
-            "ok": True, "backend": "c_native", "reason": None, "detail": "",
-            "compiler": compiler, "compiler_identity": identity, "flags": flags,
-            "digest": digest_hex, "cache_path": str(existing), "cache_hit": True,
-            "check_only": False, "abi": 2, "toolchain_ready": True,
-            "library_ready": True,
-        }
-        with _MEMO_LOCK:
-            _STATUS_MEMO[key] = status
-        return dict(status)
+        # A hit must become the newest entry before retention evicts the
+        # oldest; a concurrent publisher cannot delete the hit between here
+        # and a caller's ``ctypes.CDLL`` because both hold this same lock.
+        with accel_cache.cache_lock(cache_root()):
+            existing = _read_manifest(digest_hex)
+            if existing is not None:
+                _touch_hit(existing)
+                _prune_engine_cache(
+                    cache_root(), keep_key=existing,
+                    max_artifacts=MAX_CACHED_ARTIFACTS)
+                status = {
+                    "ok": True, "backend": "c_native", "reason": None,
+                    "detail": "", "compiler": compiler,
+                    "compiler_identity": identity, "flags": flags,
+                    "digest": digest_hex, "cache_path": str(existing),
+                    "cache_hit": True, "check_only": False, "abi": 2,
+                    "toolchain_ready": True, "library_ready": True,
+                }
+                with _MEMO_LOCK:
+                    _STATUS_MEMO[key] = status
+                return dict(status)
     built, detail, candidate = _publish(compiler, flags, cache_root(), files,
                                         digest_hex)
     if not built:
